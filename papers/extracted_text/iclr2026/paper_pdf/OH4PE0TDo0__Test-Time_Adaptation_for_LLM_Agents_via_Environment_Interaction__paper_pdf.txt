@@ -1,0 +1,5723 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+TEST-TIME ADAPTATION FOR LLM AGENTS VIA EN-
+VIRONMENT INTERACTION
+Arthur Chen1∗
+Zuxin Liu2
+Jianguo Zhang2
+Akshara Prabhakar2
+Zhiwei Liu2
+Shelby Heinecke2
+Silvio Savarese2
+Victor Zhong1†
+Caiming Xiong2†
+1University of Waterloo
+2Salesforce AI Research
+ABSTRACT
+Large language model (LLM)-based agents struggle to generalize to novel and
+complex environments, such as unseen websites or new sets of functions, due to
+a fundamental mismatch between their pre-training and test-time conditions. This
+challenge stems from two distinct failure modes: a syntactic misunderstanding of
+environment-specific components like observation formats, and a semantic misun-
+derstanding of state-transition dynamics, which are only revealed at test time. To
+address these issues, we propose two distinct strategies for adapting LLM agents
+by leveraging environment-specific information from interaction that is available
+during deployment. First, an online syntactic alignment (SA) method parameter-
+izes environmental nuances by learning a lightweight adaptation vector that biases
+the model’s output distribution, enabling rapid alignment with an environment
+response format. Second, a deployment-time dynamics grounding (DG) method
+employs a persona-driven exploration phase to systematically probe and learn the
+environment’s causal dynamics before task execution, equipping the agent with
+an in-context world model. We evaluate these strategies across diverse agentic
+benchmarks, including function calling and web navigation. Our empirical re-
+sults show the effectiveness of both strategies across all benchmarks with minimal
+computational cost. We find that dynamics grounding is particularly effective
+in complex environments where unpredictable dynamics pose a major obstacle,
+demonstrating a robust path toward more generalizable and capable LLM-based
+agents. For example, on the WebArena multi-site split, this method increases the
+agent’s success rate from 2% to 23%. We release our code1.
+1
+INTRODUCTION
+Large language model (LLM)-based AI agents have demonstrated remarkable capabilities across
+diverse tasks (Li et al., 2023a; Zhou et al., 2024a; Patil et al.; Xie et al., 2024), yet they often fail
+to generalize when deployed in novel agentic environments such as web navigation (Zhou et al.,
+2024a; He et al., 2024) and function calling (Patil et al.; Yao et al., 2024). These failures reflect
+two core challenges—the systematic mismatch between the agent’s pre-trained knowledge and the
+specific syntax and dynamics of the deployed environment (Yang et al., 2025; Thil et al., 2024).
+Although both mismatches stem from a lack of prior knowledge, we distinguish them operationally
+because they require different adaptation mechanisms (syntactic vs. semantic). To illustrate these
+two failure patterns, we consider an LLM agent tasked with booking a flight on a previously unseen
+travel website:
+1. Syntactic Mismatch: the LLM agent’s prior knowledge does not align with environment-specific
+information, such as observation structure (Yang et al., 2024; Gur et al., 2023) and the environ-
+ment’s unique syntax (Lei et al., 2024; Chen et al., 2024). This causes parsing and context-
+understanding issues: a pre-trained LLM agent might try click(‘‘Search’’) or target
+∗Work done during internship. Correspondence to: haonan.chen@uwaterloo.ca
+†Equal advising.
+1https://github.com/r2llab/GTTA
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+destination, while the new site exposes Go and dest field, producing invalid actions
+and immediate failures. (Yang et al., 2024; Gur et al., 2023; Lei et al., 2024; Chen et al., 2024)
+2. Semantic Mismatch: the agent lacks an accurate, environment-specific causal model of state
+transitions, so it cannot predict the consequences of actions. For example, the agent may expect
+click(‘‘Go’’) to show flight results, but the site instead opens a date-confirmation pop-up;
+without knowing this transition, the agent cannot form the correct multi-step plan and fails. (For-
+rester, 1971; Chae et al., 2025; Zhang et al., 2024)
+Current approaches to this generalization gap are ill-suited for rapid adaptation in novel envi-
+ronments.
+In addition, many methods require human-annotated or LLM-annotated demonstra-
+tions (Wang et al., 2024b; Murty et al., 2025; Xu et al., 2024), which can be resource-intensive
+or rely on LLM’s prior knowledge about the environment. On the other hand, to address semantic
+mismatch, explicit world modeling like (Chae et al., 2025) involves a heavyweight pipeline of exten-
+sive data collection and fine-tuning a separate, specialized model that is computationally expensive
+and struggles to generalize without being retrained. Both paradigms present significant overhead,
+highlighting the need for more efficient strategies that can ground an agent using only the informa-
+tion available at test time.
+To address the two failure modes and close the generalization gap, we propose two annotation-
+free strategies that operate at deployment time. (1) Online syntactic alignment (SA)—a lightweight
+module that learns a small per-interaction bias (an adaptation vector applied to late features) to
+quickly align an agent’s output distribution with environment-specific syntax. Observing Go and
+dest field on the page, for example, lets the adapter steer action generation toward the site’s
+actual element names. (2) Dynamics grounding (DG)—a short, persona-guided exploration phase
+that iteratively collects in-context rules about state transitions (e.g., clicking Go opens a date pop-up)
+and supplies those rules as context for downstream planning. Both methods require only test-time
+observations and no trajectory annotations or expensive fine-tuning.
+We evaluate our methods on function-calling and web-navigation benchmarks. Both approaches
+yield consistent improvements: syntactic alignment gives efficient, steady gains across sites, while
+dynamics grounding produces particularly large improvements on environments with unfamiliar
+transitions. For example, on the WebArena multi-site split (Zhou et al., 2024a), dynamics ground-
+ing raises GPT-4.1 success from 2% to 23%. Taken together, syntactic and semantic test-time
+grounding substantially narrow the deployment generalization gap and offer a practical path toward
+more robust LLM agents.
+2
+RELATED WORK
+Test-Time Adaptation
+Originating in computer vision, test-time adaptation (TTA) addresses dis-
+tributional shifts between training and testing data by adapting models at inference time (Wang et al.,
+2021; Niu et al., 2022; Sun et al., 2020). Our syntactic alignment builds directly on methods that up-
+date model parameters or steering vectors at test time to minimize an unsupervised objective, such
+as entropy minimization or self-supervised learning (Wang et al., 2021; Hu et al., 2025; Li et al.,
+2023b). Our syntactic alignment aligns with steering vector research (Tan et al., 2025; Sinii et al.,
+2025; Panickssery et al., 2024; Turner et al., 2024) in its use of latent space biases to shift output
+distributions. However, standard steering approaches generally apply modulation vectors to shift
+high-level traits (Tan et al., 2025), such as honesty (Zou et al., 2025). We distinguish our work by
+tailoring this mechanism to the dynamic nature of agentic tasks: our vector is treated as a tempo-
+rary parameter, updated online using the environment’s response as a self-supervisory signal, and
+reset per episode to ensure precise, context-dependent alignment without interference across tasks.
+While TTA for LLMs is emerging for tasks like math reasoning (Zuo et al., 2025) and few-shot
+learning (Aky¨urek et al., 2025), its application to the unique, interactive, and stateful challenges of
+LLM agents remains underexplored. Our work is the first to systematically apply this paradigm to
+adapt agents to novel environment formats without supervised trajectories.
+Environment Modeling for Agents
+Recent work has focused on incorporating environment dy-
+namics into LLM-based planning by training a parameterized world model (Fang et al., 2025; Chae
+et al., 2025; Ding et al., 2026; Qiao et al., 2024), or using an LLM to predict the next state using
+continuously updated environment rules (Zhou et al., 2024b). Such approaches typically require
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+collecting a large set of observations for learning a world model, and can be computationally expen-
+sive (Chae et al., 2025). In contrast, our dynamics grounding introduces a lightweight, deployment-
+time pipeline to generate a temporary, in-context world model from a few exploratory interactions.
+This aligns with a broader trend of using in-context learning for adaptation, including methods like
+agent workflow memory (Wang et al., 2024b) and retrieval-augmented generation (RAG) for plan-
+ning (Luo et al., 2023; Kagaya et al., 2024; Wang et al., 2024a). However, our contribution lies in
+the systematic and automated process of generating this knowledge via persona-driven exploration,
+removing the need for pre-existing annotated demonstrations or a separate, trained dynamics model.
+LLM-Based Agents
+Large language models (LLMs) have become the planning backbone of a
+wide range of agentic systems due to their strong instruction-following capabilities and generaliza-
+tion across diverse tasks (Ouyang et al., 2022; Mishra et al., 2022; Zhou et al., 2024a). Their ability
+to interpret complex instructions and generate coherent action plans has enabled their integration
+into applications such as web navigation (Zhou et al., 2024a; He et al., 2024; L`u et al., 2024; Deng
+et al., 2023) and function calling (Patil et al.; Yao et al., 2024). Despite recent advances, LLM agents
+struggle to comprehend the specific syntactical input structure of different environments, such as in
+web navigation (Yang et al., 2024; Gur et al., 2023) and text-to-SQL (Lei et al., 2024). This is
+due to the fundamental mismatch between the LLM pre-training corpus and the specific agentic
+environment (Chen et al., 2024; Ben-David et al., 2010).
+3
+GROUNDED TEST-TIME ADAPTATION STRATEGIES
+In this section, we detail our two adaptation strategies which mitigate syntactic and semantic gaps.
+We first formalize the problem setup, which is designed to reflect realistic deployment scenarios and
+is defined by three key constraints:
+1. No annotated trajectories or offline data. The agent cannot access expert demonstrations or
+pre-collected data from the target environment. It must learn from scratch during interaction. For
+our running travel example, the agent has never seen travel-example.com and has no pre-existing
+dataset of successful bookings on that site.
+2. Online, streaming adaptation. The agent receives tasks one at a time and must adapt on-the-fly
+without seeing a full batch of test instances in advance. For example, it must adapt to the web-
+site’s quirks while handling a single request (e.g. “Book a flight from New York to Saskatoon”)
+before seeing any future tasks.
+3. Permitted test-time interaction. The agent is allowed to interact with the environment to gather
+information before receiving a specific task, but without supervision. For instance, it can perform
+a “blind” exploration of travel-example.com to discover that a button triggers a calendar pop-up,
+but it does not know what kind of tasks the user will ultimately ask it to execute.
+This setting mirrors constraints in practical benchmarks (e.g., BIRD (Li et al., 2023a), We-
+bArena (Zhou et al., 2024a)) and necessitates methods that can leverage only unsupervised, test-time
+interaction. To formulate this challenge, at test-time the LLM input I is constructed as
+I = [p; o; {a}T −1
+i=1 ]
+(1)
+where p denotes the task instruction (e.g., rules, task description), o denotes the current environment
+observation (e.g., accessibility tree observation, response of function call), and {a}T −1
+i=1 denotes the
+sequence of past actions taken by the LLM-based agent up to the current step. For environments
+with short or simple observations (e.g., tool-use scenarios), we instead construct the model input
+using all previous interactions between the agent and the environment, which may include both en-
+vironment responses and agent actions. With this formulation of the challenge in mind, we describe
+two adaptation methods in the remainder of this section.
+3.1
+SYNTACTIC ALIGNMENT
+To address syntactic mismatches that arise in novel environments, we propose syntactic alignment.
+The objective is to parametrically adapt the model’s output distribution at test time by treating the
+current context (i.e. task instructions, observations, and action history) as a self-supervisory signal.
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+Figure 1:
+Overview of syntactic alignment (SA). This figure includes an example of web nav-
+igation shopping task to illustrate how the agent adapts to new environment. (1) At the start of
+each episode, we initialize an adaptation vector δ as a zero vector and construct inputs to the LLM
+agent. (2) During task execution, the agent receives environment instructions and observations. (3)
+At each step, we update the adaptation vector using cross-entropy loss on the current input, and
+apply the adaptation vector as a bias to the LLM’s final hidden layer. This enables rapid alignment
+to environment-specific observation and action formats. (4) The LLM agent takes a new action
+with the updated vector, which shifts the model’s output distribution to better match the test-time
+environment.
+This allows the model to align with local syntactic patterns, such as unique UI element labels or
+response formats, without requiring a deep understanding of the environment’s causal dynamics.
+Our approach introduces a single lightweight adaptation vector δ ∈Rd, where d is the hidden
+dimension of the language model. This vector acts as an additive bias to the final hidden representa-
+tions H ∈Rn×d before the final projection layer. At each step of an episode, the adapted logits are
+computed as:
+logits′ = (H + δ)W T
+LM
+(2)
+where WLM ∈R|V |×d is the model’s output projection matrix and |V | is the vocabulary size.
+This vector δ is updated at each turn by performing one gradient descent step to minimize the
+language modeling loss of the current input context I according to the following:
+δnew ←δold −η∇δLCE (fθ,δ(I1:n−1), I2:n)
+(3)
+where fθ,δ is the LLM parameterized by its fixed weights θ and the adaptable vector δ, and η is
+the learning rate. I1:n−1 denotes the input subsequence consisting of tokens 1 through n −1,
+and I2:n denotes the corresponding next-token targets obtained by shifting the sequence by one
+position. The loss in Eq. 3 is therefore computed by predicting each token in I2:n from its preceding
+context I1:n−1. This update encourages the model to internalize the syntactic features present in the
+immediate context by adapting its output distribution to the environment context.
+To illustrate this in practice, consider our agent on the unseen website travel-example.com.
+The agent’s input context I contains the accessibility tree, which includes strings such as [145]
+<button>Go and dest field.
+1. Initialization: At the episode’s start, the adaptation vector is initialized as a zero vector, δ ←0.
+2. Prediction:
+Without
+adaptation,
+the
+model’s
+logits
+would
+likely
+favor
+the
+action
+click(‘‘Search’’), based on its pre-trained priors.
+3. Adaptation: We compute the language modeling loss on the context I (Eq. 3). Because the
+strings Go and dest field are present in I, the gradient update to δ will shift its values to
+favor their tokens.
+4. Correction: In the subsequent generation step, the adapted logits (Eq. 2) now assign a higher
+probability to the syntactically correct action, click(‘‘Go’’).
+This process is computationally efficient, and steps 2-4 are repeated at every model prediction within
+an episode. To prevent catastrophic forgetting and ensure that adaptation is specific to the current
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+environment, δ is reset to zero at the beginning of each new episode. This lightweight update aligns
+the model’s pre-trained distribution with the specific distribution of the test-time environment.
+3.2
+DYNAMICS GROUNDING
+Figure 2: Overview of dynamics grounding (DG). This figure includes an example of web navi-
+gation shopping task to illustrate how the pipeline generates environment dynamics in language. (1)
+We synthesize diverse exploration tasks based on personas using environment descriptions. (2) An
+exploration agent interacts with the environment to collect interaction logs of state transitions. (3)
+An LLM extracts and summarizes environment dynamics from these logs. (4) A reasoning model
+filters less informative rules, which are then used to augment the agent’s context during evaluation,
+enabling more transition-aware decision making.
+LLM-based agents often fail in novel environments due to a semantic mismatch: they lack a “world
+model” to predict the outcomes of their actions (Ha & Schmidhuber, 2018; Chae et al., 2025).
+To address this, we propose dynamics grounding, a strategy that proactively discovers the causal
+dynamics of an environment before the agent encounters any user tasks during deployment.
+The objective is to construct an in-context world model using natural language by performing a one-
+time, automated exploration. The cost of this discovery phase is amortized over all subsequent tasks
+performed in that environment.
+Our method follows a four-step pipeline to generate a concise set of environment dynamics, denoted
+as Eclean, for a given new environment.
+1. Persona/Exploratory Goal Synthesis. An LLM is prompted with a high-level description of
+the environment (e.g., website purpose, API documentation) to generate a set of N diverse, ex-
+ploratory “personas” or “goals”. Personas frame open-ended tasks designed to probe for non-
+obvious interactions. For our travel-example.com scenario, a synthesized persona might
+be: “As a first-time user, I want to see what happens if I try to search for a flight without select-
+ing a date.”. We prefer personas over a less-structured exploration policy (e.g. maximizing state
+novelty or coverage) to guide the agent to explore complex, multi-step interactions that a naive
+exploration strategy might miss, thus yielding more semantically rich dynamics.
+2. Exploration and on-the-fly Dynamics Extraction For each persona or goal, an LLM agent
+interacts with the environment. The agent is instructed to take novel actions to maximize its
+discovery of new state transitions. After each action is executed and the system transitions into
+the next state, we take (observation, action, new observation) to summarize into a concise human-
+readable rule e. Immediately after, the list of generated rules {e}T
+i=1 is appended to the agent to
+encourage taking actions that have not been taken before. In our example, the agent would
+execute click(‘‘Go’’) and log the transition from the main page to a state where a calendar
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+pop-up is active. Then the transition on travel-example.com would be extracted as the
+dynamic: Executing the action click(‘Go’) on the main page causes a calendar modal to
+appear for date selection.
+3. Filtering and Consolidation. The set of all extracted dynamics, E = {e}M
+i=1, is passed to
+a reasoning model. This model filters out trivial (e.g., “typing in a text field shows text”) or
+repetitive rules, producing a final, clean set of dynamics, Eclean.
+During task execution at test time, we augment the input context I with discovered dynamics:
+I′ = [I; Eclean]
+(4)
+By leveraging the LLM’s in-context learning capabilities, this explicit knowledge of the environ-
+ment’s state-transition patterns guides the agent to make more informed and transition-aware deci-
+sions. In our example, with the calendar pop-up dynamic in its context, the agent correctly antici-
+pates the outcome of its click and plans its subsequent actions accordingly, successfully navigating
+the semantic mismatch. Example prompts for exploration and dynamics extraction are shown in
+Appendix sections section A.2 and section A.3.
+4
+EXPERIMENTS
+4.1
+SETUP
+Table 1: Number of tasks per website in
+the WebArena benchmark. The benchmark
+consists of six websites, including a multi-
+site category for tasks that require interact-
+ing across multiple websites (from the six
+sites), for a total of 812 tasks.
+Website
+Number of Tasks
+Shopping
+187
+Shopping Admin
+182
+GitLab
+180
+Map
+109
+Reddit
+106
+Multi-site
+48
+Total
+812
+We evaluate our approach on three realistic agentic
+benchmarks: BFCLv3 (Patil et al.), WebArena (Zhou
+et al., 2024a), and Tau-Bench (Yao et al., 2024), which
+together cover both web navigation and conversational
+function calling tasks.
+As for baselines, we evalu-
+ate open-source Qwen2.5-14B-Instruct (Qwen
+et al., 2025) model and closed-source GPT-4.1.
+On WebArena,
+we additionally compare to the
+World-model-augmented (WMA) agent from (Chae
+et
+al.,
+2025)
+as
+a
+baseline.
+This
+approach
+first collects exploration demonstrations, then trains
+a Llama-3.1-8B-Instruct (Grattafiori et al.,
+2024) model to predict the next state given an action
+(i.e., a learned world model). During evaluation, this
+world model is used to provide next-state predictions
+to the agent on-the-fly, helping the agent reason about the consequences of its actions. In this
+comparison, we use the same GPT-4o mini as the original WMA experiments. Aside from the
+syntactic alignment and dynamics grounding experiments, we provide ablation studies in section 4.3.
+For all dynamics grounding experiments, we leverage GPT-4.1 as an exploration policy to extract
+environmental dynamics. For each environment, we conduct 10 exploration episodes to gather a
+diverse set of dynamics. For environment dynamics filtering, we apply o32 to remove repetitive
+and trivial environment dynamics. We also include ablation studies on the number of exploration
+episodes and the effect of filtering in section 4.3.
+Before delving into the results, we first introduce the benchmarks and describe the specific experi-
+mental setups used for experiments.
+WebArena
+The WebArena benchmark consists of five self-hosted websites and a total of 812
+tasks. Many tasks require interacting across multiple websites, which poses additional challenges
+for LLM-based agents. For evaluation, WebArena employs a string-matching-based mechanism to
+assess correctness, providing more stable and objective results compared to benchmarks using LLMs
+to score, such as (He et al., 2024; Gou et al., 2025). For dynamics grounding, we first synthesize
+10 personas via prompt instruction 1 for each website using GPT-4o (OpenAI et al., 2024) and with
+seed personas from NNetNav (Murty et al., 2025). Then for each persona, we roll-out a GPT-4.1
+agent to explore the environment guided by the persona description, with the exploration prompt
+2https://platform.openai.com/docs/models/o3
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+Table 2: Main results on WebArena, WebVoyager, BFCLv3, and Tau-Bench benchmarks. We report
+task success rates (%) for each model and adaptation method. For Tau-Bench, we average runs
+across 5 seeds and use a custom more stable codebase. Both test-time adaptation strategies improve
+performance. ”N/A” indicates not applicable—AWM requires training a web-specific world model
+on state transitions, which is not applicable to Tau-Bench (conversational only) or BFCLv3 (no
+explicit web-like state transition data); Dynamics grounding does not operate in conversational Tau-
+Bench as there is no explicit and fixed state transition rules in the environment.
+Model
+Task
+WebArena
+BFCLv3
+Tau-Bench
+Airline
+Retail
+GPT-4.1
+30.0
+55.5
+-
+-
+GPT-4.1 (+ DG)
+35.0 (+5.0)
+64.0 (+8.5)
+N/A
+N/A
+GPT-4o mini
+12.0
+-
+-
+-
+GPT-4o mini (+ WMA)
+13.5 (+1.5)
+N/A
+N/A
+N/A
+GPT-4o mini (+ DG)
+18.0 (+6.0)
+-
+N/A
+N/A
+Qwen2.5-14B-Instruct
+17.0
+18.5
+21.6
+43.3
+Qwen2.5-14B-Instruct (+ SA)
+18.0 (+1.0)
+20.0 (+1.5)
+25.2 (+3.6)
+44.9 (+1.6)
+Qwen2.5-14B-Instruct (+ DG)
+20.0 (+3.0)
+22.0 (+3.5)
+N/A
+N/A
+Qwen2.5-14B-Instruct (hybrid)
+21.0 (+4.0)
+21.0 (+2.5)
+N/A
+N/A
+instruction 2 derived from NNetNav, and with a maximum exploration budget of 30 steps. To extract
+environment dynamics from interaction logs, we summarize each state transition pair (observation,
+action taken, new observation) with prompt instruction 3, and concatenate all summarized state
+transition pairs to obtain the list of environmental dynamics E = {e}M
+i=1 for each website. Finally,
+we utilize the o3 model to remove repetitive and trivial environment dynamic entries from the list via
+prompt instruction 4, resulting in Eclean. We provide all prompts we use in section A. With syntactic
+alignment, we reset the adaptation vector after each episode and we use a learning rate of 0.1 and
+training step of 1 for all experiments. During evaluation, we use the text-based accessibility tree as
+the observation type and run experiments using BrowserGym3 and AgentLab4 with a maximum step
+of 30.
+BFCLv3
+BFCLv3 (Patil et al.) is a benchmark with various realistic APIs to evaluate the functions
+calling abilities of LLM. It contains 8 different API domains. We provide the number of APIs for
+each environment in table 8. We choose the multi-turn-base split to assess the agent’s multi-turn
+function calling capabilities. This split is multi-turn and multi-step, meaning that instead of just
+handling a single tool call in a one-off request, models have to carry out sequences of function calls
+across multiple dialogue turns. BFCLv3 uses state-based evaluation (checking the system’s resulting
+state) and response-based evaluation (checking whether the call sequences are valid and minimally
+sufficient) to assess correctness, therefore being stable and deterministic. For dynamics grounding,
+we synthesize 10 exploration tasks with GPT-4o conditioned on the function documentation for
+each domain via prompt instruction 7. Concretely, we instruct the LLM to think about what functions
+it wants to explore in order to find out unpredictable outcomes or interesting behaviors, given the
+function documentation. We use a GPT-4.1 agent to execute the exploration task and we collect
+interaction logs for environment dynamics extraction. During exploration, we ask the exploration
+agent to decide if the steps taken so far are sufficient to answer the exploration task with prompt
+instruction 8. The environment dynamics are extracted using prompt instruction 9. We follow the
+same procedure as in WebArena to remove repetitive and trivial environment dynamics with prompt
+instruction 10. For syntactic alignment, we reset adaptation vector at each turn (when a new user
+query arrives).
+Tau-Bench
+Tau-Bench (Yao et al., 2024) is a realistic function calling benchmark that simulates
+real-world service agents interacting with an LLM-simulated user. It comprises two domains: air-
+line (50 tasks) and retail (115 tasks). The airline domain is generally more challenging than retail,
+as it features a much larger database, increasing the complexity of the tasks. Tau-bench’s use of an
+LLM-simulated user agent introduces significant variance in evaluation results, as the simulated hu-
+3https://github.com/ServiceNow/BrowserGym
+4https://github.com/ServiceNow/AgentLab
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+Table 3: Success rates (%) on the WebArena benchmark across different websites and models. Both
+adaptation strategies improve performance over baselines. and dynamics grounding (DG) surpasses
+WMA on GPT-4o mini. DG improves success rate substantially on complex multi-site split.
+Website
+Model
+Gitlab
+Shop Admin
+Shop
+Reddit
+Map
+Multi
+Avg
+GPT-4.1
+48.0%
+31.0%
+37.0%
+29.0%
+28.0%
+2.0%
+30.0%
+GPT-4.1 (+DG)
+45.0%
+27.0%
+33.0%
+42.0%
+31.0%
+23.0%
+35.0%
+GPT-4o mini
+9.0%
+12.0%
+18.0%
+8.0%
+12.0%
+12.0%
+12.0%
+GPT-4o mini (+WMA)
+–
+–
+–
+–
+–
+–
+13.5%
+GPT-4o mini (+DG)
+18.0%
+14.0%
+26.0%
+14.0%
+19.0%
+12.0%
+18.0%
+Qwen2.5-14B-Instruct
+20.0%
+14.0%
+22.0%
+13.0%
+13.0%
+6.0%
+17.0%
+Qwen2.5-14B-Instruct (+SA)
+16.0%
+14.0%
+24.0%
+25.0%
+16.0%
+6.0%
+18.0%
+Qwen2.5-14B-Instruct (+DG)
+23.0%
+13.0%
+24.0%
+23.0%
+20.0%
+10.0%
+20.0%
+Qwen2.5-14B-Instruct (Hybrid)
+26.0%
+13.0%
+24.0%
+31.0%
+19.0%
+4.0%
+21.0%
+man may drift from the original instruction or be influenced by the agent’s responses over multiple
+conversational turns. To address this, we adopt the improved evaluation codebase from (Prabhakar
+et al., 2025), which substantially reduces reward variance and improves evaluation fidelity. Specif-
+ically, we (1) fix incorrect labels, (2) set the temperature of the LLM-simulated user agent to 0
+for deterministic responses, and (3) employ a Best-of-N (N=5) sampling strategy combined with
+a self-critique mechanism, allowing the simulated user to better adhere to the task instruction and
+avoid being misled by the agent’s outputs. This protocol has been shown to improve consistency
+in agent performance evaluation across multiple trials according to (Prabhakar et al., 2025). Tau-
+Bench consists solely of API-based tasks without observable state transitions, meaning there are
+no environment dynamics to extract. As a result, dynamics grounding, which relies on extracting
+and leveraging such dynamics, is not applicable to this benchmark. Therefore, we only evaluate the
+syntactic alignment method on Tau-Bench. To further reduce variance, we report results averaged
+over 5 random seeds in table 2.
+4.2
+RESULTS AND ANALYSIS
+Both Adaptation Strategies Consistently Improve Performance
+As shown in table 2, both syn-
+tactic alignment (SA) and dynamics grounding (DG) improve performance across models and tasks.
+dynamics grounding yields substantial improvements for GPT-4.1, which is better able to leverage
+the provided dynamics due to its superior instruction-following abilities. It is also evident in table 2
+that our GPT-4o mini surpasses WMA that uses a learned world model by a large margin. For
+Qwen2.5-14B-Instruct, both methods provide gains, highlighting the general applicability of
+test-time adaptation. The improvements of dynamics grounding are especially significant for models
+with stronger instruction-following abilities (e.g., GPT-4.1), likely because they can better leverage
+the provided dynamics context.
+Table 4: Relative latency gain
+(%) of PA on BFCLv3 multi-
+turn. LR fixed to 0.1.
+Step
+Latency Gain ↓
+0
+0%
+1
+3.0%
+2
+5.9%
+3
+8.2%
+4
+12.6%
+5
+15.6%
+Both Adaptation Strategies are computationally efficient
+The
+two proposed strategies are computationally efficient, though they
+have different profiles.
+syntactic alignment is highly efficient
+for real-time use.
+As shown in table 4, a single update step
+adds only a 3% latency overhead. In contrast, dynamics ground-
+ing is a one-time, deployment-time investment designed to be
+far more lightweight than traditional world-modeling approaches
+like the WMA baseline. For example, while WMA requires syn-
+thesizing 870 tasks to collect trajectories for training a separate
+Llama-3.1-8B model, our method uses only 50 exploratory roll-
+outs and requires no additional model training. This streamlined
+process avoids WMA’s costly training phase and its significant inference overhead, where action
+simulation takes approximately 140 seconds per step. The total upfront cost for our dynamics
+grounding procedure on a single WebArena website is approximately 7M tokens, a cost that is
+amortized across all subsequent tasks. This investment pays significant dividends where environ-
+mental dynamics are unpredictable. For instance, on the challenging multi-site split, the success
+rate of our agent increases from 2% to 23%. This demonstrates the value of efficiently learning an
+environment’s dynamics at test time to compensate for the limitations of an agent’s pre-training.
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+Table 5: Ablation on exploration policy and dynamics extractor backbones on WebArena. Here
+we use different backbones of exploration policy and dynamics extractor. We found for dynamics
+grounding—using the same LLM agent (itself) improves the same as using a stronger one.
+Task Model
+Exploration Policy
+Dynamics Extractor
+SR
+GPT-4o mini (baseline)
+–
+–
+12.0
+GPT-4o mini
+GPT-4.1
+GPT-4.1
+18.0 (+6.0)
+GPT-4o mini (self)
+GPT-4o mini
+GPT-4o mini
+19.0 (+7.0)
+Qwen2.5-14B-Instruct (baseline)
+–
+–
+17.0
+Qwen2.5-14B-Instruct
+GPT-4.1
+GPT-4.1
+20.0 (+3.0)
+Qwen2.5-14B-Instruct (self)
+Qwen2.5-14B-Instruct
+Qwen2.5-14B-Instruct
+20.0 (+3.0)
+Effectiveness Depends on Environment Complexity and Method Synergy
+The smaller gains
+for DG on simpler websites like “Shopping” suggest that when an environment’s dynamics align
+with common sense priors (e.g., clicking ’search’ shows a search bar), the explicit dynamics provide
+less new information, and the overhead of a longer context may slightly hinder performance. In
+these simple settings, longer input on dynamics may negatively impact the model’s effectiveness,
+as prior work has shown that excessively long contexts can hurt performance (Beltagy et al., 2020;
+Liu et al., 2024). We further analyze this phenomenon and provide exemplar environment dynamics
+in section A.5. Furthermore, our test of a naive hybrid approach showed mixed results, underper-
+forming the dynamics grounding method alone on BFCLv3 (21.0% vs 22.0%). This suggests a
+simple combination is insufficient and may create interference between the two adaptation signals.
+A key challenge for future work is developing a more principled integration of semantic guidance
+and distributional alignment.
+4.3
+ABLATIONS
+Dynamics grounding enables self-improvement
+We ablate the choice of backbone LLMs for
+exploration and dynamics extraction in our dynamics grounding method (table 5). Results show that
+using the same model for both components (self-improvement) performs as well as using a stronger
+model, indicating that our approach is robust to the choice of exploration policy and dynamics
+extractor.
+Effect of filtering environmental dynamics
+We conduct an ablation experiment on BFCLv3 and
+find that filtering improves success rate across exploration budgets. Specifically, with 10 episodes,
+success rate rises from 61.0 to 64.0 (+3.0).
+Syntactic alignment is robust to different hyperparameters
+As shown in table 6, training with
+different learning rates generally improves performance across a range of reasonable hyperparameter
+values. However, using extreme hyperparameters can degrade performance. For example, in the
+case of the 7B model, applying a very high learning rate of 1.0 or training for 5 steps leads to
+reduced success rates, highlighting the importance of careful hyperparameter selection for optimal
+adaptation.
+Larger models benefit from a larger learning rate
+When testing with a very large learning rate
+(i.e., learning rate of 1.0), we find that larger models (i.e., 14B and 32B models) benefit more with a
+larger learning rate. We attribute this to the fact that the dimension of the adaptation vector for 14B
+and 32B models is the same (i.e., 5120), and is much larger compared to the 7B model’s (i.e., 3584).
+5
+LIMITATIONS AND FUTURE WORK
+Our study is primarily focused on the Qwen2.5 model family for syntactic alignment; future work
+should validate these findings across a broader range of open-source architectures. Our dynamics
+grounding method currently operates in environments with explicit state transitions, where testbeds
+such as user-oriented conversational tasks are not explored. Additionally, our online syntactic align-
+ment method does not currently normalize updates by the hidden dimension size, which could im-
+prove robustness to hyperparameters.
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+The most promising direction for future work is the development of a principled method for integrat-
+ing our two adaptation strategies as our analysis suggests that simply combining them is suboptimal.
+A more advanced approach could involve a meta-controller that assesses an environment’s complex-
+ity to dynamically decide whether to rely on efficient online adaptation for simple tasks or to deploy
+the more costly dynamics grounding for complex, unfamiliar environments.
+6
+CONCLUSIONS
+In this work, we presented a comparative study of two distinct strategies for adapting LLM agents
+to novel, complex environments. We identified two primary failure modes—syntactic and semantic
+mismatches—and investigated targeted solutions for each. The first, syntactic alignment (SA), is an
+efficient technique for aligning an agent’s output distribution to the local format of an environment.
+The second, dynamics grounding (DG), is an effective and efficient method for providing the agent
+with a causal world model through proactive dynamics extraction.
+Our evaluations on diverse agentic benchmarks demonstrate that both strategies significantly im-
+prove performance. Online adaptation provides consistent, low-cost gains, while dynamics ground-
+ing is critical for success in complex settings where an agent’s pre-trained knowledge fails. Our
+findings highlight that a multi-faceted approach to adaptation is necessary for robust agent gen-
+eralization and point toward exciting future directions in creating more intelligent and integrated
+adaptation systems.
+ACKNOWLEDGMENTS
+We thank Salesforce AI Research for supporting this work. We also thank the reviewers and the area
+chairs for their time and thoughtful feedback.
+REFERENCES
+Ekin Aky¨urek, Mehul Damani, Adam Zweiger, Linlu Qiu, Han Guo, Jyothish Pari, Yoon Kim,
+and Jacob Andreas. The Surprising Effectiveness of Test-Time Training for Few-Shot Learning,
+March 2025. URL http://arxiv.org/abs/2411.07279. arXiv:2411.07279 [cs].
+Iz Beltagy, Matthew E. Peters, and Arman Cohan. Longformer: The Long-Document Transformer,
+December 2020. URL http://arxiv.org/abs/2004.05150. arXiv:2004.05150 [cs].
+Shai Ben-David, John Blitzer, Koby Crammer, Alex Kulesza, Fernando Pereira, and Jennifer Wort-
+man Vaughan. A theory of learning from different domains. Machine Learning, 79(1):151–175,
+May 2010. ISSN 1573-0565. doi: 10.1007/s10994-009-5152-4. URL https://doi.org/
+10.1007/s10994-009-5152-4.
+Hyungjoo Chae, Namyoung Kim, Kai Tzu-iunn Ong, Minju Gwak, Gwanwoo Song, Jihoon Kim,
+Sunghwan Kim, Dongha Lee, and Jinyoung Yeo. Web Agents with World Models: Learning and
+Leveraging Environment Dynamics in Web Navigation, March 2025. URL http://arxiv.
+org/abs/2410.13232. arXiv:2410.13232 [cs].
+Zehui Chen, Kuikun Liu, Qiuchen Wang, Wenwei Zhang, Jiangning Liu, Dahua Lin, Kai Chen, and
+Feng Zhao. Agent-FLAN: Designing Data and Methods of Effective Agent Tuning for Large
+Language Models. arXiv, 2024. doi: 10.48550/ARXIV.2403.12881. URL https://arxiv.
+org/abs/2403.12881. Version Number: 1.
+Xiang Deng, Yu Gu, Boyuan Zheng, Shijie Chen, Samuel Stevens, Boshi Wang, Huan Sun, and
+Yu Su. Mind2Web: Towards a Generalist Agent for the Web, December 2023. URL http:
+//arxiv.org/abs/2306.06070. arXiv:2306.06070 [cs].
+Jingtao Ding, Yunke Zhang, Yu Shang, Yuheng Zhang, Zefang Zong, Jie Feng, Yuan Yuan,
+Hongyuan Su, Nian Li, Nicholas Sukiennik, Fengli Xu, and Yong Li.
+Understanding World
+or Predicting Future?
+A Comprehensive Survey of World Models.
+ACM Computing Sur-
+veys, 58(3):1–38, February 2026. ISSN 0360-0300, 1557-7341. doi: 10.1145/3746449. URL
+https://dl.acm.org/doi/10.1145/3746449.
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+Tianqing Fang, Hongming Zhang, Zhisong Zhang, Kaixin Ma, Wenhao Yu, Haitao Mi, and Dong Yu.
+WebEvolver: Enhancing Web Agent Self-Improvement with Coevolving World Model. 2025. doi:
+10.48550/ARXIV.2504.21024. URL https://arxiv.org/abs/2504.21024. Publisher:
+arXiv Version Number: 2.
+Jay W. Forrester. Counterintuitive behavior of social systems. Theory and Decision, 2(2):109–140,
+December 1971. ISSN 1573-7187. doi: 10.1007/BF00148991. URL https://doi.org/
+10.1007/BF00148991.
+Boyu Gou, Zanming Huang, Yuting Ning, Yu Gu, Michael Lin, Weijian Qi, Andrei Kopanev,
+Botao Yu, Bernal Jim´enez Guti´errez, Yiheng Shu, Chan Hee Song, Jiaman Wu, Shijie Chen,
+Hanane Nour Moussa, Tianshu Zhang, Jian Xie, Yifei Li, Tianci Xue, Zeyi Liao, Kai Zhang,
+Boyuan Zheng, Zhaowei Cai, Viktor Rozgic, Morteza Ziyadi, Huan Sun, and Yu Su. Mind2Web
+2: Evaluating Agentic Search with Agent-as-a-Judge, July 2025. URL http://arxiv.org/
+abs/2506.21506. arXiv:2506.21506 [cs].
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad
+Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, Amy Yang, Angela Fan,
+Anirudh Goyal, Anthony Hartshorn, Aobo Yang, Archi Mitra, Archie Sravankumar, Artem Ko-
+renev, Arthur Hinsvark, Arun Rao, Aston Zhang, Aurelien Rodriguez, Austen Gregerson, Ava
+Spataru, Baptiste Roziere, Bethany Biron, Binh Tang, Bobbie Chern, Charlotte Caucheteux,
+Chaya Nayak, Chloe Bi, Chris Marra, Chris McConnell, Christian Keller, Christophe Touret,
+Chunyang Wu, Corinne Wong, Cristian Canton Ferrer, Cyrus Nikolaidis, Damien Allonsius,
+Daniel Song, Danielle Pintz, Danny Livshits, Danny Wyatt, David Esiobu, Dhruv Choudhary,
+Dhruv Mahajan, Diego Garcia-Olano, Diego Perino, Dieuwke Hupkes, Egor Lakomkin, Ehab
+AlBadawy, Elina Lobanova, Emily Dinan, Eric Michael Smith, Filip Radenovic, Francisco
+Guzm´an, Frank Zhang, Gabriel Synnaeve, Gabrielle Lee, Georgia Lewis Anderson, Govind That-
+tai, Graeme Nail, Gregoire Mialon, Guan Pang, Guillem Cucurell, Hailey Nguyen, Hannah Kore-
+vaar, Hu Xu, Hugo Touvron, Iliyan Zarov, Imanol Arrieta Ibarra, Isabel Kloumann, Ishan Misra,
+Ivan Evtimov, Jack Zhang, Jade Copet, Jaewon Lee, Jan Geffert, Jana Vranes, Jason Park, Jay Ma-
+hadeokar, Jeet Shah, Jelmer van der Linde, Jennifer Billock, Jenny Hong, Jenya Lee, Jeremy Fu,
+Jianfeng Chi, Jianyu Huang, Jiawen Liu, Jie Wang, Jiecao Yu, Joanna Bitton, Joe Spisak, Jong-
+soo Park, Joseph Rocca, Joshua Johnstun, Joshua Saxe, Junteng Jia, Kalyan Vasuden Alwala,
+Karthik Prasad, Kartikeya Upasani, Kate Plawiak, Ke Li, Kenneth Heafield, Kevin Stone, Khalid
+El-Arini, Krithika Iyer, Kshitiz Malik, Kuenley Chiu, Kunal Bhalla, Kushal Lakhotia, Lauren
+Rantala-Yeary, Laurens van der Maaten, Lawrence Chen, Liang Tan, Liz Jenkins, Louis Martin,
+Lovish Madaan, Lubo Malo, Lukas Blecher, Lukas Landzaat, Luke de Oliveira, Madeline Muzzi,
+Mahesh Pasupuleti, Mannat Singh, Manohar Paluri, Marcin Kardas, Maria Tsimpoukelli, Mathew
+Oldham, Mathieu Rita, Maya Pavlova, Melanie Kambadur, Mike Lewis, Min Si, Mitesh Ku-
+mar Singh, Mona Hassan, Naman Goyal, Narjes Torabi, Nikolay Bashlykov, Nikolay Bogoy-
+chev, Niladri Chatterji, Ning Zhang, Olivier Duchenne, Onur C¸ elebi, Patrick Alrassy, Pengchuan
+Zhang, Pengwei Li, Petar Vasic, Peter Weng, Prajjwal Bhargava, Pratik Dubal, Praveen Krishnan,
+Punit Singh Koura, Puxin Xu, Qing He, Qingxiao Dong, Ragavan Srinivasan, Raj Ganapathy, Ra-
+mon Calderer, Ricardo Silveira Cabral, Robert Stojnic, Roberta Raileanu, Rohan Maheswari, Ro-
+hit Girdhar, Rohit Patel, Romain Sauvestre, Ronnie Polidoro, Roshan Sumbaly, Ross Taylor, Ruan
+Silva, Rui Hou, Rui Wang, Saghar Hosseini, Sahana Chennabasappa, Sanjay Singh, Sean Bell,
+Seohyun Sonia Kim, Sergey Edunov, Shaoliang Nie, Sharan Narang, Sharath Raparthy, Sheng
+Shen, Shengye Wan, Shruti Bhosale, Shun Zhang, Simon Vandenhende, Soumya Batra, Spencer
+Whitman, Sten Sootla, Stephane Collot, Suchin Gururangan, Sydney Borodinsky, Tamar Herman,
+Tara Fowler, Tarek Sheasha, Thomas Georgiou, Thomas Scialom, Tobias Speckbacher, Todor Mi-
+haylov, Tong Xiao, Ujjwal Karn, Vedanuj Goswami, Vibhor Gupta, Vignesh Ramanathan, Viktor
+Kerkez, Vincent Gonguet, Virginie Do, Vish Vogeti, V´ıtor Albiero, Vladan Petrovic, Weiwei
+Chu, Wenhan Xiong, Wenyin Fu, Whitney Meers, Xavier Martinet, Xiaodong Wang, Xiaofang
+Wang, Xiaoqing Ellen Tan, Xide Xia, Xinfeng Xie, Xuchao Jia, Xuewei Wang, Yaelle Gold-
+schlag, Yashesh Gaur, Yasmine Babaei, Yi Wen, Yiwen Song, Yuchen Zhang, Yue Li, Yuning
+Mao, Zacharie Delpierre Coudert, Zheng Yan, Zhengxing Chen, Zoe Papakipos, Aaditya Singh,
+Aayushi Srivastava, Abha Jain, Adam Kelsey, Adam Shajnfeld, Adithya Gangidi, Adolfo Victoria,
+Ahuva Goldstand, Ajay Menon, Ajay Sharma, Alex Boesenberg, Alexei Baevski, Allie Feinstein,
+Amanda Kallet, Amit Sangani, Amos Teo, Anam Yunus, Andrei Lupu, Andres Alvarado, An-
+drew Caples, Andrew Gu, Andrew Ho, Andrew Poulton, Andrew Ryan, Ankit Ramchandani, An-
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+nie Dong, Annie Franco, Anuj Goyal, Aparajita Saraf, Arkabandhu Chowdhury, Ashley Gabriel,
+Ashwin Bharambe, Assaf Eisenman, Azadeh Yazdan, Beau James, Ben Maurer, Benjamin Leon-
+hardi, Bernie Huang, Beth Loyd, Beto De Paola, Bhargavi Paranjape, Bing Liu, Bo Wu, Boyu
+Ni, Braden Hancock, Bram Wasti, Brandon Spence, Brani Stojkovic, Brian Gamido, Britt Mon-
+talvo, Carl Parker, Carly Burton, Catalina Mejia, Ce Liu, Changhan Wang, Changkyu Kim, Chao
+Zhou, Chester Hu, Ching-Hsiang Chu, Chris Cai, Chris Tindal, Christoph Feichtenhofer, Cynthia
+Gao, Damon Civin, Dana Beaty, Daniel Kreymer, Daniel Li, David Adkins, David Xu, Davide
+Testuggine, Delia David, Devi Parikh, Diana Liskovich, Didem Foss, Dingkang Wang, Duc Le,
+Dustin Holland, Edward Dowling, Eissa Jamil, Elaine Montgomery, Eleonora Presani, Emily
+Hahn, Emily Wood, Eric-Tuan Le, Erik Brinkman, Esteban Arcaute, Evan Dunbar, Evan Smoth-
+ers, Fei Sun, Felix Kreuk, Feng Tian, Filippos Kokkinos, Firat Ozgenel, Francesco Caggioni,
+Frank Kanayet, Frank Seide, Gabriela Medina Florez, Gabriella Schwarz, Gada Badeer, Georgia
+Swee, Gil Halpern, Grant Herman, Grigory Sizov, Guangyi, Zhang, Guna Lakshminarayanan,
+Hakan Inan, Hamid Shojanazeri, Han Zou, Hannah Wang, Hanwen Zha, Haroun Habeeb, Harri-
+son Rudolph, Helen Suk, Henry Aspegren, Hunter Goldman, Hongyuan Zhan, Ibrahim Damlaj,
+Igor Molybog, Igor Tufanov, Ilias Leontiadis, Irina-Elena Veliche, Itai Gat, Jake Weissman, James
+Geboski, James Kohli, Janice Lam, Japhet Asher, Jean-Baptiste Gaya, Jeff Marcus, Jeff Tang, Jen-
+nifer Chan, Jenny Zhen, Jeremy Reizenstein, Jeremy Teboul, Jessica Zhong, Jian Jin, Jingyi Yang,
+Joe Cummings, Jon Carvill, Jon Shepard, Jonathan McPhie, Jonathan Torres, Josh Ginsburg, Jun-
+jie Wang, Kai Wu, Kam Hou U, Karan Saxena, Kartikay Khandelwal, Katayoun Zand, Kathy
+Matosich, Kaushik Veeraraghavan, Kelly Michelena, Keqian Li, Kiran Jagadeesh, Kun Huang,
+Kunal Chawla, Kyle Huang, Lailin Chen, Lakshya Garg, Lavender A, Leandro Silva, Lee Bell,
+Lei Zhang, Liangpeng Guo, Licheng Yu, Liron Moshkovich, Luca Wehrstedt, Madian Khabsa,
+Manav Avalani, Manish Bhatt, Martynas Mankus, Matan Hasson, Matthew Lennie, Matthias
+Reso, Maxim Groshev, Maxim Naumov, Maya Lathi, Meghan Keneally, Miao Liu, Michael L.
+Seltzer, Michal Valko, Michelle Restrepo, Mihir Patel, Mik Vyatskov, Mikayel Samvelyan, Mike
+Clark, Mike Macey, Mike Wang, Miquel Jubert Hermoso, Mo Metanat, Mohammad Rastegari,
+Munish Bansal, Nandhini Santhanam, Natascha Parks, Natasha White, Navyata Bawa, Nayan
+Singhal, Nick Egebo, Nicolas Usunier, Nikhil Mehta, Nikolay Pavlovich Laptev, Ning Dong,
+Norman Cheng, Oleg Chernoguz, Olivia Hart, Omkar Salpekar, Ozlem Kalinli, Parkin Kent,
+Parth Parekh, Paul Saab, Pavan Balaji, Pedro Rittner, Philip Bontrager, Pierre Roux, Piotr Dollar,
+Polina Zvyagina, Prashant Ratanchandani, Pritish Yuvraj, Qian Liang, Rachad Alao, Rachel Ro-
+driguez, Rafi Ayub, Raghotham Murthy, Raghu Nayani, Rahul Mitra, Rangaprabhu Parthasarathy,
+Raymond Li, Rebekkah Hogan, Robin Battey, Rocky Wang, Russ Howes, Ruty Rinott, Sachin
+Mehta, Sachin Siby, Sai Jayesh Bondu, Samyak Datta, Sara Chugh, Sara Hunt, Sargun Dhillon,
+Sasha Sidorov, Satadru Pan, Saurabh Mahajan, Saurabh Verma, Seiji Yamamoto, Sharadh Ra-
+maswamy, Shaun Lindsay, Shaun Lindsay, Sheng Feng, Shenghao Lin, Shengxin Cindy Zha,
+Shishir Patil, Shiva Shankar, Shuqiang Zhang, Shuqiang Zhang, Sinong Wang, Sneha Agarwal,
+Soji Sajuyigbe, Soumith Chintala, Stephanie Max, Stephen Chen, Steve Kehoe, Steve Satter-
+field, Sudarshan Govindaprasad, Sumit Gupta, Summer Deng, Sungmin Cho, Sunny Virk, Suraj
+Subramanian, Sy Choudhury, Sydney Goldman, Tal Remez, Tamar Glaser, Tamara Best, Thilo
+Koehler, Thomas Robinson, Tianhe Li, Tianjun Zhang, Tim Matthews, Timothy Chou, Tzook
+Shaked, Varun Vontimitta, Victoria Ajayi, Victoria Montanez, Vijai Mohan, Vinay Satish Kumar,
+Vishal Mangla, Vlad Ionescu, Vlad Poenaru, Vlad Tiberiu Mihailescu, Vladimir Ivanov, Wei Li,
+Wenchen Wang, Wenwen Jiang, Wes Bouaziz, Will Constable, Xiaocheng Tang, Xiaojian Wu,
+Xiaolan Wang, Xilun Wu, Xinbo Gao, Yaniv Kleinman, Yanjun Chen, Ye Hu, Ye Jia, Ye Qi,
+Yenda Li, Yilin Zhang, Ying Zhang, Yossi Adi, Youngjin Nam, Yu, Wang, Yu Zhao, Yuchen
+Hao, Yundi Qian, Yunlu Li, Yuzi He, Zach Rait, Zachary DeVito, Zef Rosnbrick, Zhaoduo Wen,
+Zhenyu Yang, Zhiwei Zhao, and Zhiyu Ma. The Llama 3 Herd of Models, November 2024. URL
+http://arxiv.org/abs/2407.21783. arXiv:2407.21783 [cs].
+Izzeddin Gur, Hiroki Furuta, Austin Huang, Mustafa Safdari, Yutaka Matsuo, Douglas Eck, and
+Aleksandra Faust. A Real-World WebAgent with Planning, Long Context Understanding, and
+Program Synthesis. 2023. doi: 10.48550/ARXIV.2307.12856. URL https://arxiv.org/
+abs/2307.12856. Publisher: arXiv Version Number: 4.
+David Ha and J¨urgen Schmidhuber. World Models. March 2018. doi: 10.5281/zenodo.1207631.
+URL http://arxiv.org/abs/1803.10122. arXiv:1803.10122 [cs].
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+Hongliang He, Wenlin Yao, Kaixin Ma, Wenhao Yu, Yong Dai, Hongming Zhang, Zhenzhong Lan,
+and Dong Yu. WebVoyager: Building an End-to-End Web Agent with Large Multimodal Models,
+June 2024. URL http://arxiv.org/abs/2401.13919. arXiv:2401.13919 [cs].
+Yang Hu, Xingyu Zhang, Xueji Fang, Zhiyang Chen, Xiao Wang, Huatian Zhang, and Guojun Qi.
+SLOT: Sample-specific Language Model Optimization at Test-time, May 2025. URL http:
+//arxiv.org/abs/2505.12392. arXiv:2505.12392 [cs].
+Tomoyuki Kagaya, Thong Jing Yuan, Yuxuan Lou, Jayashree Karlekar, Sugiri Pranata, Akira Ki-
+nose, Koki Oguri, Felix Wick, and Yang You. RAP: Retrieval-Augmented Planning with Con-
+textual Memory for Multimodal LLM Agents. 2024. doi: 10.48550/ARXIV.2402.03610. URL
+https://arxiv.org/abs/2402.03610. Publisher: arXiv Version Number: 1.
+Fangyu Lei, Jixuan Chen, Yuxiao Ye, Ruisheng Cao, Dongchan Shin, Hongjin Su, Zhaoqing Suo,
+Hongcheng Gao, Wenjing Hu, Pengcheng Yin, Victor Zhong, Caiming Xiong, Ruoxi Sun, Qian
+Liu, Sida Wang, and Tao Yu. Spider 2.0: Evaluating Language Models on Real-World Enterprise
+Text-to-SQL Workflows, November 2024. URL http://arxiv.org/abs/2411.07763.
+arXiv:2411.07763 [cs].
+Jinyang Li, Binyuan Hui, Ge Qu, Jiaxi Yang, Binhua Li, Bowen Li, Bailin Wang, Bowen Qin,
+Rongyu Cao, Ruiying Geng, Nan Huo, Xuanhe Zhou, Chenhao Ma, Guoliang Li, Kevin C. C.
+Chang, Fei Huang, Reynold Cheng, and Yongbin Li. Can LLM Already Serve as A Database
+Interface? A BIg Bench for Large-Scale Database Grounded Text-to-SQLs, November 2023a.
+URL http://arxiv.org/abs/2305.03111. arXiv:2305.03111 [cs].
+Kenneth
+Li,
+Oam
+Patel,
+Fernanda
+Vi´egas,
+Hanspeter
+Pfister,
+and
+Martin
+Wattenberg.
+Inference-Time Intervention:
+Eliciting Truthful Answers from a Language Model.
+Ad-
+vances in Neural Information Processing Systems,
+36:41451–41530,
+December 2023b.
+URL
+https://proceedings.neurips.cc/paper_files/paper/2023/hash/
+81b8390039b7302c909cb769f8b6cd93-Abstract-Conference.html.
+Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio
+Petroni, and Percy Liang.
+Lost in the Middle:
+How Language Models Use Long
+Contexts.
+Transactions
+of
+the
+Association
+for
+Computational
+Linguistics,
+12:157–
+173, February 2024.
+ISSN 2307-387X.
+doi:
+10.1162/tacl a 00638.
+URL https:
+//direct.mit.edu/tacl/article/doi/10.1162/tacl_a_00638/119630/
+Lost-in-the-Middle-How-Language-Models-Use-Long.
+Linhao Luo, Yuan-Fang Li, Gholamreza Haffari, and Shirui Pan. Reasoning on Graphs: Faithful
+and Interpretable Large Language Model Reasoning. 2023. doi: 10.48550/ARXIV.2310.01061.
+URL https://arxiv.org/abs/2310.01061. Publisher: arXiv Version Number: 2.
+Xing Han L`u, Zdenˇek Kasner, and Siva Reddy. WebLINX: Real-World Website Navigation with
+Multi-Turn Dialogue, September 2024.
+URL http://arxiv.org/abs/2402.05930.
+arXiv:2402.05930 [cs].
+Swaroop Mishra, Daniel Khashabi, Chitta Baral, and Hannaneh Hajishirzi. Cross-Task General-
+ization via Natural Language Crowdsourcing Instructions. In Proceedings of the 60th Annual
+Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp. 3470–
+3487, Dublin, Ireland, 2022. Association for Computational Linguistics. doi: 10.18653/v1/2022.
+acl-long.244. URL https://aclanthology.org/2022.acl-long.244.
+Shikhar Murty, Hao Zhu, Dzmitry Bahdanau, and Christopher D. Manning. NNetNav: Unsuper-
+vised Learning of Browser Agents Through Environment Interaction in the Wild, February 2025.
+URL http://arxiv.org/abs/2410.02907. arXiv:2410.02907 [cs].
+Shuaicheng Niu, Jiaxiang Wu, Yifan Zhang, Yaofo Chen, Shijian Zheng, Peilin Zhao, and Mingkui
+Tan. Efficient Test-Time Model Adaptation without Forgetting. arXiv, 2022. doi: 10.48550/
+ARXIV.2204.02610. URL https://arxiv.org/abs/2204.02610. Version Number: 2.
+OpenAI, Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Floren-
+cia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, Red
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+Avila, Igor Babuschkin, Suchir Balaji, Valerie Balcom, Paul Baltescu, Haiming Bao, Moham-
+mad Bavarian, Jeff Belgum, Irwan Bello, Jake Berdine, Gabriel Bernadett-Shapiro, Christopher
+Berner, Lenny Bogdonoff, Oleg Boiko, Madelaine Boyd, Anna-Luisa Brakman, Greg Brock-
+man, Tim Brooks, Miles Brundage, Kevin Button, Trevor Cai, Rosie Campbell, Andrew Cann,
+Brittany Carey, Chelsea Carlson, Rory Carmichael, Brooke Chan, Che Chang, Fotis Chantzis,
+Derek Chen, Sully Chen, Ruby Chen, Jason Chen, Mark Chen, Ben Chess, Chester Cho, Casey
+Chu, Hyung Won Chung, Dave Cummings, Jeremiah Currier, Yunxing Dai, Cory Decareaux,
+Thomas Degry, Noah Deutsch, Damien Deville, Arka Dhar, David Dohan, Steve Dowling, Sheila
+Dunning, Adrien Ecoffet, Atty Eleti, Tyna Eloundou, David Farhi, Liam Fedus, Niko Felix,
+Sim´on Posada Fishman, Juston Forte, Isabella Fulford, Leo Gao, Elie Georges, Christian Gib-
+son, Vik Goel, Tarun Gogineni, Gabriel Goh, Rapha Gontijo-Lopes, Jonathan Gordon, Morgan
+Grafstein, Scott Gray, Ryan Greene, Joshua Gross, Shixiang Shane Gu, Yufei Guo, Chris Hal-
+lacy, Jesse Han, Jeff Harris, Yuchen He, Mike Heaton, Johannes Heidecke, Chris Hesse, Alan
+Hickey, Wade Hickey, Peter Hoeschele, Brandon Houghton, Kenny Hsu, Shengli Hu, Xin Hu,
+Joost Huizinga, Shantanu Jain, Shawn Jain, Joanne Jang, Angela Jiang, Roger Jiang, Haozhun
+Jin, Denny Jin, Shino Jomoto, Billie Jonn, Heewoo Jun, Tomer Kaftan, Łukasz Kaiser, Ali Ka-
+mali, Ingmar Kanitscheider, Nitish Shirish Keskar, Tabarak Khan, Logan Kilpatrick, Jong Wook
+Kim, Christina Kim, Yongjik Kim, Jan Hendrik Kirchner, Jamie Kiros, Matt Knight, Daniel
+Kokotajlo, Łukasz Kondraciuk, Andrew Kondrich, Aris Konstantinidis, Kyle Kosic, Gretchen
+Krueger, Vishal Kuo, Michael Lampe, Ikai Lan, Teddy Lee, Jan Leike, Jade Leung, Daniel
+Levy, Chak Ming Li, Rachel Lim, Molly Lin, Stephanie Lin, Mateusz Litwin, Theresa Lopez,
+Ryan Lowe, Patricia Lue, Anna Makanju, Kim Malfacini, Sam Manning, Todor Markov, Yaniv
+Markovski, Bianca Martin, Katie Mayer, Andrew Mayne, Bob McGrew, Scott Mayer McKinney,
+Christine McLeavey, Paul McMillan, Jake McNeil, David Medina, Aalok Mehta, Jacob Menick,
+Luke Metz, Andrey Mishchenko, Pamela Mishkin, Vinnie Monaco, Evan Morikawa, Daniel
+Mossing, Tong Mu, Mira Murati, Oleg Murk, David M´ely, Ashvin Nair, Reiichiro Nakano, Ra-
+jeev Nayak, Arvind Neelakantan, Richard Ngo, Hyeonwoo Noh, Long Ouyang, Cullen O’Keefe,
+Jakub Pachocki, Alex Paino, Joe Palermo, Ashley Pantuliano, Giambattista Parascandolo, Joel
+Parish, Emy Parparita, Alex Passos, Mikhail Pavlov, Andrew Peng, Adam Perelman, Filipe
+de Avila Belbute Peres, Michael Petrov, Henrique Ponde de Oliveira Pinto, Michael, Pokorny,
+Michelle Pokrass, Vitchyr H. Pong, Tolly Powell, Alethea Power, Boris Power, Elizabeth Proehl,
+Raul Puri, Alec Radford, Jack Rae, Aditya Ramesh, Cameron Raymond, Francis Real, Kendra
+Rimbach, Carl Ross, Bob Rotsted, Henri Roussez, Nick Ryder, Mario Saltarelli, Ted Sanders,
+Shibani Santurkar, Girish Sastry, Heather Schmidt, David Schnurr, John Schulman, Daniel Sel-
+sam, Kyla Sheppard, Toki Sherbakov, Jessica Shieh, Sarah Shoker, Pranav Shyam, Szymon Sidor,
+Eric Sigler, Maddie Simens, Jordan Sitkin, Katarina Slama, Ian Sohl, Benjamin Sokolowsky,
+Yang Song, Natalie Staudacher, Felipe Petroski Such, Natalie Summers, Ilya Sutskever, Jie Tang,
+Nikolas Tezak, Madeleine B. Thompson, Phil Tillet, Amin Tootoonchian, Elizabeth Tseng, Pre-
+ston Tuggle, Nick Turley, Jerry Tworek, Juan Felipe Cer´on Uribe, Andrea Vallone, Arun Vi-
+jayvergiya, Chelsea Voss, Carroll Wainwright, Justin Jay Wang, Alvin Wang, Ben Wang, Jonathan
+Ward, Jason Wei, C. J. Weinmann, Akila Welihinda, Peter Welinder, Jiayi Weng, Lilian Weng,
+Matt Wiethoff, Dave Willner, Clemens Winter, Samuel Wolrich, Hannah Wong, Lauren Work-
+man, Sherwin Wu, Jeff Wu, Michael Wu, Kai Xiao, Tao Xu, Sarah Yoo, Kevin Yu, Qiming Yuan,
+Wojciech Zaremba, Rowan Zellers, Chong Zhang, Marvin Zhang, Shengjia Zhao, Tianhao Zheng,
+Juntang Zhuang, William Zhuk, and Barret Zoph. GPT-4 Technical Report, March 2024. URL
+http://arxiv.org/abs/2303.08774. arXiv:2303.08774 [cs].
+Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Carroll L. Wainwright, Pamela Mishkin, Chong
+Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, John Schulman, Jacob Hilton, Fraser Kel-
+ton, Luke Miller, Maddie Simens, Amanda Askell, Peter Welinder, Paul Christiano, Jan Leike,
+and Ryan Lowe. Training language models to follow instructions with human feedback, March
+2022. URL http://arxiv.org/abs/2203.02155. arXiv:2203.02155 [cs].
+Nina Panickssery, Nick Gabrieli, Julian Schulz, Meg Tong, Evan Hubinger, and Alexander Matt
+Turner.
+Steering Llama 2 via Contrastive Activation Addition, July 2024.
+URL http:
+//arxiv.org/abs/2312.06681. arXiv:2312.06681 [cs].
+Shishir G Patil, Huanzhi Mao, Fanjia Yan, Charlie Cheng-Jie Ji, Vishnu Suresh, Ion Stoica, and
+Joseph E Gonzalez. The Berkeley Function Calling Leaderboard (BFCL): From Tool Use to
+Agentic Evaluation of Large Language Models.
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+Akshara Prabhakar, Zuxin Liu, Ming Zhu, Jianguo Zhang, Tulika Awalgaonkar, Shiyu Wang, Zhi-
+wei Liu, Haolin Chen, Thai Hoang, Juan Carlos Niebles, Shelby Heinecke, Weiran Yao, Huan
+Wang, Silvio Savarese, and Caiming Xiong. APIGen-MT: Agentic Pipeline for Multi-Turn Data
+Generation via Simulated Agent-Human Interplay, July 2025. URL http://arxiv.org/
+abs/2504.03601. arXiv:2504.03601 [cs].
+Shuofei Qiao, Runnan Fang, Ningyu Zhang, Yuqi Zhu, Xiang Chen, Shumin Deng, Yong Jiang,
+Pengjun Xie, Fei Huang, and Huajun Chen.
+Agent Planning with World Knowledge Model.
+2024. doi: 10.48550/ARXIV.2405.14205. URL https://arxiv.org/abs/2405.14205.
+Publisher: arXiv Version Number: 4.
+Qwen, An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan
+Li, Dayiheng Liu, Fei Huang, Haoran Wei, Huan Lin, Jian Yang, Jianhong Tu, Jianwei Zhang,
+Jianxin Yang, Jiaxi Yang, Jingren Zhou, Junyang Lin, Kai Dang, Keming Lu, Keqin Bao, Kexin
+Yang, Le Yu, Mei Li, Mingfeng Xue, Pei Zhang, Qin Zhu, Rui Men, Runji Lin, Tianhao Li,
+Tianyi Tang, Tingyu Xia, Xingzhang Ren, Xuancheng Ren, Yang Fan, Yang Su, Yichang Zhang,
+Yu Wan, Yuqiong Liu, Zeyu Cui, Zhenru Zhang, and Zihan Qiu. Qwen2.5 Technical Report,
+January 2025. URL http://arxiv.org/abs/2412.15115. arXiv:2412.15115 [cs].
+Viacheslav Sinii, Alexey Gorbatovski, Artem Cherepanov, Boris Shaposhnikov, Nikita Balagansky,
+and Daniil Gavrilov. Steering LLM Reasoning Through Bias-Only Adaptation, October 2025.
+URL http://arxiv.org/abs/2505.18706. arXiv:2505.18706 [cs].
+Yu Sun, Xiaolong Wang, Zhuang Liu, John Miller, Alexei Efros, and Moritz Hardt. Test-Time
+Training with Self-Supervision for Generalization under Distribution Shifts. In Proceedings of the
+37th International Conference on Machine Learning, pp. 9229–9248. PMLR, November 2020.
+URL https://proceedings.mlr.press/v119/sun20b.html. ISSN: 2640-3498.
+Daniel Tan, David Chanin, Aengus Lynch, Dimitrios Kanoulas, Brooks Paige, Adria Garriga-
+Alonso, and Robert Kirk. Analyzing the Generalization and Reliability of Steering Vectors, May
+2025. URL http://arxiv.org/abs/2407.12404. arXiv:2407.12404 [cs].
+Lucas-Andrei Thil, Mirela Popa, and Gerasimos Spanakis. Navigating WebAI: Training Agents
+to Complete Web Tasks with Large Language Models and Reinforcement Learning. Proceed-
+ings of the 39th ACM/SIGAPP Symposium on Applied Computing, pp. 866–874, April 2024.
+doi: 10.1145/3605098.3635903. URL https://dl.acm.org/doi/10.1145/3605098.
+3635903. Conference Name: SAC ’24: 39th ACM/SIGAPP Symposium on Applied Computing
+ISBN: 9798400702433 Place: Avila Spain Publisher: ACM.
+Alexander Matt Turner, Lisa Thiergart, Gavin Leech, David Udell, Juan J. Vazquez, Ulisse Mini,
+and Monte MacDiarmid. Steering Language Models With Activation Engineering, October 2024.
+URL http://arxiv.org/abs/2308.10248. arXiv:2308.10248 [cs].
+Dequan Wang, Evan Shelhamer, Shaoteng Liu, Bruno Olshausen, and Trevor Darrell. Tent: Fully
+Test-time Adaptation by Entropy Minimization, March 2021.
+URL http://arxiv.org/
+abs/2006.10726. arXiv:2006.10726 [cs].
+Junjie Wang, Mingyang Chen, Binbin Hu, Dan Yang, Ziqi Liu, Yue Shen, Peng Wei, Zhiqiang
+Zhang, Jinjie Gu, Jun Zhou, Jeff Z. Pan, Wen Zhang, and Huajun Chen.
+Learning to Plan
+for Retrieval-Augmented Large Language Models from Knowledge Graphs.
+2024a.
+doi:
+10.48550/ARXIV.2406.14282. URL https://arxiv.org/abs/2406.14282. Publisher:
+arXiv Version Number: 3.
+Zora Zhiruo Wang, Jiayuan Mao, Daniel Fried, and Graham Neubig. Agent Workflow Memory,
+September 2024b. URL http://arxiv.org/abs/2409.07429. arXiv:2409.07429 [cs].
+Tianbao Xie, Danyang Zhang, Jixuan Chen, Xiaochuan Li, Siheng Zhao, Ruisheng Cao, Toh Jing
+Hua, Zhoujun Cheng, Dongchan Shin, Fangyu Lei, Yitao Liu, Yiheng Xu, Shuyan Zhou, Silvio
+Savarese, Caiming Xiong, Victor Zhong, and Tao Yu. OSWorld: Benchmarking Multimodal
+Agents for Open-Ended Tasks in Real Computer Environments, May 2024.
+URL http://
+arxiv.org/abs/2404.07972. arXiv:2404.07972 [cs].
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+Yiheng Xu, Dunjie Lu, Zhennan Shen, Junli Wang, Zekun Wang, Yuchen Mao, Caiming Xiong,
+and Tao Yu. AgentTrek: Agent Trajectory Synthesis via Guiding Replay with Web Tutorials,
+December 2024. URL http://arxiv.org/abs/2412.09605. arXiv:2412.09605 [cs].
+Ke Yang, Jiateng Liu, John Wu, Chaoqi Yang, Yi R. Fung, Sha Li, Zixuan Huang, Xu Cao, Xingyao
+Wang, Yiquan Wang, Heng Ji, and Chengxiang Zhai. If LLM Is the Wizard, Then Code Is the
+Wand: A Survey on How Code Empowers Large Language Models to Serve as Intelligent Agents.
+2024. doi: 10.48550/ARXIV.2401.00812. URL https://arxiv.org/abs/2401.00812.
+Publisher: arXiv Version Number: 2.
+Ke Yang, Yao Liu, Sapana Chaudhary, Rasool Fakoor, Pratik Chaudhari, George Karypis, and
+Huzefa Rangwala. AgentOccam: A Simple Yet Strong Baseline for LLM-Based Web Agents,
+May 2025. URL http://arxiv.org/abs/2410.13825. arXiv:2410.13825 [cs].
+Shunyu Yao, Noah Shinn, Pedram Razavi, and Karthik Narasimhan. $\tau$-bench: A Benchmark
+for Tool-Agent-User Interaction in Real-World Domains, June 2024. URL http://arxiv.
+org/abs/2406.12045. arXiv:2406.12045 [cs].
+Yanzhe Zhang, Tao Yu, and Diyi Yang. Attacking Vision-Language Computer Agents via Pop-ups,
+November 2024. URL http://arxiv.org/abs/2411.02391. arXiv:2411.02391 [cs]
+version: 1.
+Shuyan Zhou, Frank F. Xu, Hao Zhu, Xuhui Zhou, Robert Lo, Abishek Sridhar, Xianyi Cheng,
+Tianyue Ou, Yonatan Bisk, Daniel Fried, Uri Alon, and Graham Neubig. WebArena: A Realistic
+Web Environment for Building Autonomous Agents, April 2024a. URL http://arxiv.org/
+abs/2307.13854. arXiv:2307.13854 [cs].
+Siyu Zhou, Tianyi Zhou, Yijun Yang, Guodong Long, Deheng Ye, Jing Jiang, and Chengqi
+Zhang.
+WALL-E: World Alignment by Rule Learning Improves World Model-based LLM
+Agents.
+2024b.
+doi: 10.48550/ARXIV.2410.07484.
+URL https://arxiv.org/abs/
+2410.07484. Publisher: arXiv Version Number: 2.
+Andy Zou, Long Phan, Sarah Chen, James Campbell, Phillip Guo, Richard Ren, Alexander
+Pan, Xuwang Yin, Mantas Mazeika, Ann-Kathrin Dombrowski, Shashwat Goel, Nathaniel Li,
+Michael J. Byun, Zifan Wang, Alex Mallen, Steven Basart, Sanmi Koyejo, Dawn Song, Matt
+Fredrikson, J. Zico Kolter, and Dan Hendrycks. Representation Engineering: A Top-Down Ap-
+proach to AI Transparency, March 2025. URL http://arxiv.org/abs/2310.01405.
+arXiv:2310.01405 [cs].
+Yuxin Zuo, Kaiyan Zhang, Li Sheng, Shang Qu, Ganqu Cui, Xuekai Zhu, Haozhan Li, Yuchen
+Zhang, Xinwei Long, Ermo Hua, Biqing Qi, Youbang Sun, Zhiyuan Ma, Lifan Yuan, Ning
+Ding, and Bowen Zhou. TTRL: Test-Time Reinforcement Learning, June 2025. URL http:
+//arxiv.org/abs/2504.16084. arXiv:2504.16084 [cs].
+A
+APPENDIX
+A.1
+EXPERIMENT DETAILS
+WebArena
+We follow the BrowserGym guide5 to setup WebArena enviornment. We use AWS
+EC2 instance with a t3a.xlarge instance. For all exploration episodes of dynamics grounding,
+we use a temperatue of 1.0. We use a temperature of 0.0 for all task evaluation experiments.
+BFCLv3
+For BFCLv3, we follow the official setup6 and consistently using a temperature of 0.
+5https://github.com/ServiceNow/BrowserGym/blob/main/browsergym/
+webarena/README.md
+6https://github.com/ShishirPatil/gorilla/tree/main/
+berkeley-function-call-leaderboard
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+Tau-bench
+We adopt the codebase form (Prabhakar et al., 2025) and use Best-of-N (N=5) strategy
+for LLM-simulated user agent, so each trajectory will be scored by an LLM judge and the reponse
+that best adheres with user intent will be select, therefore drastically mitigating variance in average
+reward.
+A.2
+PROMPTS USED IN WEBARENA EXPERIMENTS
+Listing 1: prompt used to synthesize personas for WebArena
+You are
+an
+e x p e r t
+a t
+c r e a t i n g
+r e a l i s t i c
+user
+personas
+given
+a
+website . You are
+given
+the name of
+a
+website
+and some example
+o u t p u t s
+f o r
+the
+website ,
+g e n e r a t e
+a
+d i v e r s e
+l i s t
+of ${
+n personas } personas ,
+each
+with
+a
+unique
+” persona ” name and a
+1−2 se n t en c e
+” d e s c r i p t i o n ”
+of
+t h e i r
+t y p i c a l
+behavior ,
+i n t e r e s t s ,
+or
+m o t i v a t i o n s
+on
+t h a t
+s i t e .
+Format
+your
+output
+as
+a JSON array ,
+where
+each
+element
+i s
+an
+o b j e c t
+with two
+f i e l d s :
+−” persona ” :
+a
+short ,
+d e s c r i p t i v e
+name
+f o r
+the
+persona
+( e . g . ,
+”
+Casual
+Browser ” ,
+” Tech
+E n t h u s i a s t ”)
+−” d e s c r i p t i o n ” :
+a
+b r i e f
+d e s c r i p t i o n
+of how
+t h i s
+persona
+t y p i c a l l y
+uses
+the
+website
+Now,
+g e n e r a t e
+a
+l i s t
+of
+personas
+in
+the
+s p e c i f i e d JSON format . You
+are
+given
+the name of
+the
+website
+and some example
+o u t p u t s
+f o r
+the
+website .
+Website :
+${ website }
+Example
+o u t p u t s :
+${ examples }
+Listing 2: prompt used for persona-driven exploration in WebArena
+You are
+an autonomous
+i n t e l l i g e n t
+agent
+tasked
+with
+n a v i g a t i n g
+a
+web browser .
+Your
+o b j e c t i v e
+i s
+to
+s i m u l a t e
+a
+t a s k
+t h a t
+a
+person
+might
+perform ,
+by
+i n t e r a c t i n g
+with
+the
+browser
+through
+the
+use
+of
+s p e c i f i c
+a c t i o n s .
+Here ’ s
+the
+i n f o r m a t i o n
+you ’ l l
+have :
+The
+c u r r e n t
+web page ’ s
+a c c e s s i b i l i t y
+t r e e :
+This
+i s
+a
+s i m p l i f i e d
+r e p r e s e n t a t i o n
+of
+the
+webpage ,
+p r o v i d i n g
+key
+i n f o r m a t i o n .
+The
+c u r r e n t
+web page ’ s URL:
+This
+i s
+the
+page you ’ re
+c u r r e n t l y
+n a v i g a t i n g .
+The open
+t a b s :
+These
+are
+the
+t a b s
+you have open .
+The
+p r ev i o us
+a c t i o n :
+This
+i s
+the
+a c t i o n
+you
+j u s t
+performed .
+I t
+may
+be
+h e l p f u l
+to
+t r a c k
+your
+p r o g r e s s .
+T r a j e c t o r y :
+This
+i s
+a
+sequence
+of
+n a t u r a l
+language
+d e s c r i p t i o n s
+of
+the
+agent ’ s
+i n t e r a c t i o n
+with
+the web−browser .
+Person
+D e s c r i p t i o n :
+The
+d e s c r i p t i o n
+of
+a
+s p e c i f i c
+kind
+of
+person
+whose
+t a s k
+you
+are
+supposed
+to
+s i m u l a t e .
+Environment
+dynamics :
+D e s c r i p t i o n s
+of how
+s t a t e s
+t r a n s i t i o n .
+The
+a c t i o n s
+you can
+perform
+f a l l
+i n t o
+s e v e r a l
+c a t e g o r i e s :
+Page
+Operation
+Actions :
+‘ c l i c k
+[ id ] ‘ :
+This
+a c t i o n
+c l i c k s
+on an
+element
+with
+a
+s p e c i f i c
+id
+on
+the
+webpage .
+‘ type
+[ id ]
+[ c o n t e n t ]
+[ p r e s s e n t e r a f t e r = 0 | 1 ] ‘ :
+Use
+t h i s
+to
+type
+the
+c o n t e n t
+i n t o
+the
+f i e l d
+with
+id . By d e f a u l t ,
+the
+” Enter ”
+key
+i s
+pre ssed
+a f t e r
+typing
+u n l e s s
+p r e s s e n t e r a f t e r
+i s
+s e t
+to
+0.
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+‘ hover
+[ id ] ‘ :
+Hover
+over
+an
+element
+with
+id .
+‘ p r e s s
+[ key comb ] ‘ :
+Simulates
+the
+p r e s s i n g
+of
+a key
+combination
+on
+the
+keyboard
+( e . g . ,
+C t r l +v ) .
+‘ s c r o l l
+[ d i r e c t i o n =down | up ] ‘ :
+S c r o l l
+the
+page up or down .
+Tab Management
+Actions :
+‘ new tab ‘ :
+Open a new ,
+empty
+browser
+tab .
+‘ t a b f o c u s
+[ t a b i n d e x ] ‘ :
+Switch
+the
+browser ’ s
+focus
+to
+a
+s p e c i f i c
+tab
+using
+i t s
+index .
+‘ c l o s e t a b ‘ :
+Close
+the
+c u r r e n t l y
+a c t i v e
+tab .
+URL Navigation
+Actions :
+‘ goto
+[ u r l ] ‘ :
+Navigate
+to
+a
+s p e c i f i c URL.
+‘ go back ‘ :
+Navigate
+to
+the
+p r e v i o u s l y
+viewed
+page .
+‘ go forward ‘ :
+Navigate
+to
+the
+next
+page
+( i f
+a
+p r ev i ou s
+’ go back ’
+a c t i o n
+was performed ) .
+Completion
+Action :
+‘ stop
+[” done ” ] ‘ :
+I s s u e
+t h i s
+a c t i o n
+when you
+are
+done .
+Homepage :
+I f
+you want
+to
+v i s i t
+o t h e r
+websites ,
+check
+out
+the
+homepage
+a t
+h t t p : / / homepage . com .
+I t
+has a
+l i s t
+of
+w e bs i te s
+you can
+v i s i t .
+To be
+s u c c e s s f u l ,
+i t
+i s
+very
+i m p o r t a n t
+to
+follow
+the
+f o l l o w i n g
+r u l e s :
+1 . You should
+only
+i s s u e
+an
+a c t i o n
+t h a t
+i s
+v a l i d
+given
+the
+c u r r e n t
+o b s e r v a t i o n
+2 . You should
+only
+i s s u e
+one
+a c t i o n
+a t
+a
+time .
+3 . You should
+follow
+the
+examples
+to
+reason
+s t e p
+by
+s t e p
+and
+then
+i s s u e
+the
+next
+a c t i o n .
+4 .
+Generate
+the
+a c t i o n
+in
+the
+c o r r e c t
+format .
+S t a r t
+with
+a ” In
+summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s ”
+phrase ,
+followed
+by
+a c t i o n
+i n s i d e
+‘ ‘ ‘ ‘ ‘ ‘.
+For example ,
+” In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ c l i c k
+[1234] ‘ ‘ ‘”.
+5 . To g e n e r a t e
+an
+i n t e r e s t i n g
+task ,
+make sure
+you
+i s s u e
+a t l e a s t
+4
+a c t i o n s
+before
+st op p in g .
+More
+i n t e r e s t i n g
+t a s k s
+t y p i c a l l y
+involve
+more
+i n t e r a c t i o n s
+with
+the
+browser .
+6 . You can
+i s s u e
+atmost 40
+a c t i o n s
+before
+stopping ,
+but
+f e e l
+f r e e
+to
+output
+the
+stop
+a c t i o n
+e a r l y
+i f
+you want
+to
+stop
+e x p l o r i n g .
+Don ’ t
+g e n e r a t e
+anything
+a f t e r
+stop .
+Here
+are
+the
+l i s t
+of
+environmental
+dynamics
+of
+t h i s
+environment :
+OBSERVATION:
+[1744]
+l i n k
+’HP CB782A#ABA 640
+I n k j e t
+Fax Machine
+( Renewed ) ’
+[1749]
+S t a t i c T e x t
+’ $279 .49 ’
+[1757]
+button
+’Add to
+Cart ’
+[1760]
+button
+’Add to Wish List ’
+[1761]
+button
+’Add to
+Compare ’
+URL:
+h t t p : / / onestopmarket . com / o f f i c e −p ro d uc t s / o f f i c e −e l e c t r o n i c s .
+html
+ENVIRONMENTAL DYNAMICS:
+[{ ’ i n i t i a l s t a t e ’ :
+’Homepage of
+onestopmarket . com ,
+with
+the
+button
+Add to
+Cart
+v i s i b l e ’ ,
+’ action ’ :
+’ c l i c k
+[1757]
+where
+the
+button
+i s
+purchase ’ } ]
+PREVIOUS ACTION:
+None
+Let ’ s
+t h i n k
+step −by−s t e p .
+This
+page
+l i s t s
+the
+i n f o r m a t i o n
+of HP
+I n k j e t
+Fax Machine ,
+which
+i s
+the
+product
+i d e n t i f i e d
+in
+the
+o b j e c t i v e .
+I t s
+p r i c e
+i s
+$279 . 4 9 .
+I
+have
+checked
+the
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+environmental
+dynamics and
+see
+t h a t
+s to p pi ng
+with
+t h i s
+answer
+from
+t h i s
+s t a t e
+has
+not
+been done
+before ,
+so
+t h i s
+a c t i o n
+w i l l
+c o n t r i b u t e
+to
+e x p l o r a t i o n
+d i v e r s i t y .
+I
+t h i n k
+I
+have
+achieved
+the
+o b j e c t i v e .
+In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ stop
+[ $279 .49] ‘ ‘ ‘
+OBSERVATION:
+[164]
+textbox
+’ Search ’
+focused :
+True
+r e q u i r e d :
+False
+[171]
+button
+’Go’
+[174]
+l i n k
+’ Find
+d i r e c t i o n s
+between two
+points ’
+[212]
+heading
+’ Search
+Results ’
+[216]
+button
+’ Close ’
+URL:
+h t t p : / / openstreetmap . org
+ENVIRONMENTAL DYNAMICS:
+[{ ’ i n i t i a l s t a t e ’ :
+’ OpenStreetMap homepage
+with
+search
+box and Go
+button
+v i s i b l e ’ ,
+’ action ’ :
+’ c l i c k
+[171]
+to
+submit
+a
+search ’} ,
+{ ’ i n i t i a l s t a t e ’ :
+’ OpenStreetMap homepage
+with
+search
+box
+focused ’ ,
+’ action ’ :
+’ type
+[164]
+[ parks
+near NY]
+[ 1 ] ’ } ]
+PREVIOUS ACTION:
+None
+Let ’ s
+t h i n k
+step −by−s t e p .
+This
+page
+has a
+search
+box whose ID
+i s
+[ 1 6 4 ] .
+According
+to
+the
+nominatim
+r u l e
+of
+openstreetmap ,
+I
+can
+search
+f o r
+r e s t a u r a n t s
+near
+a
+l o c a t i o n
+by
+typing
+” r e s t a u r a n t s
+near ”
+followed
+by
+the
+l o c a t i o n .
+I
+can
+submit my typing
+by
+p r e s s i n g
+Enter
+a f t e r w a r d s .
+Before
+proceeding ,
+I
+w i l l
+check
+the
+environmental
+dynamics
+to
+see
+i f
+a
+s i m i l a r
+a c t i o n
+has
+a l r e a d y
+been
+performed
+from
+t h i s
+s t a t e .
+I
+see
+t h a t
+t h e r e
+i s
+no
+p re v io u s
+a c t i o n
+where ,
+s t a r t i n g
+from
+the
+c u r r e n t
+s t a t e ,
+someone
+searched
+f o r
+” r e s t a u r a n t s
+near CMU”
+in
+the
+search
+box .
+This means my a c t i o n
+w i l l
+c o n t r i b u t e
+to
+e x p l o r a t i o n
+d i v e r s i t y
+.
+In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ type
+[164]
+[ r e s t a u r a n t s
+near CMU]
+[1] ‘ ‘ ‘
+OBSERVATION:
+${OBSERVATION}
+Person
+D e s c r i p t i o n :
+${PERSON DESCRIPTION}
+URL:
+${URL}
+PREVIOUS ACTION:
+${PREVIOUS ACTION}
+ENVIRONMENTAL DYNAMICS:
+${ENVIRONMENTAL DYNAMICS}
+Listing 3: prompt used to extract environment dynamics from observations
+You are
+given
+the
+output
+of
+an
+a c t i o n
+taken
+by an autonomous
+i n t e l l i g e n t
+agent
+n a v i g a t i n g
+a web browser .
+Your
+o b j e c t i v e
+i s
+to
+produce a
+d e s c r i p t i o n
+of
+the
+changes made to
+the
+s t a t e
+of
+the
+browser .
+S p e c i f i c a l l y ,
+you need
+to
+produce
+the
+f o l l o w i n g
+elements :
+1)
+I n i t i a l
+s t a t e :
+provide
+a
+conc ise
+d e s c r i p t i o n
+of
+the
+browser ’ s
+s t a t e
+before
+the
+a c t i o n
+was
+taken
+( f o r
+example :
+” GitHub
+homepage ”
+or ” GitHub
+r e p o s i t o r y
+page ”) .
+2)
+Environmental
+dynamics :
+c l e a r l y
+d e s c r i b e
+the
+s p e c i f i c
+changes
+t h a t
+occurred
+in
+the
+browser ’ s
+s t a t e
+as
+a
+r e s u l t
+of
+the
+a c t i o n
+( f o r
+example :
+”The
+search
+bar
+expanded and
+i s
+able
+to
+consume
+i n p u t ”) .
+Here ’ s
+the
+i n f o r m a t i o n
+you ’ l l
+have :
+−** I n i t i a l
+s t a t e
+of
+the
+browser
+as
+an
+a c c e s s i b i l i t y
+t r e e :**
+This
+i s
+a
+s i m p l i f i e d
+r e p r e s e n t a t i o n
+of
+the
+webpage ,
+p r o v i d i n g
+key
+i n f o r m a t i o n .
+−** F i n a l
+s t a t e
+of
+the
+browser :**
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+This
+i s
+the
+a c c e s s i b i l i t y
+t r e e
+r e p r e s e n t a t i o n
+a f t e r
+the
+agent
+took
+the
+a c t i o n .
+−**The
+a c t i o n
+taken
+by
+the web agent :**
+The
+agent
+can
+take
+a c t i o n s
+t h a t
+f a l l
+under
+the
+f o l l o w i n g
+c a t e g o r i e s
+( with
+d e s c r i p t i o n s ) :
+** Page
+Operation
+Actions :**
+−‘ c l i c k
+[ id ] ‘ :
+Clicks
+on an
+element
+with
+a
+s p e c i f i c
+id
+on
+the
+webpage .
+−‘ type
+[ id ]
+[ c o n t e n t ]
+[ p r e s s e n t e r a f t e r = 0 | 1 ] ‘ :
+Types
+the
+c o n t e n t
+i n t o
+the
+f i e l d
+with
+id . By d e f a u l t ,
+the
+” Enter ” key
+i s
+pres sed
+a f t e r
+typing
+u n l e s s
+‘ p r e s s e n t e r a f t e r ‘
+i s
+s e t
+to
+0.
+−‘ hover
+[ id ] ‘ :
+Hovers
+over
+an
+element
+with
+id .
+−‘ p r e s s
+[ key comb ] ‘ :
+Simulates
+p r e s s i n g
+a key
+combination
+on
+the
+keyboard
+( e . g . ,
+C t r l +v ) .
+−‘ s c r o l l
+[ d i r e c t i o n =down | up ] ‘ :
+S c r o l l s
+the
+page up or down .
+**Tab Management
+Actions :**
+−‘ new tab ‘ :
+Opens a new ,
+empty
+browser
+tab .
+−‘ t a b f o c u s
+[ t a b i n d e x ] ‘ :
+Switches
+the
+browser ’ s
+focus
+to
+a
+s p e c i f i c
+tab
+using
+i t s
+index .
+−‘ c l o s e t a b ‘ :
+Closes
+the
+c u r r e n t l y
+a c t i v e
+tab .
+**URL Navigation
+Actions :**
+−‘ goto
+[ u r l ] ‘ :
+Navigates
+to
+a
+s p e c i f i c URL.
+−‘ go back ‘ :
+Navigates
+to
+the
+p r e v i o u s l y
+viewed
+page .
+−‘ go forward ‘ :
+Navigates
+to
+the
+next
+page
+( i f
+a
+p r ev i ou s
+’ go back
+’
+a c t i o n
+was performed ) .
+** Completion
+Action :**
+−‘ stop
+[ answer ] ‘ :
+I s s u e
+t h i s
+a c t i o n
+when you
+b e l i e v e
+the
+t a s k
+i s
+complete .
+I f
+the
+o b j e c t i v e
+i s
+to
+f i n d
+a
+text −based
+answer ,
+provide
+the
+answer
+in
+the
+b r a c k e t .
+I f
+you
+b e l i e v e
+the
+t a s k
+i s
+i m p o s s i b l e
+to
+complete ,
+provide
+the
+answer
+as
+”N/A”
+in
+the
+b r a c k e t .
+**To be
+s u c c e s s f u l ,
+i t
+i s
+very
+i m p o r t a n t
+to
+follow
+t h e s e
+r u l e s :**
+1 .
+E x p l i c i t l y
+t h i n k
+about
+the
+v a r i o u s
+f e a t u r e s
+on
+the
+website
+and
+how the
+i n t e r a c t i o n
+with
+the
+website
+changed
+t h e s e
+f e a t u r e s .
+2 .
+Provide
+the
+d e s c r i p t i o n
+of
+changes
+in
+one
+or two
+s e n t e n c e s .
+3 .
+I f
+t h e r e
+i s
+no change ,
+your
+d e s c r i p t i o n
+of
+the
+changes
+in
+s t a t e
+should
+be ”no change ” .
+4 .
+S t r i c t l y
+follow
+the JSON format
+in
+your
+response :
+{”
+i n i t i a l
+s t a t e ” : <d e s c r i p t i o n
+of
+i n i t i a l
+s t a t e >, ”
+environmental dynamics ” : <d e s c r i p t i o n
+of
+environmental
+change
+>}
+Here
+are
+some
+output
+examples
+f o r
+some random
+t a s k s :
+1 .
+{” i n i t i a l
+s t a t e ” :
+” Google homepage
+with
+search
+bar
+v i s i b l e ” ,
+”
+environmental dynamics ” :
+”A modal
+search
+d i a l o g
+opened up ,
+b r i n g i n g
+up a
+focused
+search
+i n p u t
+with
+suggestions ,
+allowing
+the
+user
+to
+search
+or jump
+to
+v a r i o u s
+GitHub
+s e c t i o n s . ” }
+2 .
+{” i n i t i a l
+s t a t e ” :
+” Wikipedia
+a r t i c l e
+page ” ,
+”
+environmental dynamics ” :
+”The page
+s c r o l l e d
+down ,
+r e v e a l i n g
+the
+’ History ’
+s e c t i o n . ” }
+3 .
+{” i n i t i a l
+s t a t e ” :
+”Amazon product
+page ” ,
+”
+environmental dynamics ” :
+”A c o n f i r m a t i o n
+message
+appeared
+i n d i c a t i n g
+the
+item was added
+to
+the
+c a r t . ” }
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+Listing 4: prompt used to remove repeatitive or trivial environment dynamics in WebArena
+You are
+given
+a
+l i s t
+of
+environmental
+dynamics
+of
+an
+environment
+c o l l e c t e d
+by an autonomous web browsing
+agent . You are
+tasked
+to
+remove
+r e p e t i t i v e
+and
+t r i v i a l
+environmental
+dynamics .
+Each
+of
+the
+p o i n t
+c o n s i s t s
+of
+the
+f o l l o w i n g :
+1)
+i n i t i a l
+s t a t e :
+provide
+a
+con cise
+d e s c r i p t i o n
+of
+the
+browser ’ s
+s t a t e
+before
+the
+a c t i o n
+was
+taken
+( f o r
+example :
+” GitHub
+homepage ”
+or ” GitHub
+r e p o s i t o r y
+page ”) .
+2)
+a c t i o n :
+a c t i o n
+taken
+to make the
+environmental
+change
+2)
+environmental dynamics :
+c l e a r l y
+d e s c r i b e
+the
+s p e c i f i c
+changes
+t h a t
+occurred
+in
+the
+browser ’ s
+s t a t e
+as
+a
+r e s u l t
+of
+the
+a c t i o n
+( f o r
+example :
+”The
+search
+bar
+expanded and
+i s
+able
+to
+consume
+i n p u t ”) .
+To be
+s u c c e s s f u l ,
+i t
+i s
+i m p o r t a n t
+to
+follow
+t h e s e
+r u l e s :
+1 .
+e n t r i e s
+with
+t r i v i a l
+enviornmental
+dynamics ,
+such
+as
+”when I
+s c r o l l
+down ,
+the
+page
+w i l l
+r e v e a l
+more
+c o n t e n t ”
+should
+be
+removed .
+T r i v i a l
+environmental
+dynamics
+are
+those
+t h a t
+do not
+r e f l e c t
+a
+meaningful
+or
+unique
+change
+in
+the
+environment ,
+such
+as
+simple
+s c r o l l i n g ,
+pagination ,
+or
+t o g g l i n g
+the
+v i s i b i l i t y
+of
+a l r e a d y
+a v a i l a b l e
+c o n t e n t
+without
+i n t r o d u c i n g
+new
+i n f o r m a t i o n
+or
+i n t e r f a c e
+elements .
+2 . Remove
+e n t r i e s
+where
+the
+environmental dynamics
+only
+d e s c r i b e
+the
+expansion
+or
+c o l l a p s e
+of
+t e x t
+( e . g . ,
+”The
+f u l l
+a b s t r a c t
+expanded and
+i s now
+v i s i b l e ”) ,
+u n l e s s
+the
+expansion
+r e v e a l s
+new
+i n t e r f a c e
+elements
+or
+o p t i o n s
+t h a t
+were
+not
+p r e v i o u s l y
+a c c e s s i b l e .
+3 . Remove
+e n t r i e s
+where
+the
+environmental dynamics
+only
+d e s c r i b e
+n a v i g a t i o n
+to
+a
+d i f f e r e n t
+s e c t i o n
+of
+the
+same page
+( e . g . ,
+”The
+page
+s c r o l l e d
+to
+the
+’ References ’
+s e c t i o n ”) ,
+u n l e s s
+t h i s
+n a v i g a t i o n
+r e s u l t s
+in
+a
+s u b s t a n t i a l
+change
+in
+the
+a v a i l a b l e
+i n t e r f a c e
+or
+c o n t e n t .
+4 .
+Keep
+e n t r i e s
+where
+the
+environmental dynamics
+d e s c r i b e :
+−Unexpected
+or
+s p u r i o u s
+s t a t e
+change
+of
+e x e c u t i n g
+an
+a c t i o n
+a t
+the
+i n i t i a l
+s t a t e .
+−Keep
+e n t r i e s
+where
+the
+environmental dynamics
+i n d i c a t e
+t h a t
+performing
+an
+a c t i o n
+did
+not
+r e s u l t
+in
+any change
+to
+the
+browser ’ s
+s t a t e ,
+even
+though a change would
+normally
+be
+expected
+( f o r
+example ,
+c l i c k i n g
+a
+button
+t h a t
+should
+open a
+menu but
+nothing
+happens ) .
+−The appearance
+of new c o n t r o l s ,
+f i l t e r s ,
+or
+o p t i o n s
+in
+the
+i n t e r f a c e .
+−Navigation
+to
+a new page
+or
+a
+s u b s t a n t i a l l y
+d i f f e r e n t
+view
+( e
+. g . ,
+from
+search
+r e s u l t s
+to
+a
+d e t a i l e d
+a r t i c l e
+page ) .
+−The
+a d d i t i o n
+or
+removal
+of
+search
+f i e l d s ,
+f i l t e r s ,
+or
+o t h e r
+i n t e r a c t i v e
+elements .
+−Any change
+t h a t
+en ables new
+a c t i o n s
+or
+r e v e a l s
+new types
+of
+i n f o r m a t i o n
+not
+p r e v i o u s l y
+a c c e s s i b l e .
+5 . When in
+doubt ,
+p r e f e r
+to
+remove
+e n t r i e s
+t h a t
+are
+r e p e t i t i v e
+( e .
+g . ,
+m u l t i p l e
+e n t r i e s
+d e s c r i b i n g
+the
+same
+type
+of
+a b s t r a c t
+expansion )
+or
+t h a t
+do not
+add new i n f o r m a t i o n
+about
+the
+environment ’ s
+c a p a b i l i t i e s
+or
+s t a t e .
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+Your
+output
+should
+be a
+cleaned
+l i s t
+of
+environmental
+dynamics ,
+with
+only
+the
+non−t r i v i a l ,
+non−r e p e t i t i v e ,
+and
+meaningful
+changes
+r e t a i n e d .
+Please
+output
+in
+the
+o r i g i n a l JSON format .
+Listing 5: prompt used for evaluation in WebArena
+You are
+an autonomous
+i n t e l l i g e n t
+agent
+tasked
+with
+n a v i g a t i n g
+a
+web browser . You w i l l
+be
+given web−based
+t a s k s .
+These
+t a s k s
+w i l l
+be
+accomplished
+through
+the
+use
+of
+s p e c i f i c
+a c t i o n s
+you
+can
+i s s u e .
+Here ’ s
+the
+i n f o r m a t i o n
+you ’ l l
+have :
+The user ’ s
+o b j e c t i v e :
+This
+i s
+the
+t a s k
+you ’ re
+t r y i n g
+to
+complete .
+The
+c u r r e n t
+web page ’ s
+a c c e s s i b i l i t y
+t r e e :
+This
+i s
+a
+s i m p l i f i e d
+r e p r e s e n t a t i o n
+of
+the
+webpage ,
+p r o v i d i n g
+key
+i n f o r m a t i o n .
+The
+c u r r e n t
+web page ’ s URL:
+This
+i s
+the
+page you ’ re
+c u r r e n t l y
+n a v i g a t i n g .
+The open
+t a b s :
+These
+are
+the
+t a b s
+you have open .
+The
+p r ev i o us
+a c t i o n s :
+These
+are
+a l l
+the
+a c t i o n
+you have
+performed .
+I t
+may be
+h e l p f u l
+to
+t r a c k
+your
+p r o g r e s s .
+The
+a c t i o n s
+you can
+perform
+f a l l
+i n t o
+s e v e r a l
+c a t e g o r i e s :
+Page
+Operation
+Actions :
+‘ c l i c k
+[ id ] ‘ :
+This
+a c t i o n
+c l i c k s
+on an
+element
+with
+a
+s p e c i f i c
+id
+on
+the
+webpage .
+‘ type
+[ id ]
+[ c o n t e n t ]
+[ p r e s s e n t e r a f t e r = 0 | 1 ] ‘ :
+Use
+t h i s
+to
+type
+the
+c o n t e n t
+i n t o
+the
+f i e l d
+with
+id . By d e f a u l t ,
+the
+” Enter ”
+key
+i s
+pre ssed
+a f t e r
+typing
+u n l e s s
+p r e s s e n t e r a f t e r
+i s
+s e t
+to
+0.
+‘ hover
+[ id ] ‘ :
+Hover
+over
+an
+element
+with
+id .
+‘ p r e s s
+[ key comb ] ‘ :
+Simulates
+the
+p r e s s i n g
+of
+a key
+combination
+on
+the
+keyboard
+( e . g . ,
+C t r l +v ) .
+‘ s c r o l l
+[ down | up ] ‘ :
+S c r o l l
+the
+page up or down .
+Tab Management
+Actions :
+‘ new tab ‘ :
+Open a new ,
+empty
+browser
+tab .
+‘ t a b f o c u s
+[ t a b i n d e x ] ‘ :
+Switch
+the
+browser ’ s
+focus
+to
+a
+s p e c i f i c
+tab
+using
+i t s
+index .
+‘ c l o s e t a b ‘ :
+Close
+the
+c u r r e n t l y
+a c t i v e
+tab .
+URL Navigation
+Actions :
+‘ goto
+[ u r l ] ‘ :
+Navigate
+to
+a
+s p e c i f i c URL.
+‘ go back ‘ :
+Navigate
+to
+the
+p r e v i o u s l y
+viewed
+page .
+‘ go forward ‘ :
+Navigate
+to
+the
+next
+page
+( i f
+a
+p r ev i ou s
+’ go back ’
+a c t i o n
+was performed ) .
+Completion
+Action :
+‘ stop
+[ answer ] ‘ :
+I s s u e
+t h i s
+a c t i o n
+when you
+b e l i e v e
+the
+t a s k
+i s
+complete .
+I f
+the
+o b j e c t i v e
+i s
+to
+f i n d
+a
+text −based
+answer ,
+provide
+the
+answer
+in
+the
+b r a c k e t .
+I f
+you
+b e l i e v e
+the
+t a s k
+i s
+i m p o s s i b l e
+to
+complete ,
+provide
+the
+answer
+as
+”N/A”
+in
+the
+b r a c k e t .
+Homepage :
+I f
+you want
+to
+v i s i t
+o t h e r
+websites ,
+check
+out
+the
+homepage
+a t
+h t t p : / / homepage . com .
+I t
+has a
+l i s t
+of
+w e bs i te s
+you can
+v i s i t .
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+To be
+s u c c e s s f u l ,
+i t
+i s
+very
+i m p o r t a n t
+to
+follow
+the
+f o l l o w i n g
+r u l e s :
+1 . You should
+only
+i s s u e
+an
+a c t i o n
+t h a t
+i s
+v a l i d
+given
+the
+c u r r e n t
+o b s e r v a t i o n
+2 . You should
+only
+i s s u e
+one
+a c t i o n
+a t
+a
+time .
+3 . You should
+follow
+the
+examples
+to
+reason
+s t e p
+by
+s t e p
+and
+then
+i s s u e
+the
+next
+a c t i o n .
+4 . You are
+s t r i c t l y
+f o r b i d d e n
+from
+i s s u i n g
+a
+goto
+a c t i o n
+to
+a URL
+t h a t
+i s
+not on
+the
+homepage .
+5 .
+Generate
+the
+a c t i o n
+in
+the
+c o r r e c t
+format .
+S t a r t
+by
+r e a s o n i n g
+about
+the
+c u r r e n t
+s i t u a t i o n .
+End with
+” In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s ”
+phrase ,
+followed
+by
+a c t i o n
+i n s i d e
+‘ ‘ ‘ ‘ ‘ ‘.
+For example ,
+” Let ’ s
+t h i n k
+step −by−s t e p .
+Given
+the
+c u r r e n t
+s t a t e ,
+I
+need
+to
+c l i c k
+on
+the
+l i k e
+button
+which
+has
+id
+1234.
+In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ c l i c k
+[1234] ‘ ‘ ‘”.
+6 .
+I s s u e
+stop
+a c t i o n
+when you
+t h i n k
+you have
+achieved
+the
+o b j e c t i v e . Don ’ t
+g e n e r a t e
+anything
+a f t e r
+stop .
+Here
+are
+some example
+o u t p u t s
+f o r
+some random
+t a s k s :
+1 .
+Let ’ s
+t h i n k
+step −by−s t e p .
+This
+page
+l i s t
+the
+i n f o r m a t i o n
+of HP
+I n k j e t
+Fax Machine ,
+which
+i s
+the
+product
+i d e n t i f i e d
+in
+the
+o b j e c t i v e .
+I t s
+p r i c e
+i s
+$279 . 4 9 .
+I
+t h i n k
+I
+have
+achieved
+the
+o b j e c t i v e .
+I
+w i l l
+i s s u e
+the
+stop
+a c t i o n
+with
+the
+answer .
+In
+summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ stop
+[ $279
+.49] ‘ ‘ ‘
+2 .
+Let ’ s
+t h i n k
+step −by−s t e p .
+This
+page
+has a
+search
+box whose ID
+i s
+[ 1 6 4 ] .
+According
+to
+the
+nominatim
+r u l e
+of
+openstreetmap ,
+I
+can
+search
+f o r
+the
+r e s t a u r a n t s
+near
+a
+l o c a t i o n
+by ” r e s t a u r a n t s
+near ” .
+I
+can
+submit my typing
+by
+p r e s s i n g
+the
+Enter
+a f t e r w a r d s .
+In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘
+type
+[164]
+[ r e s t a u r a n t s
+near CMU]
+[1] ‘ ‘ ‘
+Listing 6: prompt used for evaluation on WebArena with environment dynamics
+You are
+an autonomous
+i n t e l l i g e n t
+agent
+tasked
+with
+n a v i g a t i n g
+a
+web browser . You w i l l
+be
+given web−based
+t a s k s .
+These
+t a s k s
+w i l l
+be
+accomplished
+through
+the
+use
+of
+s p e c i f i c
+a c t i o n s
+you
+can
+i s s u e .
+Here ’ s
+the
+i n f o r m a t i o n
+you ’ l l
+have :
+The user ’ s
+o b j e c t i v e :
+This
+i s
+the
+t a s k
+you ’ re
+t r y i n g
+to
+complete .
+The
+c u r r e n t
+web page ’ s
+a c c e s s i b i l i t y
+t r e e :
+This
+i s
+a
+s i m p l i f i e d
+r e p r e s e n t a t i o n
+of
+the
+webpage ,
+p r o v i d i n g
+key
+i n f o r m a t i o n .
+The
+c u r r e n t
+web page ’ s URL:
+This
+i s
+the
+page you ’ re
+c u r r e n t l y
+n a v i g a t i n g .
+The open
+t a b s :
+These
+are
+the
+t a b s
+you have open .
+The
+p r ev i o us
+a c t i o n s :
+These
+are
+a l l
+the
+a c t i o n
+you have
+performed .
+I t
+may be
+h e l p f u l
+to
+t r a c k
+your
+p r o g r e s s .
+The
+environmental
+dynamics : You w i l l
+a l s o
+be
+given
+the
+environmental
+dynamics
+of
+the
+environment . You can
+use
+the
+environmental
+dynamics
+to
+p r e d i c t
+the
+next
+a c t i o n .
+Each
+environmental
+dynamics
+e n t r y
+d e s c r i b e s
+a
+s t a t e
+change
+in
+the
+environment
+and
+c o n t a i n s
+the
+f o l l o w i n g
+f i e l d s :
+−” i n i t i a l
+s t a t e ” :
+The
+s t a t e
+of
+the
+environment
+before
+the
+a c t i o n
+i s
+taken .
+−” a c t i o n ” :
+The
+a c t i o n
+performed by
+the
+agent .
+23
+
+--- Page 24 ---
+Published as a conference paper at ICLR 2026
+−” environmental dynamics ” : A d e s c r i p t i o n
+of how the
+environment
+changes
+as
+a
+r e s u l t
+of
+the
+a c t i o n .
+The
+a c t i o n s
+you can
+perform
+f a l l
+i n t o
+s e v e r a l
+c a t e g o r i e s :
+Page
+Operation
+Actions :
+‘ c l i c k
+[ id ] ‘ :
+This
+a c t i o n
+c l i c k s
+on an
+element
+with
+a
+s p e c i f i c
+id
+on
+the
+webpage .
+‘ type
+[ id ]
+[ c o n t e n t ]
+[ p r e s s e n t e r a f t e r = 0 | 1 ] ‘ :
+Use
+t h i s
+to
+type
+the
+c o n t e n t
+i n t o
+the
+f i e l d
+with
+id . By d e f a u l t ,
+the
+” Enter ”
+key
+i s
+pre ssed
+a f t e r
+typing
+u n l e s s
+p r e s s e n t e r a f t e r
+i s
+s e t
+to
+0.
+‘ hover
+[ id ] ‘ :
+Hover
+over
+an
+element
+with
+id .
+‘ p r e s s
+[ key comb ] ‘ :
+Simulates
+the
+p r e s s i n g
+of
+a key
+combination
+on
+the
+keyboard
+( e . g . ,
+C t r l +v ) .
+‘ s c r o l l
+[ down | up ] ‘ :
+S c r o l l
+the
+page up or down .
+Tab Management
+Actions :
+‘ new tab ‘ :
+Open a new ,
+empty
+browser
+tab .
+‘ t a b f o c u s
+[ t a b i n d e x ] ‘ :
+Switch
+the
+browser ’ s
+focus
+to
+a
+s p e c i f i c
+tab
+using
+i t s
+index .
+‘ c l o s e t a b ‘ :
+Close
+the
+c u r r e n t l y
+a c t i v e
+tab .
+URL Navigation
+Actions :
+‘ goto
+[ u r l ] ‘ :
+Navigate
+to
+a
+s p e c i f i c URL.
+‘ go back ‘ :
+Navigate
+to
+the
+p r e v i o u s l y
+viewed
+page .
+‘ go forward ‘ :
+Navigate
+to
+the
+next
+page
+( i f
+a
+p r ev i ou s
+’ go back ’
+a c t i o n
+was performed ) .
+Completion
+Action :
+‘ stop
+[ answer ] ‘ :
+I s s u e
+t h i s
+a c t i o n
+when you
+b e l i e v e
+the
+t a s k
+i s
+complete .
+I f
+the
+o b j e c t i v e
+i s
+to
+f i n d
+a
+text −based
+answer ,
+provide
+the
+answer
+in
+the
+b r a c k e t .
+I f
+you
+b e l i e v e
+the
+t a s k
+i s
+i m p o s s i b l e
+to
+complete ,
+provide
+the
+answer
+as
+”N/A”
+in
+the
+b r a c k e t .
+Homepage :
+I f
+you want
+to
+v i s i t
+o t h e r
+websites ,
+check
+out
+the
+homepage
+a t
+h t t p : / / homepage . com .
+I t
+has a
+l i s t
+of
+w e bs i te s
+you can
+v i s i t .
+To be
+s u c c e s s f u l ,
+i t
+i s
+very
+i m p o r t a n t
+to
+follow
+the
+f o l l o w i n g
+r u l e s :
+1 . You should
+only
+i s s u e
+an
+a c t i o n
+t h a t
+i s
+v a l i d
+given
+the
+c u r r e n t
+o b s e r v a t i o n
+2 . You should
+only
+i s s u e
+one
+a c t i o n
+a t
+a
+time .
+3 . You should
+follow
+the
+examples
+to
+reason
+s t e p
+by
+s t e p
+and
+then
+i s s u e
+the
+next
+a c t i o n .
+4 . You are
+s t r i c t l y
+f o r b i d d e n
+from
+i s s u i n g
+a
+goto
+a c t i o n
+to
+a URL
+t h a t
+i s
+not on
+the
+homepage .
+5 .
+Generate
+the
+a c t i o n
+in
+the
+c o r r e c t
+format .
+S t a r t
+by
+r e a s o n i n g
+about
+the
+c u r r e n t
+s i t u a t i o n .
+End with
+” In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s ”
+phrase ,
+followed
+by
+a c t i o n
+i n s i d e
+‘ ‘ ‘ ‘ ‘ ‘.
+For example ,
+” Let ’ s
+t h i n k
+step −by−s t e p .
+Given
+the
+c u r r e n t
+s t a t e ,
+I
+need
+to
+c l i c k
+on
+the
+l i k e
+button
+which
+has
+id
+1234.
+In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ c l i c k
+[1234] ‘ ‘ ‘”.
+6 . When s e l e c t i n g
+a c t i o n s ,
+c o n s i d e r
+the
+environmental
+dynamics −
+what
+s t a t e
+changes
+w i l l
+occur
+based on your
+knowledge
+of how
+the
+website
+behaves .
+Use
+t h i s
+to
+avoid
+a c t i o n s
+t h a t
+would
+lead
+24
+
+--- Page 25 ---
+Published as a conference paper at ICLR 2026
+to
+u n d e s i r e d
+s t a t e s
+or
+to
+s t r a t e g i c a l l y
+choose
+a c t i o n s
+t h a t
+lead
+to
+d e s i r e d
+outcomes .
+7 .
+I s s u e
+stop
+a c t i o n
+when you
+t h i n k
+you have
+achieved
+the
+o b j e c t i v e . Don ’ t
+g e n e r a t e
+anything
+a f t e r
+stop .
+Here
+are
+some example
+o u t p u t s
+f o r
+some random
+t a s k s :
+1 .
+Let ’ s
+t h i n k
+step −by−s t e p .
+This
+page
+l i s t s
+the
+i n f o r m a t i o n
+of HP
+I n k j e t
+Fax Machine ,
+which
+i s
+the
+product
+i d e n t i f i e d
+in
+the
+o b j e c t i v e .
+I t s
+p r i c e
+i s
+$279 . 4 9 . By c o n s i d e r i n g
+the
+environmental
+dynamics ,
+I
+can
+confirm
+t h a t
+no
+f u r t h e r
+a c t i o n s
+are
+needed
+to
+change
+the
+s t a t e ,
+and
+I
+have
+achieved
+the
+o b j e c t i v e .
+I
+w i l l
+i s s u e
+the
+stop
+a c t i o n
+with
+the
+answer .
+In
+summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ stop
+[ $279
+.49] ‘ ‘ ‘
+2 .
+Let ’ s
+t h i n k
+step −by−s t e p .
+This
+page
+has a
+search
+box whose ID
+i s
+[ 1 6 4 ] .
+According
+to
+the
+nominatim
+r u l e
+of
+openstreetmap ,
+I
+can
+search
+f o r
+the
+r e s t a u r a n t s
+near
+a
+l o c a t i o n
+by ” r e s t a u r a n t s
+near ” . By c o n s i d e r i n g
+the
+environmental
+dynamics ,
+I know
+t h a t
+typing
+t h i s
+query
+and
+p r e s s i n g
+Enter
+w i l l
+t r i g g e r
+the
+search
+and
+update
+the
+r e s u l t s
+a c c o r d i n g l y .
+Therefore ,
+I
+can
+submit my
+typing
+by
+p r e s s i n g
+the
+Enter
+a f t e r w a r d s .
+In summary ,
+the
+next
+a c t i o n
+I
+w i l l
+perform
+i s
+‘ ‘ ‘ type
+[164]
+[ r e s t a u r a n t s
+near CMU]
+[1] ‘ ‘ ‘
+25
+
+--- Page 26 ---
+Published as a conference paper at ICLR 2026
+A.3
+PROMPTS USED IN BFCLV3 EXPERIMENTS
+Listing 7: prompt used to synthesize exploration tasks on BFCLv3
+You are
+an
+e x p e r t
+a t
+c r e a t i n g
+e x p l o r a t i o n
+s t r a t e g i e s
+t h a t
+w i l l
+help
+guide
+an LLM to
+explor e
+and
+understand
+a new f u n c t i o n
+c a l l i n g
+environment .
+Your
+t a s k
+i s
+to
+s y n t h e s i z e
+some
+e x p l o r a t i o n
+goals
+based on a
+l i s t
+of
+f u n c t i o n s
+and a
+s p e c i f i c
+environment .
+## Task
+Given a
+l i s t
+of
+f u n c t i o n s
+and an
+environment ,
+c r e a t e
+${N}
+d i s t i n c t
+goals
+t h a t
+w i l l
+exp lore
+d i f f f e r e n t
+a s p e c t s
+of
+the
+environment
+.
+Each
+goal
+should
+r e p r e s e n t
+d i f f e r e n t
+e x p l o r a t i o n
+s t r a t e g i e s
+and
+approaches
+to
+d i s c o v e r i n g
+f u n c t i o n a l i t y .
+##
+Input
+Format
+−** Environment **: The computing
+environment
+or
+system
+( e . g . ,
+”
+f i l e
+system ” ,
+” v e h i c l e
+c o n t r o l ” ,
+”web browser ”)
+−** Functions **: A l i s t
+of
+a v a i l a b l e
+f u n c t i o n s / commands
+a l o n g s i d e
+with
+d e t a i l e d
+d e s c r i p t i o n s
+( e . g . ,
+[” cd ( ) ” ,
+” l s ( ) ” ,
+”pwd ( ) ” ,
+”
+mkdir ( ) ” ,
+”rm ( ) ” ] )
+## Output
+Format
+Output a JSON
+l i s t
+of
+goals .
+Each
+goal
+should
+be a
+s i n g l e
+s en t e n ce
+t h a t
+c a p t u r e s
+the
+e x p l o r a t i o n
+goal
+and
+the
+s t r a t e g y
+to
+achieve
+i t .
+Format :
+[” goal
+d e s c r i p t i o n ” ,
+” goal
+d e s c r i p t i o n ” ,
+. . . ]
+## Example Output
+** Environment **:
+F i l e
+System
+** Functions **:
+{”name ” :
+” touch ” ,
+” d e s c r i p t i o n ” :
+” This
+t o o l
+belongs
+to
+the
+G o r i l l a
+f i l e
+system .
+I t
+i s
+a
+simple
+f i l e
+system
+t h a t
+allows
+u s e r s
+to
+perform
+b a s i c
+f i l e
+o p e r a t i o n s
+such
+as
+n a v i g a t i n g
+d i r e c t o r i e s ,
+c r e a t i n g
+f i l e s
+and
+d i r e c t o r i e s ,
+read ing
+and
+w r i t i n g
+to
+f i l e s ,
+e t c .
+Tool
+d e s c r i p t i o n :
+Create
+a new
+f i l e
+of
+any
+e x t e n s i o n
+in
+the
+c u r r e n t
+d i r e c t o r y . ” ,
+” parameters ” :
+{” type ” :
+” d i c t ” ,
+”
+p r o p e r t i e s ” :
+{” f i l e n a m e ” :
+{” type ” :
+” s t r i n g ” ,
+” d e s c r i p t i o n ” :
+”
+The name of
+the new
+f i l e
+in
+the
+c u r r e n t
+d i r e c t o r y .
+f i l e n a m e
+i s
+l o c a l
+to
+the
+c u r r e n t
+d i r e c t o r y
+and
+does
+not
+allow
+path . ”} } ,
+” r e q u i r e d ” :
+[” f i l e n a m e ”]} ,
+” response ” :
+{” type ” :
+” d i c t ” ,
+”
+p r o p e r t i e s ” :
+{}}}
+{”name ” :
+”wc” ,
+” d e s c r i p t i o n ” :
+” This
+t o o l
+belongs
+to
+the
+G o r i l l a
+f i l e
+system .
+I t
+i s
+a
+simple
+f i l e
+system
+t h a t
+allows
+u s e r s
+to
+perform
+b a s i c
+f i l e
+o p e r a t i o n s
+such
+as
+n a v i g a t i n g
+d i r e c t o r i e s ,
+c r e a t i n g
+f i l e s
+and
+d i r e c t o r i e s ,
+read ing
+and
+w r i t i n g
+to
+f i l e s ,
+e t c .
+Tool
+d e s c r i p t i o n :
+Count
+the
+number
+of
+l i n e s ,
+words ,
+and
+c h a r a c t e r s
+in
+a
+f i l e
+of
+any
+e x t e n s i o n
+from
+c u r r e n t
+d i r e c t o r y
+. ” ,
+” parameters ” :
+{” type ” :
+” d i c t ” ,
+” p r o p e r t i e s ” :
+{” f i l e n a m e ” :
+{” type ” :
+” s t r i n g ” ,
+” d e s c r i p t i o n ” :
+”Name of
+the
+f i l e
+of
+c u r r e n t
+d i r e c t o r y
+to
+perform wc o p e r a t i o n
+on . ” } ,
+”mode ” :
+{”
+type ” :
+” s t r i n g ” ,
+” d e s c r i p t i o n ” :
+”Mode of
+o p e r a t i o n
+( ’ l ’
+f o r
+l i n e s ,
+’w’
+f o r
+words ,
+’c ’
+f o r
+c h a r a c t e r s ) .
+” ,
+” d e f a u l t ” :
+” l
+”}} , ” r e q u i r e d ” :
+[” f i l e n a m e ”]} ,
+” response ” :
+{” type ” :
+” d i c t ” ,
+” p r o p e r t i e s ” :
+{” count ” :
+{” type ” :
+” i n t e g e r ” ,
+” d e s c r i p t i o n ” :
+”
+The count
+of
+the
+number
+of
+l i n e s ,
+words ,
+or
+c h a r a c t e r s
+in
+the
+f i l e . ” } ,
+” type ” :
+{” type ” :
+” s t r i n g ” ,
+” d e s c r i p t i o n ” :
+”The type
+26
+
+--- Page 27 ---
+Published as a conference paper at ICLR 2026
+of
+u n i t we are
+counting .
+[Enum ] :
+[\” l i n e s \” ,
+\” words \” ,
+\”
+c h a r a c t e r s \”]”}}}}
+{”name ” :
+” l s ” ,
+” d e s c r i p t i o n ” :
+” This
+t o o l
+belongs
+to
+the
+G o r i l l a
+f i l e
+system .
+I t
+i s
+a
+simple
+f i l e
+system
+t h a t
+allows
+u s e r s
+to
+perform
+b a s i c
+f i l e
+o p e r a t i o n s
+such
+as
+n a v i g a t i n g
+d i r e c t o r i e s ,
+c r e a t i n g
+f i l e s
+and
+d i r e c t o r i e s ,
+read ing
+and
+w r i t i n g
+to
+f i l e s ,
+e t c .
+Tool
+d e s c r i p t i o n :
+L i s t
+the
+c o n t e n t s
+of
+the
+c u r r e n t
+d i r e c t o r y . ” ,
+” parameters ” :
+{” type ” :
+” d i c t ” ,
+” p r o p e r t i e s ” :
+{” a
+” :
+{” type ” :
+” boolean ” ,
+” d e s c r i p t i o n ” :
+”Show hidden
+f i l e s
+and
+d i r e c t o r i e s .
+D e f a u l t s
+to
+False .
+” ,
+” d e f a u l t ” :
+f a l s e }} , ”
+r e q u i r e d ” :
+[ ] } ,
+” response ” :
+{” type ” :
+” d i c t ” ,
+” p r o p e r t i e s ” :
+{”
+c u r r e n t d i r e c t o r y c o n t e n t ” :
+{” type ” :
+” a r r a y ” ,
+” d e s c r i p t i o n ” :
+”
+A l i s t
+of
+the
+c o n t e n t s
+of
+the
+s p e c i f i e d
+d i r e c t o r y . ” ,
+” items ” :
+{” type ” :
+” s t r i n g ”}}}}}
+{”name ” :
+”rm ” ,
+” d e s c r i p t i o n ” :
+” This
+t o o l
+belongs
+to
+the
+G o r i l l a
+f i l e
+system .
+I t
+i s
+a
+simple
+f i l e
+system
+t h a t
+allows
+u s e r s
+to
+perform
+b a s i c
+f i l e
+o p e r a t i o n s
+such
+as
+n a v i g a t i n g
+d i r e c t o r i e s ,
+c r e a t i n g
+f i l e s
+and
+d i r e c t o r i e s ,
+read ing
+and
+w r i t i n g
+to
+f i l e s ,
+e t c .
+Tool
+d e s c r i p t i o n : Remove a
+f i l e
+or
+d i r e c t o r y . ” ,
+”
+parameters ” :
+{” type ” :
+” d i c t ” ,
+” p r o p e r t i e s ” :
+{” f i l e n a m e ” :
+{”
+type ” :
+” s t r i n g ” ,
+” d e s c r i p t i o n ” :
+”The name of
+the
+f i l e
+or
+d i r e c t o r y
+to
+remove .
+”}} , ” r e q u i r e d ” :
+[” f i l e n a m e ”]} ,
+”
+response ” :
+{” type ” :
+” d i c t ” ,
+” p r o p e r t i e s ” :
+{” r e s u l t ” :
+{” type ” :
+” s t r i n g ” ,
+” d e s c r i p t i o n ” :
+”The
+r e s u l t
+of
+the
+remove
+o p e r a t i o n
+.”}}}}
+Generated
+goals :
+[
+” Explore
+simple
+ways
+to
+c r e a t e
+a
+f i l e
+with
+touch ( ) ,
+count
+words
+of
+the
+f i l e
+with wc ( ) ,
+and remove
+the
+f i l e
+with rm ( ) . ” ,
+” Understand
+the
+” f i l e n a m e ” argument
+of
+the
+touch ( )
+f u n c t i o n
+to
+see
+i f
+a
+f i l e
+can be
+c r e a t e d
+using
+a
+path
+i n s t e a d
+of
+j u s t
+a
+f i l e
+name . ”
+]
+##
+G u i d e l i n e s
+−**Be function −s p e c i f i c **:
+Each
+goal
+should
+e x p l i c i t l y
+mention
+which
+s p e c i f i c
+f u n c t i o n s / t o o l s
+w i l l
+be used
+and
+in
+what
+sequence
+−** I n c o r p o r a t e
+f u n c t i o n
+d e s c r i p t i o n s
+i n t o
+goal
+f o r m u l a t i o n **: You
+should
+examine
+the
+given
+f u n c t i o n
+d e s c r i p t i o n s
+( i . e . ,
+i n p u t
+or
+output
+arguments )
+to
+propose
+goals
+to
+solve
+confusing
+or
+ambiguous
+f u n c t i o n
+d e s c r i p t i o n s
+or
+environmental
+dynamics .
+−** Ensure
+c l a r i t y
+and
+a c h i e v a b i l i t y **:
+Each
+goal
+should
+be a
+s i n g l e ,
+c l e a r
+a c t i o n
+t h a t
+can be
+completed
+with
+the
+a v a i l a b l e
+f u n c t i o n s
+## Your Task
+Now s y n t h e s i z e
+goal
+d e s c r i p t i o n s
+f o r
+the
+environment
+and
+f u n c t i o n s
+provided
+in
+the
+format
+of
+a JSON
+l i s t .
+Please
+do not
+leave
+any comment .
+Listing 8: user prompt used in BFCLv3 exploration
+Do you
+t h i n k
+you have
+well −explored
+a l l
+f u n c t i o n s
+t h a t
+you
+are
+i n t e r e s t e d
+in ,
+p a r t i c u l a r l y
+those
+with
+ambiguous
+i n p u t
+formats
+/ s t r u c t u r e s
+or
+p o t e n t i a l l y
+unexpected
+o u t p u t s ?
+27
+
+--- Page 28 ---
+Published as a conference paper at ICLR 2026
+Consider
+st op pi ng
+(###STOP)
+i f :
+−You have
+thoroughly
+t e s t e d
+f u n c t i o n s
+with
+u n c l e a r
+parameter
+r e q u i r e m e n t s
+−You have
+explored
+f u n c t i o n s
+t h a t
+might
+produce
+unexpected
+or
+v a r i a b l e
+output
+formats
+−You have
+s u f f i c i e n t
+u n d e r s t a n d i n g
+of how to
+handle
+edge
+cases
+and
+e r r o r s
+Continue
+e x p l o r i n g
+(###CONTINUE)
+i f :
+−There
+are
+s t i l l
+f u n c t i o n s
+with
+ambiguous
+i n p u t
+s p e c i f i c a t i o n s
+t h a t
+need
+c l a r i f i c a t i o n
+−You haven ’ t
+f u l l y
+t e s t e d
+f u n c t i o n s
+t h a t
+could
+have
+u n p r e d i c t a b l e
+o u t p u t s
+−You need more
+e x p l o r a t i o n
+to
+understand
+parameter
+c o n s t r a i n t s
+and
+e r r o r
+handling
+Pl ease
+output
+###STOP i f
+you
+b e l i e v e
+you have
+comprehensive
+coverage ,
+or ###CONTINUE i f
+more
+e x p l o r a t i o n
+i s
+needed .
+Listing 9: prompt used to extract environment dynamics from interaction logs of BFCLv3
+You are
+an
+e x p e r t
+data
+a n a l y s t
+s p e c i a l i z i n g
+in
+f u n c t i o n
+c a l l i n g
+environments .
+Your
+t a s k
+i s
+to
+analyze
+i n t e r a c t i o n
+logs
+between
+a
+f u n c t i o n
+c a l l i n g
+bot
+and an
+environment
+to
+e x t r a c t
+environmental
+dynamics
+based on a
+given
+e x p l o r a t i o n
+goal .
+## Task
+Given an
+e x p l o r a t i o n
+goal
+and an
+i n t e r a c t i o n
+log ,
+e x t r a c t
+environmental
+dynamics
+t h a t
+d e s c r i b e how the
+environment
+changes
+in
+response
+to
+bot
+a c t i o n s .
+Each
+environmental
+dynamic
+should
+c a p t u r e
+the
+cause −and −e f f e c t
+r e l a t i o n s h i p
+between
+a c t i o n s
+and
+environmental
+changes .
+## Environmental Dynamic
+S t r u c t u r e
+Each
+environmental
+dynamic must
+i n c l u d e
+t h e s e
+t h r e e
+components :
+1 .
+** i n i t i a l
+s t a t e **: The
+r e l e v a n t
+s t a t e
+of
+the
+environment
+before
+the
+a c t i o n
+−Inc lude
+c o n t e x t
+l i k e
+c u r r e n t
+d i r e c t o r y ,
+v a r i a b l e
+values ,
+f i l e
+s t a t e s ,
+or
+any
+p e r t i n e n t
+environmental
+c o n d i t i o n s
+−Be
+s p e c i f i c
+about
+what
+m a t t e r s
+f o r
+u n d e r s t a n d i n g
+the
+action ’ s
+impact
+2 .
+** a c t i o n t a k e n **: The
+exact
+f u n c t i o n
+c a l l
+or
+a c t i o n
+performed
+by
+the
+bot
+−Inc lude
+the
+f u n c t i o n
+name and
+a l l
+parameters
+with
+t h e i r
+values
+−Use
+the
+exact
+syntax
+from
+the
+i n t e r a c t i o n
+log
+3 .
+** environmental dynamics **: How the
+environment
+changes
+as
+a
+r e s u l t
+of
+the
+a c t i o n
+−Describe
+what was
+created ,
+modified ,
+deleted ,
+or
+r e v e a l e d
+−Inc lude
+any
+s t a t e
+t r a n s i t i o n s ,
+data
+changes ,
+or new
+i n f o r m a t i o n
+made
+a v a i l a b l e
+−Be
+s p e c i f i c
+about
+the
+o b s e r v a b l e
+e f f e c t s
+##
+G u i d e l i n e s
+−** Output
+format **:
+Generate
+your
+response
+as
+a JSON a r r a y
+of
+o b j e c t s
+28
+
+--- Page 29 ---
+Published as a conference paper at ICLR 2026
+−** Completeness **:
+E x t r a c t
+dynamics
+f o r
+every
+s i g n i f i c a n t
+a c t i o n
+in
+the
+log
+−** Accuracy **:
+Base
+d e s c r i p t i o n s
+s t r i c t l y
+on what ’ s
+o b s e r v a b l e
+in
+the
+i n t e r a c t i o n
+log
+−** C l a r i t y **: Use
+p r e c i s e ,
+unambiguous
+language
+f o r
+each
+component
+−** Focus **:
+Only
+i n c l u d e
+dynamics
+t h a t
+show meaningful
+environmental
+changes
+## Example
+Input
+Goal :
+I n v e s t i g a t e
+how to
+c r e a t e
+a new
+f i l e
+with
+touch ( )
+and
+confirm
+i t s
+e x i s t e n c e
+using
+l s ( ) .
+I n t e r a c t i o n
+Logs :
+Step
+1:
+A s s i s t a n t :
+[ l s ( ) ]
+Environment :
+{” c u r r e n t d i r e c t o r y c o n t e n t ” :
+[ ] }
+Step
+2:
+A s s i s t a n t :
+[ mkdir ( dir name =” t e s t d i r ”) ]
+Environment :
+None
+Step
+3:
+A s s i s t a n t :
+[ cd ( f o l d e r =” t e s t d i r ”) ]
+Environment :
+{” c u r r e n t w o r k i n g d i r e c t o r y ” :
+” t e s t d i r ”}
+Step
+4:
+A s s i s t a n t :
+[ pwd ( ) ]
+Environment :
+{” c u r r e n t w o r k i n g d i r e c t o r y ” :
+” / / / t e s t d i r ”}
+## Example Output
+[
+{
+” i n i t i a l
+s t a t e ” :
+”The
+c u r r e n t
+d i r e c t o r y
+c o n t a i n s
+no
+f i l e s . ” ,
+” a c t i o n t a k e n ” :
+” touch ( f i l e n a m e =\” t e s t f i l e . t x t \”) ” ,
+” environmental dynamics ” :
+”A new
+f i l e
+named \” t e s t f i l e . t x t \”
+i s
+c r e a t e d
+in
+the
+c u r r e n t
+d i r e c t o r y . ”
+} ,
+{
+” i n i t i a l
+s t a t e ” :
+”The
+c u r r e n t
+d i r e c t o r y
+c o n t a i n s
+the
+f i l e
+\”
+t e s t f i l e . t x t \ ” . ” ,
+” a c t i o n t a k e n ” :
+” l s ( ) ” ,
+” environmental dynamics ” :
+”The environment
+r e v e a l s
+the
+c o n t e n t s
+of
+the
+c u r r e n t
+d i r e c t o r y ,
+showing
+t h a t
+\” t e s t f i l e
+. t x t \”
+e x i s t s . ”
+}
+]
+Listing 10: prompt used to filter environment dynamics of BFCLv3
+You are
+an
+e x p e r t
+data
+a n a l y s t
+s p e c i a l i z i n g
+in
+f u n c t i o n
+c a l l i n g
+environments .
+Your
+t a s k
+i s
+to
+f i l t e r
+environmental
+dynamics
+to
+remove
+i n s i g n i f i c a n t
+or
+environment −s p e c i f i c
+d e t a i l s
+while
+p r e s e r v i n g
+meaningful
+b e h a v i o r a l
+p a t t e r n s .
+## Task
+Given a JSON a r r a y
+of
+environmental
+dynamics ,
+i d e n t i f y
+and remove
+dynamics
+t h a t
+are :
+1 .
+**Very environment −s p e c i f i c **:
+Contain
+s p e c i f i c
+data ,
+names ,
+or
+values
+t h a t
+are
+unique
+to
+a
+p a r t i c u l a r
+environment
+i n s t a n c e /
+setup
+29
+
+--- Page 30 ---
+Published as a conference paper at ICLR 2026
+2 .
+** I n s i g n i f i c a n t **:
+Describe
+t r i v i a l
+or non−meaningful
+changes
+t h a t
+don ’ t
+c o n t r i b u t e
+to
+u n d e r s t a n d i n g
+f u n c t i o n
+behavior
+( e . g
+. ,
+l s ( )
+in
+a
+f i l e
+system )
+3 .
+** Redundant **:
+D u p l i c a t e
+s i m i l a r
+p a t t e r n s
+a l r e a d y
+ca p t u re d
+in
+o t h e r
+dynamics
+##
+F i l t e r i n g
+C r i t e r i a
+### Remove dynamics
+t h a t
+c o n t a i n :
+−** S p e c i f i c
+data
+values **: Names ,
+IDs ,
+f i l e
+contents ,
+user
+l i s t s ,
+or
+any
+c o n c r e t e
+data
+t h a t
+v a r i e s
+between
+environments
+−** Environment −s p e c i f i c
+paths **:
+Absolute
+paths ,
+s p e c i f i c
+d i r e c t o r y
+names ,
+or
+l o c a t i o n −dependent
+i n f o r m a t i o n
+−** Instance −s p e c i f i c
+i d e n t i f i e r s **:
+User names ,
+s e s s i o n
+IDs ,
+timestamps ,
+or
+o t h e r
+unique
+i d e n t i f i e r s
+−** T r i v i a l
+s t a t e
+changes **:
+Minor
+f o r m a t t i n g
+changes ,
+temporary
+s t a t e s ,
+or
+cosmetic
+updates
+−** Redundant
+i n f o r m a t i o n **:
+M ul ti pl e
+dynamics
+d e s c r i b i n g
+the
+same
+b e h a v i o r a l
+p a t t e r n
+with
+d i f f e r e n t
+s p e c i f i c
+values
+### Keep dynamics
+t h a t
+d e s c r i b e :
+−** General
+b e h a v i o r a l
+p a t t e r n s **: How f u n c t i o n s
+t y p i c a l l y
+behave
+a c r o s s
+d i f f e r e n t
+environments
+−** Error
+c o n d i t i o n s **:
+Standard
+e r r o r
+messages
+and
+f a i l u r e
+modes
+−** S t a t e
+t r a n s i t i o n s **:
+General
+s t a t e
+changes
+( logged
+in / out ,
+f i l e
+c r e a t e d / deleted ,
+e t c . )
+−** Function
+c a p a b i l i t i e s **: What
+f u n c t i o n s
+can do ,
+not
+what
+s p e c i f i c
+data
+they
+r e t u r n
+−** Function
+c o n t a i n s
+meaningful
+arguments **: Keep dynamics
+where
+the
+f u n c t i o n
+c a l l
+i n c l u d e s
+arguments
+t h a t
+a f f e c t
+behavior
+or
+s t a t e ,
+as
+t h e s e
+i l l u s t r a t e
+how i n p u t
+parameters
+i n f l u e n c e
+outcomes .
+##
+G u i d e l i n e s
+−** Output
+format **:
+Return
+a JSON a r r a y
+c o n t a i n i n g
+only
+the
+f i l t e r e d
+dynamics
+−** P r es e r ve
+s t r u c t u r e **: Keep
+the
+same JSON s t r u c t u r e
+f o r
+remaining
+dynamics
+−** G e n e r a l i z e
+d e s c r i p t i o n s **:
+Replace
+s p e c i f i c
+values
+with
+g e n e r a l
+d e s c r i p t i o n s
+where
+p o s s i b l e
+−** Maintain
+accuracy **: Don ’ t
+change
+the
+core
+meaning
+of
+the
+dynamics ,
+only
+remove
+s p e c i f i c i t y
+−** Focus on
+p a t t e r n s **:
+P r i o r i t i z e
+dynamics
+t h a t
+show
+r e u s a b l e
+b e h a v i o r a l
+p a t t e r n s
+## Examples
+### Remove ( Very environment −s p e c i f i c
+t h a t
+i t
+c o n t a i n s
+data
+e n t r i e s
+s p e c i f i c
+to
+a
+environment
+i n s t a n c e ) :
+‘ ‘ ‘ json
+{
+” i n i t i a l
+s t a t e ” :
+”No user
+i s
+logged
+i n t o
+the
+system ,
+and a
+l i s t
+of
+u s e r s
+needs
+to
+be
+i d e n t i f i e d . ” ,
+” a c t i o n t a k e n ” :
+” l i s t u s e r s ( ) ” ,
+” environmental dynamics ” :
+” Provides
+the
+l i s t
+of
+a v a i l a b l e
+u s e r s :
+Alice ,
+Bob ,
+Catherine ,
+and
+Daniel . ”
+}
+‘ ‘ ‘
+30
+
+--- Page 31 ---
+Published as a conference paper at ICLR 2026
+### Keep ( General
+p a t t e r n
+and
+e r r o r
+message ) :
+‘ ‘ ‘ json
+{
+” i n i t i a l
+s t a t e ” :
+”No user
+i s
+c u r r e n t l y
+logged
+in . ” ,
+” a c t i o n t a k e n ” :
+” search messages ( keyword =\” t e s t \”) ” ,
+” environmental dynamics ” :
+”An e r r o r
+message
+i s
+r e t u r n e d
+i n d i c a t i n g
+t h a t
+no
+user
+i s
+c u r r e n t l y
+logged
+in . ”
+}
+‘ ‘ ‘
+### Remove ( T r i v i a l
+t r a n s i t i o n ) :
+‘ ‘ ‘ json
+{
+” i n i t i a l
+s t a t e ” :
+” In
+a
+d i r e c t o r y
+with
+e x i s t i n g
+f i l e s . ” ,
+” a c t i o n t a k e n ” :
+” l s ( ) ” ,
+” environmental dynamics ” :
+” Returns
+a
+l i s t
+of
+f i l e s
+and
+d i r e c t o r i e s
+in
+the
+c u r r e n t
+l o c a t i o n . ”
+}
+‘ ‘ ‘
+##
+I n s t r u c t i o n s
+1 .
+Analyze
+each
+environmental
+dynamic
+in
+the
+i n p u t JSON a r r a y
+2 .
+Apply
+the
+f i l t e r i n g
+c r i t e r i a
+to
+determine
+i f
+i t
+should
+be
+kept
+or
+removed
+3 .
+For
+dynamics
+t h a t
+are
+kept ,
+g e n e r a l i z e
+any
+remaining
+s p e c i f i c
+d e t a i l s
+4 .
+Return
+the
+f i l t e r e d
+JSON a r r a y
+with
+only
+the
+s i g n i f i c a n t ,
+g e n e r a l i z a b l e
+dynamics
+A.4
+ADDITIONAL RESULTS
+Table 6: Success rate (SR) of syntactic alignment across different Qwen2.5 instruct model sizes
+(7B, 14B, 32B) and training hyperparameters. Results are shown for varying numbers of training
+iterations and two learning rates (LR=0.1 and LR=1.0). Syntactic alignment adaptation generally
+improves SR over the baseline, with larger models and moderate learning rates yielding higher gains.
+Model
+Number of Training Iterations
+SR (LR=0.1)
+SR (LR=1.0)
+Qwen2.5-7B-Instruct
+Baseline (0)
+9.00
+-
+Qwen2.5-7B-Instruct
+1
+9.50
+9.50
+Qwen2.5-7B-Instruct
+2
+9.50
+8.50
+Qwen2.5-7B-Instruct
+3
+9.50
+9.00
+Qwen2.5-7B-Instruct
+4
+10.00
+8.50
+Qwen2.5-7B-Instruct
+5
+10.00
+8.50
+Qwen2.5-14B-Instruct
+Baseline (0)
+18.5
+-
+Qwen2.5-14B-Instruct
+1
+20.00
+20.00
+Qwen2.5-14B-Instruct
+2
+20.00
+20.00
+Qwen2.5-14B-Instruct
+3
+20.00
+21.00
+Qwen2.5-14B-Instruct
+4
+19.50
+20.00
+Qwen2.5-14B-Instruct
+5
+19.00
+19.00
+Qwen2.5-32B-Instruct
+Baseline (0)
+26.00
+-
+Qwen2.5-32B-Instruct
+1
+25.50
+26.50
+Qwen2.5-32B-Instruct
+2
+26.50
+26.50
+Qwen2.5-32B-Instruct
+3
+26.50
+27.00
+Qwen2.5-32B-Instruct
+4
+26.50
+27.00
+Qwen2.5-32B-Instruct
+5
+26.00
+26.50
+31
+
+--- Page 32 ---
+Published as a conference paper at ICLR 2026
+Table 7: Number of environment dynamics per website before and after filtering with GPT-4.1 as
+the exploration policy and dynamics extractor. Most environment dynamics are filtered out.
+Website
+Number of Env Dynamics
+Number of Env Dynamics (after filtering)
+Shopping
+334
+52
+Shopping Admin
+334
+50
+GitLab
+334
+53
+Map
+334
+18
+Reddit
+334
+23
+Table 8: Number of functions available in each BFCLv3 environment.
+Environment
+Num of Functions
+VehicleControlAPI
+22
+GorillaFileSystem
+18
+TravelAPI
+17
+MathAPI
+17
+TwitterAPI
+14
+MessageAPI
+10
+TicketAPI
+9
+TradingBot
+22
+A.5
+ENVIRONMENT DYNAMICS ANALYSIS
+Here we provide some concrete examples of environment dynamics that are removed by our filtering
+mechanism. Exploration policy and dynamics extractor is GPT-4.1.
+• No Change Dynamics
+{
+"initial_state": "Magento Admin product edit page, with the ’
+Country of Manufacture’ dropdown expanded and no country
+selected.",
+"action": "click [1405] where [1405] is United States",
+"environmental_dynamics": "no change"
+}
+• Basic Dropdown/Combobox Expansion
+{
+"initial_state": "Magento Admin product edit page for ’Sprite
+Stasis Ball 65 cm’, with the ’Country of Manufacture’
+combobox (notice-WPNSU51) collapsed and not focused.",
+"action": "click [1168] where [1168] is notice-WPNSU51",
+"environmental_dynamics": "The ’Country of Manufacture’ combobox
+became focused and expanded, showing its list of country
+options."
+}
+• Basic Dialog Open/Close
+{
+"initial_state": "Magento Admin product edit page for ’Sprite
+Stasis Ball 65 cm’, with the ’Add Attribute’ button visible
+but no attribute selection dialog open.",
+"action": "click [720] where [720] is Add Attribute",
+"environmental_dynamics": "Clicking the ’Add Attribute’ button
+opened the ’Add Attribute’ dialog, displaying available
+product attributes for selection and actions such as ’Create
+New Attribute’."
+}
+32
+
+--- Page 33 ---
+Published as a conference paper at ICLR 2026
+• Standard Form Field Visibility
+{
+"initial_state": "Magento Admin product detail page for ’Sprite
+Stasis Ball 65 cm’ with all product attribute forms visible,
+including a collapsed ’Country of Manufacture’ dropdown (
+combobox).",
+"action": "click [1267] where [1267] is notice-BKW2147",
+"environmental_dynamics": "The ’Country of Manufacture’ combobox
+was clicked, causing attribute fields for ’Country of
+Manufacture’ and all subsequent grouped attributes to become
+visible."
+}
+• Basic Button Focus
+{
+"initial_state": "Magento Admin product edit page with the ’Add
+Attribute’ dialog open; in the attributes table, the ’Options
+’ column header includes a checkbox and an ’Options’ button,
+neither focused nor expanded.",
+"action": "click [2372] where [2372] is ",
+"environmental_dynamics": "The ’Options’ button in the ’Options’
+column header of the Add Attribute dialog became focused and
+expanded a dropdown list with a single option, ’Select All’,
+now visible below the button."
+}
+33

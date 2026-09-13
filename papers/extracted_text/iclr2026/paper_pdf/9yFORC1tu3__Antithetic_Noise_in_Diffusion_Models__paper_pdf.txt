@@ -1,0 +1,2583 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+ANTITHETIC NOISE IN DIFFUSION MODELS
+Jing Jia1
+Sifan Liu2⋆
+Bowen Song3
+Wei Yuan1
+Liyue Shen3⋆
+Guanyang Wang1∗
+1Rutgers University, {jing.jia, wy204, guanyang.wang}@rutgers.edu
+2Duke University, sifan.liu@duke.edu
+3University of Michigan, {bowenbw, liyues}@umich.edu
+ABSTRACT
+We systematically study antithetic initial noise in diffusion models, discovering that
+pairing each noise sample with its negation consistently produces strong negative
+correlation. This universal phenomenon holds across datasets, model architec-
+tures, conditional and unconditional sampling, and even other generative models
+such as VAEs and Normalizing Flows. To explain it, we combine experiments
+and theory and propose a symmetry conjecture that the learned score function is
+approximately affine antisymmetric (odd symmetry up to a constant shift), sup-
+ported by empirical evidence. This negative correlation leads to substantially more
+reliable uncertainty quantification with up to 90% narrower confidence intervals.
+We demonstrate these gains on tasks including estimating pixel-wise statistics and
+evaluating diffusion inverse solvers. We also provide extensions with randomized
+quasi-Monte Carlo noise designs for uncertainty quantification, and explore ad-
+ditional applications of the antithetic noise design to improve image editing and
+generation diversity. Our framework is training-free, model-agnostic, and adds
+no runtime overhead. Code is available at https://github.com/jjia131/
+Antithetic-Noise-in-Diffusion-Models-page.
+1
+INTRODUCTION
+Diffusion models have set the state of the art in photorealistic image synthesis, high-fidelity audio,
+and video generation (Sohl-Dickstein et al., 2015; Ho et al., 2020; Song et al., 2021b; Kong et al.,
+2021); they also power applications such as text-to-image generation (Rombach et al., 2022), image
+editing and restoration (Meng et al., 2022), and inverse problem solving (Song et al., 2022).
+For many pretrained diffusion models, sampling relies on three elements: the network weights,
+the denoising schedule, and the initial Gaussian noise. Once these are fixed, sampling is often
+deterministic: the sampler transforms the initial noise into an image via successive denoising passes.
+Much of the literature improves the first two ingredients and clusters into two strands: (i) architectural
+and training developments, which improve sample quality and scalability through backbone or
+objective redesign (e.g., EDM (Karras et al., 2022), Latent Diffusion Models (Rombach et al., 2022),
+DiT (Peebles & Xie, 2023)), (ii) accelerated sampling, which reduces the number of denoising steps
+while retaining high-quality generation (e.g., DDIM (Song et al., 2021a), Consistency Models (Song
+et al., 2023), DPM-Solver++ (Lu et al., 2023), and progressive distillation (Salimans & Ho, 2022)).
+However, the third ingredient—the initial Gaussian noise—has received comparatively little attention.
+Prior work has optimized initial noise for generation quality, editing, controllability, or inverse
+problem solving (Guo et al., 2024; Qi et al., 2024; Zhou et al., 2024; Ban et al., 2025; Chen et al.,
+2024a; Eyring et al., 2024; Song et al., 2025; Wang et al., 2024; Chihaoui et al., 2024). However, most
+of these efforts are task-specific. A systematic understanding of how noise itself shapes diffusion
+model outputs is still missing.
+Our perspective is orthogonal to prior work. Our central discovery is both simple and universal:
+pairing every Gaussian noise z with its negation −z—known as antithetic sampling (Owen, 2013)—
+consistently produces samples that are strongly negatively correlated. This phenomenon holds
+∗co-corresponding authors
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+regardless of architecture, dataset, sampling schedule, and both conditional and unconditional
+sampling. It further extends to other generative models such as VAEs and Normalizing Flows. We
+explain this phenomenon through both experiments and theory. This leads to a symmetry conjecture
+that the score function is approximately affine antisymmetric, providing a new structural insight
+supported by empirical evidence.
+Figure 1: Use antithetic noise −z and z (with condition c) to generate visually “opposite” images.
+This universal property has direct impact on uncertainty quantification and also enables additional
+applications:
+(i) Sharper uncertainty quantification. Antithetic pairs naturally act as control variates, enabling
+significant variance reduction and thus sharper uncertainty quantification. Our antithetic estimator
+delivers up to 90% tighter confidence intervals and cuts computation cost by more than 100 times. The
+efficiency gain immediately leads to huge cost savings in a variety of tasks, including bias detection
+in generation and diffusion inverse solver evaluation, as we demonstrate in later experiments.
+(ii) Other applications. Because each antithetic noise pair drives reverse-diffusion trajectories
+toward distant regions of the data manifold (see Figure 1), the paired-sampling scheme increases
+diversity “for free” while preserving high image quality, as confirmed by SSIM and LPIPS in our
+experiments. Moreover, algorithms that rely on intermediate sampling or approximation steps also
+benefit from the improved reliability provided by antithetic noise. As an illustration, we present an
+image editing example in C.2 and show that our antithetic design serves as a plug-and-play tool to
+improve performance at no additional cost.
+Building on the antithetic pairs, we generalize the idea to apply quasi-Monte Carlo (QMC) and
+randomized QMC (RQMC). The resulting RQMC estimator often delivers further variance reduction.
+Although QMC has been widely used in computer graphics (Keller, 1995; Waechter & Keller, 2011),
+quantitative finance (Joy et al., 1996; L’Ecuyer, 2009), and Bayesian inference (Buchholz et al., 2018;
+Liu & Owen, 2021), this is, to our knowledge, its first application to diffusion models.
+In summary, we discover a universal property of initial noise, reveal a new symmetry in score
+networks, and demonstrate concrete benefits in various practical applications. This positions initial
+noise manipulations as a simple, training-free tool for advancing generative modeling.
+The remainder of the paper is organized as follows. Section 2 defines the problem and outlines
+our motivation. Section 3 presents our central finding that antithetic noise pairs produce strongly
+negatively correlated outputs. We offer both theoretical and empirical explanations for this phe-
+nomenon, and present the symmetry conjecture in Section 3.2. Section 4 develops estimators and their
+confidence intervals via antithetic sampling, and extends the approach to QMC. Section 5 reports
+experiments on the aforementioned applications. Section 6 discusses our method and outlines future
+directions. Appendix B, C, and D include proofs, additional experiments and detailed setups, and
+supplemental visualizations, respectively.
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+2
+SETUP, MOTIVATION, AND RELATED WORKS
+Unconditional diffusion model:
+A diffusion model aims to generate samples from an unknown
+data distribution p0. It first noises data towards a standard Gaussian progressively, then learns to
+reverse the process so that Gaussian noise can be denoised step-by-step back into target samples.
+The forward process simulates a stochastic differential equation (SDE): dxt = µ(xt, t)dt + σtdwt,
+where {wt}T
+t=0 denotes the standard Brownian motion, and µ(x, t), σt are chosen by the users. Let
+pt denote the distribution of xt. Song et al. (2021b) states that if we sample yT ∼pT and simulate
+the probability-flow ordinary differential equation (PF-ODE) backward from time T to 0 as
+dyt =
+
+−µ(yt, t) −1
+2σ2
+t ∇log p(yt, t)
+
+dt,
+(1)
+then for every time t the marginal distribution of yt coincides with pt. Thus, in an idealized world,
+one can perfectly sample from p0 by simulating the PF-ODE (1).
+In practice, the score function ∇log pt(x, t) is unavailable, and a neural network ϵ(t)
+θ (x) is trained
+to approximate it, where θ denotes its weights. Therefore, one can generate new samples from p0
+by first sampling a Gaussian noise and simulating the PF-ODE (1) through a numerical integrator
+from T to 0. For example, DDIM (Song et al., 2021a) has the (discretized) forward process as
+xk | xk−1 ∼N(√αkxk−1, (1 −αk)I) for k = 0, . . . , T −1, and backward sampling process as
+yT ∼N(0, I), yt−1 = √αt−1
+ 
+yt −√1 −αt ϵ(t)
+θ (yt)
+√αt
+!
++
+p
+1 −αt−1 ϵ(t)
+θ (yt).
+(2)
+Once θ is fixed, the randomness in DDIM sampling comes solely from the initial Gaussian noise.
+We remark that samples from p0 can also be drawn by simulating the backward SDE with randomness
+at each step, as in the DDPM sampler (Ho et al., 2020; Song et al., 2021b). Throughout the main text,
+we focus on deterministic samplers such as DDIM to explain our idea. In Appendix C.4, we present
+additional experiments showing that our findings also extend to stochastic samplers like DDPM.
+Text–conditioned latent diffusion:
+In Stable Diffusion and its successors SDXL and SDXL Turbo
+(Podell et al., 2024; Sauer et al., 2024), a pretrained VAE first compresses each image to a latent
+tensor z. A text encoder embeds the prompt as c ∈Rm. During training, the network ϵ(t)
+θ
+receives
+(zt, c) and learns ∇zt log pt(zt | c). At generation time we draw latent noise zT ∼N(0, I) and run
+the reverse diffusion from t = T to 0, yielding a denoised latent z0, which the decoder maps back to
+pixels. Given a prompt c and an initial Gaussian noise, the sampler produces an image from p0(· | c).
+Diffusion posterior sampling:
+Diffusion model can also be used as a prior in inverse problems.
+Suppose we observe only a partial or corrupted measurement yobs = A(x) + noise from an unknown
+signal x. Diffusion posterior sampling aims to sample from the posterior distribution p(x | yobs) ∝
+p(yobs | x) p(x), where p(x) is given by a pretrained diffusion model. Given initial noise z and
+observed yobs, diffusion posterior samplers apply a sequence of denoising steps from T to 0, each
+step resembling (2) but incorporating yobs (Chung et al., 2023a; Song et al., 2022; 2024).
+2.1
+MOTIVATION
+Beyond examining how variations in the initial noise affect the outputs, several technical considera-
+tions motivate our focus on the antithetic noise pair (z, −z) for diffusion models. Let DM denote
+certain diffusion model’s mapping from an initial noise vector to a generated image sample.
+• Preserving quality: Since z ∼N(0, I) implies −z ∼N(0, I), the initial noises z and −z share
+the same marginal distribution. Consequently, DM(z)
+d= DM(−z), so all per-sample statistics
+remain unchanged. In other words, negating the initial noise does not degrade generation quality.
+• Maximal separation in the noise space: High-dimensional Gaussians concentrate on the sphere
+of radius
+√
+dimension (Vershynin, 2018), so any draw z and its negation −z lie at opposite poles
+of that hypersphere. This antipodal pairing represents the maximum possible perturbation in noise
+space, making it a natural extreme test of the sampler’s behavior.
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+(a) CelebA-HQ
+(b) DiT (class 919)
+(c) Glow (class 0)
+Figure 2: Histograms of standard and centralized Pearson correlation coefficients for CelebA-HQ,
+and DiT class and Glow in single class. Dashed lines indicate the average.
+• Measuring (non-)linearity: Recent work has examined how closely score networks approximate
+linear operators. Empirical studies across various diffusion settings show that these networks
+behave as locally linear maps; this behavior forms the basis for new controllable sampling schemes
+(Chen et al., 2024b; Li et al., 2024b; Song et al., 2025). Correlation is a natural choice to measure
+linearity: if a score network were exactly linear, feeding it with noises z and −z would yield
+a correlation of −1 between DM(z) and DM(−z). Thus, the difference between the observed
+correlation and −1 provides a direct measure of the network’s departure from linearity.
+3
+NEGATIVE CORRELATION FROM ANTITHETIC NOISE
+3.1
+PIXEL-WISE CORRELATIONS: ANTITHETIC VS. INDEPENDENT NOISE
+We compare the similarity between paired images generated under two sampling schemes: PN
+(positive vs. negative, z vs. −z) and RR (random vs. random, z1 vs. z2) under three settings: (1)
+unconditional diffusion models, (2) class- or prompt-based conditional diffusion models, and (3)
+generative models beyond diffusion.
+For diffusion models, we evaluate both unconditional and conditional generation using publicly
+available pre-trained checkpoints. Notably, we include both traditional U-Net architecture and
+transformer-based DiT (Peebles & Xie, 2023). Implementation details are described in Section 5.1.
+We also test on distilled diffusion models (Song et al., 2023) using consistency distillation checkpoints.
+For generative models beyond diffusion, we select two representative baselines: an unconditional
+VAE on MNIST and a conditional Glow model (Kingma & Dhariwal, 2018) on CIFAR-10. The
+experimental details for consistency models, VAE and Glow are provided in Appendix C.1.
+To quantify similarity, we use two metrics: the standard Pearson correlation and a centralized Pearson
+correlation. Let xi,1 and xi,2 denote the flattened pixel values of the two images in the i-th generated
+pair. The standard Pearson correlation is computed directly between xi,1 and xi,2. To correct for
+dataset-level or class-level bias, we also define a centralized correlation. For a dataset, prompt, or
+class with K pairs generated, we compute the mean µc = PK
+i=1(xi,1 + xi,2)/2K. The centralized
+correlation of the i-th pair is defined as the standard Pearson correlation between the centralized
+images xi,1 −µc and xi,2 −µc. For each comparison, t-test is conducted to assess statistical
+significance. In all experiments, the resulting p-values are negligible (< 10−10), which confirms
+significance; hence, they are omitted from the presentation.
+Additional metrics such as the Wasserstein distance are presented in Appendix C.4.
+Results: Table 1 summarizes the statistics in all classes of models. PN pairs consistently show
+significantly stronger negative correlations than RR pairs, with this contrast also visually evident in
+their histograms (Figure 2). In addition, centralization strengthens the negative correlation, since it
+removes shared patterns. For example, in CelebA-HQ, centralization removes global facial structure,
+while in DiT and Glow, it removes class-specific patterns.
+The same behavior appears in both DDPM models and diffusion posterior samplers, which we report
+in Appendix C.4. These results demonstrate that the negative correlation resulting from antithetic
+sampling is a universal phenomenon across diverse architectures and conditioning schemes.
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+Table 1: Correlation results across different models and datasets, shown are means (SD). Rows
+1–3 are pretrained unconditional diffusion models on different datasets. Rows 4–5 are conditional
+diffusion models. Rows 6–8 are pretrained consistency models on different datasets. Rows 9–10 are
+generative models that are not diffusion-based.
+Model
+Dataset
+Standard Correlation
+Centralized Correlation
+PN
+RR
+PN
+RR
+Uncon.
+Model
+LSUN-Church
+-0.62 (0.11)
+0.08 (0.17)
+-0.77 (0.07)
+0.00 (0.17)
+CelebA-HQ
+-0.34 (0.19)
+0.25 (0.20)
+-0.78 (0.06)
+-0.01 (0.20)
+CIFAR-10
+-0.76 (0.13)
+0.05 (0.24)
+-0.86 (0.07)
+0.00 (0.23)
+SD 1.5
+DiT
+LAION-2B(en)
+-0.47 (0.05)
+0.05 (0.04)
+-0.54 (0.08)
+0.00 (0.01)
+ImageNet-256
+-0.07 (0.27)
+0.26 (0.18)
+-0.45 (0.08)
+0.00 (0.03)
+Consistency
+Model
+LSUN-Cat
+-0.88 (0.06)
+0.02 (0.14)
+-0.91 (0.05)
+0.01 (0.14)
+LSUN-Bedroom
+-0.78 (0.07)
+0.03 (0.15)
+-0.84 (0.06)
+0.00 (0.15)
+ImageNet-64
+-0.71 (0.14)
+0.02 (0.19)
+-0.75 (0.12)
+0.01 (0.19)
+VAE
+Glow
+MNIST
+0.21 (0.12)
+0.42 (0.17)
+-0.41 (0.12)
+-0.00 (0.24)
+CIFAR-10
+-0.52 (0.02)
+0.08 (0.05)
+-0.57 (0.02)
+-0.01 (0.02)
+3.2
+EXPLANATORY EXPERIMENTS: TEMPORAL CORRELATIONS & SYMMETRY CONJECTURE
+We aim to explain the strong negative correlation between DM(Z) and DM(−Z) for Z ∼N(0, I).
+Because DM performs iterative denoising through the score network ϵ(t)
+θ
+(see (2)), we visualize how
+these correlations evolve over diffusion time-steps in Figure 3.
+Throughout the transition from noises to samples, the PN correlation of ϵ(t)
+θ —indicated by the orange,
+blue, and green dashed lines in Figure 3—starts at –1, stays strongly negative, and only climbs slightly
+in the final steps. This nearly −1 correlation is remarkable, as it suggests that the score network ϵθ
+learns an approximately affine antisymmetric function. To explain, we first state the following results
+which shows −1 correlation is equivalent to affine antisymmetric, with proof in Appendix B.1.
+Lemma 1. Let Z ∼N(0, Id), suppose a map f : Rd →R satisfies Corr(f(Z), f(−Z)) = −1, then
+f must be affine antisymmetric at (0, c) for some c, i.e., f(x) + f(−x) = 2c for every x.
+Figure 3: Correlation of xt (solid) and
+ϵ(t)
+θ
+(dash) between antithetic (PN) pairs.
+Step 50 is the initial noise and Step 0
+is the generated image. Shaded bands
+show ±1 std. dev.
+Lemma 1 and Figure 3 leads us to the following conjecture:
+Conjecture
+For each time step t, the score network ϵ(t)
+θ
+is approximately affine antisymmetric at (0, ct), i.e.,
+ϵ(t)
+θ (x) + ϵ(t)
+θ (−x) ≈2ct
+for some fixed vector ct that depends on t.
+The conjecture implies that the score network has learned
+an “almost odd” function up to an additive shift. This is
+consistent with both theory and observations for large t,
+where pt(x) is close to standard Gaussian, thus the score
+function is almost linear in x. Nonetheless, our conjecture
+is far more general: it applies to every timestep t and can
+accommodate genuinely nonlinear odd behaviors (for example, functions like sin x).
+This conjecture combined with the DDIM update rule (2) immediately explains the negative
+correlation: The one step iteration of Ft in (2) can be written as a linear combination be-
+tween x and the output of the score network: Ft(x) = atx + btϵ(t)
+θ (x). Given the conjecture,
+Ft(−x) ≈−atx −btϵ(t)
+θ (x) + 2btct = −Ft(x) + 2btct, so the one-step DDIM update is affine
+antisymmetric at (0, btct). Thus, beginning with a strongly negatively correlated pair, each DDIM
+update preserves that strong negative correlation all the way through to the final output.
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+To (partly) validate our conjecture, we perform the following experiment. Using a pretrained CIFAR-
+10 score network with a 50-step DDIM sampler, we picked time steps t = 1, 3, . . . , 19 (where smaller
+t is closer to the image and larger t is closer to pure noise). For each t, we sample x ∼N(0, Id),
+evaluated the first coordinate of ϵ(t)
+θ (c x) as c varied from −1 to 1 (interpolating from −x to x), and
+plotted the result in Figure 4. We exclude t ≥20, where the curve is very close to a straight line.
+Figure 4: First-coordinate output of the pretrained score
+network on CIFAR10 as a function of the interpolation
+scalar c for a 50-step DDIM at t = 1, 3, . . . , 19.
+Figure 4 confirms that, at every step
+t, the first coordinate of the score net-
+work is indeed overall affine antisym-
+metric.
+Although the curves display
+nonlinear oscillations at small t, the
+deviations on either side are approxi-
+mately mirror images, and for larger t
+the mapping is almost a straight line.
+The symmetry center ct usually lies near
+zero, but not always—for instance, at
+t = 11, ct ≈0.05 even though the
+function spans from −0.05 to 0.15. In
+Appendix C.5, we present further vali-
+dation experiments using alternative co-
+ordinates, datasets, and a quantitative
+metric called the antisymmetry score. Despite the distinct function shapes across coordinates, the
+conjectured symmetry still persists.
+We further evaluate the antisymmetry conjecture across additional coordinates and datasets. On
+CIFAR-10 and Church, we assess how closely one-dimensional slices of the network outputs behave
+like affine-antisymmetric functions. To this end, we introduce the affine antisymmetry score, which
+quantifies the degree of antisymmetry. Across datasets, the resulting antisymmetry scores are
+consistently high (mean values above 0.99 and even the lower quantiles still near 0.9). These results
+provide strong empirical support for the conjecture; full experimental details and plots are given in
+Appendix C.5.
+Finally, we provide theoretical support for our conjecture in Appendix B.2, B.3, and B.4. Ap-
+pendix B.2 confirms the conjecture in the large-t regime, Appendix B.3 shows how both the density
+ratio and the score error converge monotonically as t evolves via a Hermite polynomial expansion,
+and Appendix B.4 demonstrates that all orthogonal symmetries of the data distribution are preserved
+throughout the forward process. These results help explain the behavior underlying the conjecture.
+The forward process preserves every orthogonal symmetry of the initial distribution, including coor-
+dinate reflections. Thus, in the ideal case where the data distribution at t = 0 is reflection-symmetric,
+the density remains even and the score remains odd for all t by Proposition 4. Moreover, even if this
+symmetry holds only approximately for small t, the monotone decay of the density ratio and the
+score error shows that pt quickly approaches the Gaussian, so the forward dynamics push the score
+toward an odd function in a controlled manner.
+Both the conjecture and its empirical support could be of independent interest. They imply that the
+score network learns a function with strong symmetry, even though that symmetry is not explicitly
+enforced. The conjecture matches the Gaussian linear score approximation in the high-noise regime,
+which has proven effective (Wang & Vastola, 2024). In the intermediate-to-low noise regime, a single
+Gaussian approximation performs poorly—this is clear in Figure 4 for t = 3, 7, 11, where the score
+is strongly nonlinear—yet our conjectured approximate symmetry still holds.
+Besides explaining the source of negative correlation, we believe this result provides new insight into
+the structure of diffusion models, which are often treated as black-box functions. Leveraging this
+finding for algorithms and applications is an important direction for future work.
+For readers interested in an additional theoretical perspective, Appendix B.6 presents a discussion
+that links negative correlation to the FKG inequality, and provides a detailed analysis of the DDIM
+sampler using this framework.
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+4
+UNCERTAINTY QUANTIFICATION
+In uncertainty quantification for a diffusion model DM, the goal is typically to estimate expectations
+of the form Ez∼N(0,I)
+
+S
+ DM(z)
+
+, where S is a statistic of user’s interest. Our goal is to leverage
+negative correlation to design an estimator with higher accuracy at fixed computation cost of inference.
+Recent studies have examined epistemic uncertainty and bias in diffusion models, including Berry
+et al. (2024; 2025). Our focus is different: we study aleatoric uncertainty from noise sampling and
+develop a variance-reduction method.
+Standard Monte Carlo: To approximate this expectation, the simplest approach is to draw N
+independent noises z1, . . . , zN ∼N(0, I), calculate Si = S
+ DM(zi)
+
+for each i and form the
+standard Monte Carlo (MC) estimator ˆµMC
+N
+:= PN
+i=1 Si/N by taking their average. A (1 −α)
+confidence interval, denoted as CIMC
+N (1 −α) is then ˆµMC
+N
+± z1−α/2
+q
+(ˆσMC
+N )2/N, where ˆσ2
+N is the
+sample variance of S1, S2, . . . , SN and z1−α/2 is the (1 −α/2)-quantile of the standard normal. A
+formal guarantee of the above construction is given in Proposition 5 in Appendix B.5.
+Antithetic Monte Carlo: The observed negative correlation motivates an improved estimator. Let
+N = 2K be even, users can generate K pairs of antithetic noise (z1, −z1), . . . , (zK, −zK). Define
+S+
+i = S(DM(zi)), S−
+i = S(DM(−zi)), and let ¯Si = 0.5(S+
+i +S−
+i ) be their average. Our Antithetic
+Monte Carlo (AMC) estimator is ˆµAMC
+N
+:= PK
+i=1 ¯Si/K, and confidence interval CIAMC
+N
+(1 −α) is
+ˆµAMC
+N
+± z1−α/2
+q
+2(ˆσAMC
+N
+)2/N, where (ˆσAMC
+N
+)2 is the sample variance of ¯S1, . . . , ¯SK.
+The intuition is simple: if the pair (S+
+i , S−
+i ) remains negatively correlated, then averaging antithetic
+pairs can reduce variance by partially canceling out opposing errors—since negative correlation
+suggests that when one estimate exceeds the true value, the other is likely to fall below it.
+The AMC estimator is unbiased, and CIAMC
+N
+(1 −α) achieves correct coverage as the sample size
+increases. Let ρ := Corr(S+
+i , S−
+i ). We can prove that AMC’s standard error and its confidence-
+interval width are each equal to the Monte Carlo counterparts multiplied by the factor √1 + ρ. Thus,
+when ρ < 0, AMC produces provably lower variance and tighter confidence intervals than MC,
+with greater gains as ρ becomes more negative. See Appendix B.5 for a formal statement and proof.
+Since both methods have the same computational cost, the variance reduction from negative correla-
+tion and the antithetic design yields a direct and cost-free improvement.
+K-antithetic noise: We can generalize the antithetic noise pair to a collection of K noise variables,
+constructed so that every pair has the same negative correlation −1/(K −1). One way to generate
+them is as follows. Draw K independent standard Gaussian vectors (w1, . . . , wK) and let ¯w be their
+average. For each i, set zi =
+p
+K/(K −1) (wi −¯w) . One can directly check that each zi is still
+marginally standard Gaussian, and Corr(zi,l, zj,l) = −1/(K −1) for every i ̸= j and every pixel l.
+In particular, when K = 2, this construction reduces to our usual antithetic noise pair.
+Quasi-Monte Carlo: The idea of using negatively correlated samples has been widely adopted in
+Monte Carlo methods (Craiu & Meng, 2005) and statistical risk estimation (Liu et al., 2024) for
+improved performance. This principle of variance reduction can be further extended to QMC methods.
+As an alternative to Monte Carlo, QMC constructs a deterministic set of N samples that have negative
+correlation and provide a more balanced coverage of the sample space. QMC samples can also be
+randomized, resulting in RQMC methods. RQMC maintains the marginal distribution of each sample
+while preserving the low-discrepancy properties of QMC. Importantly, repeated randomizations allow
+for empirical error estimation and confidence intervals (L’Ecuyer et al., 2023).
+Under regularity conditions (Niederreiter, 1992), QMC and RQMC can improve the error convergence
+rate from O(N −1/2) to O(N −1+ϵ) for any ϵ > 0, albeit ϵ may absorb a dimension-dependent factor
+(log N)d. For sufficiently smooth functions, RQMC can achieve rates as fast as O(N −3/2+ϵ) (Owen,
+1997b;a). Moreover, the space-filling property of QMC may also promote greater sample diversity.
+Although the dimension of the Gaussian noise is higher than the typical regime where QMC is
+expected to be most effective, RQMC still further shrinks our confidence intervals by several-fold
+compared with standard MC. This hints that the image generator’s effective dimension is much lower
+than its ambient one, allowing QMC methods to stay useful. Similar gains arise when QMC methods
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+deliberately exploit low-dimensional structure in practical problems (Wang & Fang, 2003; Xiao &
+Wang, 2019; Liu & Owen, 2023). Developing ways to identify and leverage this structure more
+systematically is an appealing avenue for future work.
+5
+EXPERIMENT
+Sections 5.1 and 5.2 present two uncertainty quantification applications: estimating pixel-wise
+statistics and evaluating diffusion inverse problem solvers. The latter considers two popular algorithms
+across a range of tasks and datasets. For each task, we apply MC, AMC, and, when applicable, QMC
+estimators as described in Section 4. For each estimator, we report the 95% confidence interval (CI)
+width and its relative efficiency. The relative efficiency of a new estimator (AMC or QMC) is defined
+as the squared ratio of the MC CI width to that of the estimator, (CIMC/CInew estimator)2 . It reflects
+how many times more MC samples are required to achieve the same accuracy as our new estimator.
+Section 5.3 shows that antithetic noise produces more diverse images than independent noise while
+preserving quality, and Appendix C.2 explores an image editing example.
+5.1
+PIXEL-WISE STATISTICS
+We begin by evaluating four pixel-level statistics. These include the (i) pixel value mean, (ii)
+perceived brightness, (iii) contrast, and (iv) the image centroid, with definitions in Appendix C.6.
+These statistics are actively used in diffusion workflows for diagnosing artifacts and assessing
+reliability, with applications in detecting signal leakage (Lin et al., 2024; Everaert et al., 2024),
+out-of-distribution detection (Le Bellier & Audebert, 2024), identifying artifact-prone regions (Kou
+et al., 2024), and improving the reliability of weather prediction (Li et al., 2024a).
+Setup: We study both unconditional and conditional diffusion models; details are in Appendix C.3:
+For unconditional diffusion models, we evaluate pre-trained models on CIFAR-10 (Krizhevsky et al.,
+2009), CelebA-HQ (Xia et al., 2021), and LSUN-Church (Yu et al., 2015). For each dataset, 1,600
+image pairs are generated under both PN and RR noise sampling with 50 DDIM steps.
+For conditional diffusion models, we evaluate Stable Diffusion 1.5 on 200 prompts from the Pick-a-Pic
+(Kirstain et al., 2023) and DrawBench (Saharia et al., 2022) with classifier-free-guidance (CFG) scale
+3.5, and DiT (Peebles & Xie, 2023) on 32 ImageNet classes with CFG scale 4.0. For each class or
+prompt, 100 PN and RR pairs are generated with 20 DDIM steps. We also study the effect of CFG
+scale on both models in the Appendix C.4 (Ho & Salimans, 2022).
+Implementation: To ensure fair comparisons under equal sample budget:
+For unconditional diffusion models: MC uses 3,200 independent samples, AMC (k = 2) uses 1,600
+antithetic pairs, and AMC (k = 8) uses 400 independent negative correlated batches. QMC employs
+a Sobol’ point set of size 64 with 50 independent randomizations. Due to the dimensionality limits,
+QMC is restricted to CIFAR-10.
+For conditional diffusion models: for each class or prompt, MC uses 200 independent samples, AMC
+uses 100 antithetic pairs, and QMC employs 8 Sobol’ points with 25 randomizations.
+CIs for MC and AMC are constructed as described in Section 4. For QMC, we use a student-t interval
+to ensure reliable coverage (L’Ecuyer et al., 2023), with details in Appendix C.6.
+Results: Across all statistics, both AMC and QMC have much shorter CIs than MC, with relative
+efficiencies ranging from 3.1 to 136. This strongly suggests our estimators can dramatically reduce
+cost for uncertainty estimates. AMC and QMC estimators yield comparable results. The performance
+of QMC depends on how the total budget is allocated between the size of the QMC point set and the
+number of random replicates, a trade-off we explore in further details in Appendix C.6.
+5.2
+EVALUATING DIFFERENT DIFFUSION INVERSE PROBLEM SOLVERS
+Bayesian inverse problems are important in medical imaging, remote sensing, and astronomy. Re-
+cently, many methods have been proposed that leverage diffusion priors to solve inverse problems.
+For instance, Zheng et al. (2025) surveys 14 such methods, yet this is still far from exhaustive. As a
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+Table 2: CI lengths and efficiency (CIMC/CI)2 (in parentheses), using MC as baseline.
+Dataset
+Brightness
+Pixel Mean
+Contrast
+Centroid
+CIFAR10
+MC
+2.00
+2.04
+1.08
+0.14
+QMC
+0.35 (32.05)
+0.39 (26.94)
+0.22 (23.43)
+0.04 (9.65)
+AMC (k = 2)
+0.35 (32.66)
+0.39 (27.12)
+0.23 (22.05)
+0.04 (9.73)
+AMC (k = 8)
+0.36 (30.35)
+0.39 (27.34)
+0.24 (20.37)
+0.03 (13.94)
+CelebA
+MC
+1.77
+1.76
+0.60
+0.60
+AMC (k = 2)
+0.26 (47.41)
+0.31 (33.15)
+0.19 (10.18)
+0.20 (7.82)
+AMC (k = 8)
+0.15 (130.69)
+0.16 (115.79)
+0.18 (10.90)
+0.19 (8.49)
+Church
+MC
+1.66
+1.64
+1.02
+0.82
+AMC (k = 2)
+0.14 (134.13)
+0.16 (103.80)
+0.20 (27.16)
+0.26 (9.84)
+AMC (k = 8)
+0.15 (117.90)
+0.16 (107.64)
+0.19 (27.81)
+0.25 (10.87)
+Stable Diff.
+MC
+3.86
+3.95
+2.18
+4.03
+QMC
+1.36 (8.07)
+1.43 (7.60)
+1.03 (4.46)
+1.88 (4.54)
+AMC (k = 2)
+0.90 (18.53)
+1.00 (15.53)
+0.89 (6.25)
+1.62 (6.15)
+DiT
+MC
+7.52
+7.74
+3.32
+3.15
+QMC
+3.44 (4.78)
+3.49 (4.91)
+1.82 (3.31)
+1.69 (3.46)
+AMC (k = 2)
+3.13 (5.79)
+3.12 (6.16)
+1.72 (3.74)
+1.74 (3.30)
+result, comprehensive benchmarking is costly. Meanwhile, most existing works on new diffusion
+inverse solvers (DIS) largely ignore uncertainty quantification, though it is critical for fair evaluation.
+This raises a key challenge: how to efficiently evaluate posterior sampling algorithms with reliable
+estimates of reconstruction quality and uncertainty. Our approach aims to efficiently address this gap.
+We show that our antithetic estimator can save substantial computational cost for quantifying un-
+certainty by requiring far fewer samples than standard estimators. We focus on two popular DISs,
+Diffusion Posterior Sampling (DPS) (Chung et al., 2023a) and Decomposed Diffusion Sampler
+(DDS) (Chung et al., 2023b), and evaluate them on a range of tasks described below.
+5.2.1
+HUMAN FACE RECONSTRUCTION
+We evaluate DPS across three inverse problems: inpainting, Gaussian deblurring, and super-resolution.
+Reconstruction error is measured using both PSNR and L1 distance relative to the ground truth image.
+For all tasks, we use 200 human face images from the CelebA-HQ dataset. For each corrupted image,
+we generate 50 DPS reconstructions using both PN and RR noise pairs to compare their estimators.
+Operator-specific configurations (e.g., kernel sizes, mask ratios) are provided in Appendix C.6.
+Results: As shown in Table 3, across all three tasks, AMC achieves substantially shorter confidence
+intervals than standard MC. This implies AMC yields efficiency gains, ranging from 54% – 84% in
+inpainting, 41% – 54% in super-resolution, and 34% – 56% in deblurring.
+The reconstruction metrics (L1, PSNR) differ by less than 0.2% between the two estimators, showing
+that they produce consistent results. Meanwhile, our method offers a clear advantage in efficiency.
+Table 3: Comparison of AMC vs. MC across tasks in DPS with efficiency (CIMC/CI)2 in parentheses
+L1
+PSNR
+Task
+AMC CI
+MC CI
+AMC CI
+MC CI
+Inpainting
+0.83 (1.54)
+1.03
+0.23 (1.84)
+0.31
+Super-resolution
+1.01 (1.41)
+1.20
+0.24 (1.54)
+0.30
+Gaussian Deblur
+0.89 (1.34)
+1.03
+0.23 (1.56)
+0.29
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+5.2.2
+MEDICAL IMAGE RECONSTRUCTION
+We use the DDS (Chung et al., 2023b) as the reconstruction backbone and apply our antithetic
+noise initialization to estimate reconstruction confidence intervals. Given a single measurement, we
+generate 100 reconstruction pairs using 50-step DDS sampling. Reconstruction quality is evaluated
+against ground truth using L1 distance and PSNR. Dataset details can be found in Appendix C.6.4.
+Results: Both MC and AMC estimators give consistent estimates, with estimated L1 error of 0.0194
+and 0.0195, and PSNR values of 31.48 and 31.45, respectively. Similarly, we observe that AMC
+produces much shorter confidence intervals. The CI lengths decrease with relative efficiency of 1.44
+for L1 and 1.37 for PSNR. This shows that antithetic initialization consistently reduces estimator
+variance with no extra cost without degrading reconstruction fidelity in large-scale inverse problems.
+Conclusion: These two experiments show that a single antithetic estimator reduces evaluation costs
+for diffusion inverse solvers by 34%–84%, a saving that becomes especially valuable given the large
+number of solvers in the literature. This makes large-scale benchmarking far more practical.
+5.3
+DIVERSITY IMPROVEMENT
+Many diffusion tools generate a few images from one prompt to let users select a preferred one.
+However, these images may look similar with randomly sampled initial noise (Marwood et al., 2023;
+Sadat et al., 2024). We show that antithetic noise produces more diverse images than independent
+noise, without reducing image quality or increasing computational cost. Diversity is measured using
+pairwise SSIM (lower = more diverse) and LPIPS (Zhang et al., 2018) (higher = more diverse).
+We evaluate the diversity metrics for both unconditional and conditional diffusion on image pairs
+generated following the same setup in Section 5.1. As shown in Table 4, antithetic noise pairs
+consistently lead to higher diversity, as indicated by lower SSIM and higher LPIPS scores. Importantly,
+image quality remains stable for both noise types. We expect our method can be easily integrated into
+existing diversity optimization techniques to further improve their performance.
+Table 4: Average percentage improvement of PN pairs over RR pairs on SSIM and LPIPS.
+Metric
+Unconditional Diffusion
+Conditional Diffusion
+CIFAR-10
+LSUN-Church
+CelebA-HQ
+SD1.5
+DiT
+SSIM (%)
+88.78
+45.69
+36.78
+28.32
+23.99
+LPIPS (%)
+6.69
+3.54
+15.14
+5.78
+10.62
+6
+DISCUSSION AND FUTURE DIRECTIONS
+We find that antithetic initial noise yields negatively correlated samples. This is a robust property that
+generalizes across every model that we have tested. The negative correlation is especially useful for
+uncertainty quantification, where it brings huge variance reduction and cost savings. This makes our
+approach highly effective for evaluation and benchmarking tasks. Meanwhile, this finding can serve
+as a simple plug-in to improve related tasks, such as diversity improvement and image editing.
+A limitation of our work is that while the symmetry conjecture is supported by both empirical and
+theoretical evidence, it remains open in full generality. In addition, our method is not a cure-all: the
+LPIPS diversity improvements in Table 4 are consistent but modest. While we obtain large gains for
+pixel-wise statistics, the improvements for perceptual or text-alignment metrics such as MUSIQ and
+CLIP Score are small, since the strong nonlinearity of transformer decoders attenuates most of the
+negative correlation present in the diffusion outputs.
+Looking forward, future directions include systematically studying the symmetry conjecture; inte-
+grating antithetic noise with existing noise-optimization methods; and further leveraging QMC to
+improve sampling and estimation.
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+ACKNOWLEDGEMENT
+Guanyang Wang and Jing Jia acknowledge support from the National Science Foundation through
+grant DMS–2210849 and an Adobe Data Science Research Award. Liyue Shen and Bowen Song
+acknowledge funding support from the National Science Foundation through grant IIS-2435746,
+Defense Advanced Research Projects Agency (DARPA) under Contract No. HR00112520042,
+Hyundai America Technical Center, Inc. (HATCI), as well as the University of Michigan MICDE
+Catalyst Grant Award and MIDAS PODS Grant Award.
+ETHICS STATEMENT
+This work does not involve human subjects or personally identifiable data collected by the authors.
+All datasets used are publicly available and distributed under licenses permitting academic research.
+Our medical image reconstruction experiments rely on benchmark datasets that are fully de-identified
+before release (e.g., publicly available MRI data). No new data collection was performed, and no
+protected health information is included. The experiments are purely methodological, intended to
+evaluate reconstruction fidelity and uncertainty quantification techniques, and make no clinical claims
+or diagnostic recommendations.
+Our contributions are methodological, focusing on sampling and uncertainty quantification in gen-
+erative models. While such methods could be applied broadly, including in sensitive domains, we
+emphasize that our work aims to improve reliability, transparency, and efficiency in evaluation.
+REPRODUCIBILITY STATEMENT
+Full experimental details can be found in Section 5 and Appendix C. The code is available at https:
+//github.com/jjia131/Antithetic-Noise-in-Diffusion-Models-page.
+REFERENCES
+Rishabh Agarwal, Levi Melnick, Nicholas Frosst, Xuezhou Zhang, Ben Lengerich, Rich Caruana,
+and Geoffrey E Hinton. Neural additive models: Interpretable machine learning with neural nets.
+Advances in Neural Information Processing Systems, 34:4699–4711, 2021.
+Dominique Bakry, Ivan Gentil, and Michel Ledoux. Analysis and geometry of Markov diffusion
+operators, volume 348. Springer Science & Business Media, 2013.
+Yuanhao Ban, Ruochen Wang, Tianyi Zhou, Boqing Gong, Cho-Jui Hsieh, and Minhao Cheng.
+The crystal ball hypothesis in diffusion models: Anticipating object positions from initial noise.
+In The Thirteenth International Conference on Learning Representations, 2025. URL https:
+//openreview.net/forum?id=GpdO9r73xT.
+Lucas Berry, Axel Brando, and David Meger. Shedding light on large generative networks: Estimating
+epistemic uncertainty in diffusion models. In The 40th Conference on Uncertainty in Artificial
+Intelligence, 2024.
+Lucas Berry, Axel Brando, Wei-Di Chang, Juan Camilo Gamboa Higuera, and David Meger. See-
+ing the unseen: How emoe unveils bias in text-to-image diffusion models.
+arXiv preprint
+arXiv:2505.13273, 2025.
+Alexander Buchholz, Florian Wenzel, and Stephan Mandt. Quasi-Monte Carlo variational inference.
+In International Conference on Machine Learning, pp. 668–677. PMLR, 2018.
+Changgu Chen, Libing Yang, Xiaoyan Yang, Lianggangxu Chen, Gaoqi He, Changbo Wang, and
+Yang Li. FIND: Fine-tuning initial noise distribution with policy optimization for diffusion models.
+In Proceedings of the 32nd ACM International Conference on Multimedia, pp. 6735–6744, 2024a.
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+Siyi Chen, Huijie Zhang, Minzhe Guo, Yifu Lu, Peng Wang, and Qing Qu.
+Exploring low-
+dimensional subspace in diffusion models for controllable image editing.
+In The Thirty-
+eighth Annual Conference on Neural Information Processing Systems, 2024b. URL https:
+//openreview.net/forum?id=50aOEfb2km.
+Hamadi Chihaoui, Abdelhak Lemkhenter, and Paolo Favaro. Blind image restoration via fast diffusion
+inversion. Advances in Neural Information Processing Systems, 37:34513–34532, 2024.
+Hyungjin Chung, Jeongsol Kim, Michael Thompson Mccann, Marc Louis Klasky, and Jong Chul Ye.
+Diffusion posterior sampling for general noisy inverse problems. In The Eleventh International
+Conference on Learning Representations, 2023a. URL https://openreview.net/forum?
+id=OnD9zGAGT0k.
+Hyungjin Chung, Suhyeon Lee, and Jong Chul Ye. Decomposed diffusion sampler for accelerating
+large-scale inverse problems. arXiv preprint arXiv:2303.05754, 2023b.
+Radu V Craiu and Xiao-Li Meng. Multiprocess parallel antithetic coupling for backward and forward
+Markov chain Monte Carlo. Annals of Statistics, pp. 661–697, 2005.
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale
+hierarchical image database. In 2009 IEEE conference on computer vision and pattern recognition,
+pp. 248–255. Ieee, 2009.
+Martin Nicolas Everaert, Athanasios Fitsios, Marco Bocchio, Sami Arpa, Sabine Süsstrunk, and
+Radhakrishna Achanta. Exploiting the signal-leak bias in diffusion models. In Proceedings of the
+IEEE/CVF Winter Conference on Applications of Computer Vision, pp. 4025–4034, 2024.
+Luca Eyring, Shyamgopal Karthik, Karsten Roth, Alexey Dosovitskiy, and Zeynep Akata. Reno:
+Enhancing one-step text-to-image models through reward-based noise optimization. Advances in
+Neural Information Processing Systems, 37:125487–125519, 2024.
+Cees M Fortuin, Pieter W Kasteleyn, and Jean Ginibre. Correlation inequalities on some partially
+ordered sets. Communications in Mathematical Physics, 22:89–103, 1971.
+William
+C.
+Francis.
+Variational-autoencoder-for-mnist.
+https://github.com/
+williamcfrancis/Variational-Autoencoder-for-MNIST,
+2022.
+Pytorch
+implementation of a Variational Autoencoder (VAE) that learns from the MNIST dataset and
+generates images of altered handwritten digits.
+Xiefan Guo, Jinlin Liu, Miaomiao Cui, Jiankai Li, Hongyu Yang, and Di Huang. Initno: Boosting
+text-to-image diffusion models via initial noise optimization. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition, pp. 9380–9389, 2024.
+Jonathan Ho and Tim Salimans. Classifier-free diffusion guidance. arXiv preprint arXiv:2207.12598,
+2022.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. Advances in
+neural information processing systems, 33:6840–6851, 2020.
+Corwin Joy, Phelim P Boyle, and Ken Seng Tan. Quasi-Monte Carlo methods in numerical finance.
+Management science, 42(6):926–938, 1996.
+Samuel Karlin and Yosef Rinott. Classes of orderings of measures and related correlation inequalities.
+i. multivariate totally positive distributions. Journal of Multivariate Analysis, 10(4):467–498, 1980.
+Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-
+based generative models. Advances in Neural Information Processing Systems, 35:26565–26577,
+2022.
+Alexander Keller. A quasi-Monte Carlo algorithm for the global illumination problem in the radiosity
+setting. In Monte Carlo and Quasi-Monte Carlo Methods in Scientific Computing: Proceedings of
+a conference at the University of Nevada, Las Vegas, Nevada, USA, June 23–25, 1994, pp. 239–251.
+Springer, 1995.
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+Durk P Kingma and Prafulla Dhariwal. Glow: Generative flow with invertible 1x1 convolutions.
+Advances in neural information processing systems, 31, 2018.
+Yuval Kirstain, Adam Polyak, Uriel Singer, Shahbuland Matiana, Joe Penna, and Omer Levy.
+Pick-a-pic: An open dataset of user preferences for text-to-image generation. In Thirty-seventh
+Conference on Neural Information Processing Systems, 2023. URL https://openreview.
+net/forum?id=G5RwHpBUv0.
+Florian Knoll, Jure Zbontar, Anuroop Sriram, Matthew J Muckley, Mary Bruno, Aaron Defazio,
+Marc Parente, Krzysztof J Geras, Joe Katsnelson, Hersh Chandarana, et al. fastmri: A publicly
+available raw k-space and dicom dataset of knee images for accelerated mr image reconstruction
+using machine learning. Radiology: Artificial Intelligence, 2(1):e190007, 2020.
+Zhifeng Kong, Wei Ping, Jiaji Huang, Kexin Zhao, and Bryan Catanzaro. Diffwave: A versatile
+diffusion model for audio synthesis. In International Conference on Learning Representations,
+2021. URL https://openreview.net/forum?id=a-xFK8Ymz5J.
+Siqi Kou, Lei Gan, Dequan Wang, Chongxuan Li, and Zhijie Deng. Bayesdiff: Estimating pixel-wise
+uncertainty in diffusion via bayesian inference. In The Twelfth International Conference on Learn-
+ing Representations, 2024. URL https://openreview.net/forum?id=YcM6ofShwY.
+Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+Vladimir Kulikov, Matan Kleiner, Inbar Huberman-Spiegelglas, and Tomer Michaeli. Flowedit:
+Inversion-free text-based editing using pre-trained flow models. arXiv preprint arXiv:2412.08629,
+2024.
+Georges Le Bellier and Nicolas Audebert. Detecting out-of-distribution earth observation images
+with diffusion models. In Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition, pp. 481–491, 2024.
+Lizao Li, Robert Carver, Ignacio Lopez-Gomez, Fei Sha, and John Anderson. Generative emulation
+of weather forecast ensembles with diffusion models. Science Advances, 10(13):eadk4489, 2024a.
+Xiang Li, Yixiang Dai, and Qing Qu. Understanding generalizability of diffusion models requires
+rethinking the hidden gaussian structure. Advances in neural information processing systems, 37:
+57499–57538, 2024b.
+Shanchuan Lin, Bingchen Liu, Jiashi Li, and Xiao Yang. Common diffusion noise schedules and
+sample steps are flawed. In Proceedings of the IEEE/CVF winter conference on applications of
+computer vision, pp. 5404–5411, 2024.
+Sifan Liu and Art B Owen. Quasi-Monte Carlo quasi-Newton in variational Bayes. Journal of
+Machine Learning Research, 22(243):1–23, 2021.
+Sifan Liu and Art B Owen. Preintegration via active subspace. SIAM Journal on Numerical Analysis,
+61(2):495–514, 2023.
+Sifan Liu, Snigdha Panigrahi, and Jake A. Soloff. Cross-validation with antithetic Gaussian random-
+ization. arXiv preprint arXiv:2412.14423, 2024.
+Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. DPM-solver++:
+Fast solver for guided sampling of diffusion probabilistic models, 2023.
+URL https://
+openreview.net/forum?id=4vGwQqviud5.
+Pierre L’Ecuyer. Quasi-Monte Carlo methods with applications in finance. Finance and Stochastics,
+13:307–349, 2009.
+Pierre L’Ecuyer, Marvin K. Nakayama, Art B. Owen, and Bruno Tuffin. Confidence intervals for
+randomized quasi-Monte Carlo estimators. In 2023 Winter Simulation Conference, pp. 445–446,
+2023.
+David Marwood, Shumeet Baluja, and Yair Alon. Diversity and diffusion: Observations on synthetic
+image distributions with stable diffusion. arXiv preprint arXiv:2311.00056, 2023.
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+Chenlin Meng, Yutong He, Yang Song, Jiaming Song, Jiajun Wu, Jun-Yan Zhu, and Stefano Ermon.
+SDEdit: Guided image synthesis and editing with stochastic differential equations. In International
+Conference on Learning Representations, 2022. URL https://openreview.net/forum?
+id=aBsCjcPu_tE.
+H. Niederreiter. Random Number Generation and Quasi-Monte Carlo Methods. SIAM, Philadelphia,
+PA, 1992.
+A. B. Owen. Scrambled net variance for integrals of smooth functions. Annals of Statistics, 25(4):
+1541–1562, 1997a.
+A. B. Owen. Monte Carlo variance of scrambled net quadrature. SIAM Journal of Numerical Analysis,
+34(5):1884–1910, 1997b.
+Art B. Owen. Monte Carlo Theory, Methods and Examples. https://artowen.su.domains/
+mc/, 2013.
+William Peebles and Saining Xie. Scalable diffusion models with transformers. In Proceedings of
+the IEEE/CVF international conference on computer vision, pp. 4195–4205, 2023.
+Dustin Podell, Zion English, Kyle Lacey, Andreas Blattmann, Tim Dockhorn, Jonas Müller, Joe
+Penna, and Robin Rombach. SDXL: Improving latent diffusion models for high-resolution image
+synthesis. In The Twelfth International Conference on Learning Representations, 2024. URL
+https://openreview.net/forum?id=di52zR8xgf.
+Zipeng Qi, Lichen Bai, Haoyi Xiong, and Zeke Xie. Not all noises are created equally: Diffusion
+noise selection and optimization. arXiv preprint arXiv:2407.14041, 2024.
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-
+resolution image synthesis with latent diffusion models. In Proceedings of the IEEE/CVF confer-
+ence on computer vision and pattern recognition, pp. 10684–10695, 2022.
+Seyedmorteza Sadat, Jakob Buhmann, Derek Bradley, Otmar Hilliges, and Romann M. Weber. CADS:
+Unleashing the diversity of diffusion models through condition-annealed sampling. In The Twelfth
+International Conference on Learning Representations, 2024. URL https://openreview.
+net/forum?id=zMoNrajk2X.
+Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily L Denton, Kamyar
+Ghasemipour, Raphael Gontijo Lopes, Burcu Karagol Ayan, Tim Salimans, et al. Photorealistic
+text-to-image diffusion models with deep language understanding. Advances in Neural Information
+Processing Systems, 35:36479–36494, 2022.
+Tim Salimans and Jonathan Ho. Progressive distillation for fast sampling of diffusion models. In
+International Conference on Learning Representations, 2022. URL https://openreview.
+net/forum?id=TIdIXIpzhoI.
+Axel Sauer, Dominik Lorenz, Andreas Blattmann, and Robin Rombach. Adversarial diffusion
+distillation. In European Conference on Computer Vision, pp. 87–103. Springer, 2024.
+Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised
+learning using nonequilibrium thermodynamics. In International conference on machine learning,
+pp. 2256–2265. pmlr, 2015.
+Bowen Song, Soo Min Kwon, Zecheng Zhang, Xinyu Hu, Qing Qu, and Liyue Shen. Solving inverse
+problems with latent diffusion models via hard data consistency. In The Twelfth International
+Conference on Learning Representations, 2024. URL https://openreview.net/forum?
+id=j8hdRqOUhN.
+Bowen Song, Zecheng Zhang, Zhaoxu Luo, Jason Hu, Wei Yuan, Jing Jia, Zhengxu Tang, Guanyang
+Wang, and Liyue Shen. CCS: Controllable and constrained sampling with diffusion models via
+initial noise perturbation. In The Thirty-ninth Annual Conference on Neural Information Processing
+Systems, 2025. URL https://openreview.net/forum?id=64lk7JQAU1.
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. In Interna-
+tional Conference on Learning Representations, 2021a. URL https://openreview.net/
+forum?id=St1giarCHLP.
+Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben
+Poole. Score-based generative modeling through stochastic differential equations. In International
+Conference on Learning Representations, 2021b. URL https://openreview.net/forum?
+id=PxTIG12RRHS.
+Yang Song, Liyue Shen, Lei Xing, and Stefano Ermon. Solving inverse problems in medical imaging
+with score-based generative models. In International Conference on Learning Representations,
+2022. URL https://openreview.net/forum?id=vaRCHVj0uGI.
+Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever. Consistency models. In International
+Conference on Machine Learning, pp. 32211–32252. PMLR, 2023.
+Roman Vershynin. High-dimensional probability: An introduction with applications in data science,
+volume 47. Cambridge university press, 2018.
+Patrick von Platen, Suraj Patil, Anton Lozhkov, Pedro Cuenca, Nathan Lambert, Kashif Rasul,
+Mishig Davaadorj, Dhruv Nair, Sayak Paul, William Berman, Yiyi Xu, Steven Liu, and Thomas
+Wolf. Diffusers: State-of-the-art diffusion models. https://github.com/huggingface/
+diffusers, 2022.
+Carsten Waechter and Alexander Keller. Quasi-Monte Carlo light transport simulation by efficient
+ray tracing, May 31 2011. US Patent 7,952,583.
+Binxu Wang and John Vastola. The unreasonable effectiveness of gaussian score approximation for
+diffusion models and its applications. Transactions on Machine Learning Research, 2024. ISSN
+2835-8856. URL https://openreview.net/forum?id=I0uknSHM2j.
+Hengkang Wang, Xu Zhang, Taihui Li, Yuxiang Wan, Tiancong Chen, and Ju Sun. Dmplug: A plug-in
+method for solving inverse problems with diffusion models. Advances in Neural Information
+Processing Systems, 37:117881–117916, 2024.
+Xiaoqun Wang and Kai-Tai Fang. The effective dimension and quasi-Monte Carlo integration.
+Journal of Complexity, 19:101–124, 2003.
+Weihao Xia, Yujiu Yang, Jing-Hao Xue, and Baoyuan Wu. Tedigan: Text-guided diverse face image
+generation and manipulation. In IEEE Conference on Computer Vision and Pattern Recognition
+(CVPR), 2021.
+Ye Xiao and Xiaoqun Wang. Enhancing quasi-Monte Carlo simulation by minimizing effective
+dimension for derivative pricing. Computational Economics, 54(1):343–366, 2019.
+Seungil You, David Ding, Kevin Canini, Jan Pfeifer, and Maya Gupta. Deep lattice networks and
+partial monotonic functions. Advances in neural information processing systems, 30, 2017.
+Fisher Yu, Ari Seff, Yinda Zhang, Shuran Song, Thomas Funkhouser, and Jianxiong Xiao. Lsun:
+Construction of a large-scale image dataset using deep learning with humans in the loop. arXiv
+preprint arXiv:1506.03365, 2015.
+Jure Zbontar, Florian Knoll, Anuroop Sriram, Tullie Murrell, Zhengnan Huang, Matthew J Muckley,
+Aaron Defazio, Ruben Stern, Patricia Johnson, Mary Bruno, et al. fastmri: An open dataset and
+benchmarks for accelerated mri. arXiv preprint arXiv:1811.08839, 2018.
+Richard Zhang, Phillip Isola, Alexei A Efros, Eli Shechtman, and Oliver Wang. The unreasonable
+effectiveness of deep features as a perceptual metric. In Proceedings of the IEEE conference on
+computer vision and pattern recognition, pp. 586–595, 2018.
+Hongkai Zheng, Wenda Chu, Bingliang Zhang, Zihui Wu, Austin Wang, Berthy Feng, Caifeng
+Zou, Yu Sun, Nikola Borislavov Kovachki, Zachary E Ross, Katherine Bouman, and Yisong
+Yue. Inversebench: Benchmarking plug-and-play diffusion priors for inverse problems in physical
+sciences. In The Thirteenth International Conference on Learning Representations, 2025. URL
+https://openreview.net/forum?id=U3PBITXNG6.
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+Zikai Zhou, Shitong Shao, Lichen Bai, Zhiqiang Xu, Bo Han, and Zeke Xie. Golden noise for
+diffusion models: A learning framework. arXiv preprint arXiv:2411.09502, 2024.
+A
+USE OF LLMS
+LLMs are used only for writing, editing, or formatting purposes and do not affect the core methodol-
+ogy, contributions, and originality of the paper.
+B
+PROOFS
+B.1
+PROOFS IN SECTION 3.2
+Proof of Lemma 1. It suffices to show Var(f(Z) + f(−Z)) = 0. By definition:
+Corr(f(−Z), f(Z)) =
+Cov(f(−Z), f(Z))
+p
+Var(f(Z)) Var(f(−Z))
+= −1.
+Therefore
+Var(f(Z) + f(−Z)) = Var(f(Z)) + Var(f(−Z)) + 2 Cov(f(Z), f(−Z))
+= Var(f(Z)) + Var(f(−Z)) −2
+p
+Var(f(Z)) Var(f(−Z))
+=
+p
+Var(f(Z)) −
+p
+Var(f(−Z))
+2
+.
+On the other hand, since −Z ∼N(0, I) given Z ∼N(0, 1), we have Var(f(Z)) = Var(f(−Z))
+and then Var(f(Z) + f(−Z)) = 0, as claimed.
+B.2
+THEORETICAL GUARANTEE OF THE SYMMETRY CONJECTURE FOR LARGE t
+Background: The Ornstein–Uhlenbeck (OU) process.
+The OU process (Xt)t≥0 in Rd solves the
+SDE
+dXt = −Xt dt +
+√
+2 dBt,
+X0 ∼µ0,
+where (Bt) is standard Brownian motion in Rd. This is a Gaussian Markov process with stationary
+distribution γd = N(0, Id) and generator
+Lf(x) = ∆f(x) −x · ∇f(x).
+For any initial law µ0, let µt denote the law of Xt. Then µt = µ0Pt, where (Pt)t≥0 is the OU
+semigroup defined by
+(Ptf)(x) = E[f(Xt) | X0 = x].
+Write the score of µt as st(x) := ∇log pt(x), where pt is Lebesgue density of µt, we have
+Theorem 1 (Score converges to the Gaussian score). Under the setup above,
+lim
+t→∞Eµt
+
+∥st(Xt) + Xt∥2
+= 0.
+Moreover, the convergence is quantified by
+Eµt
+
+∥st(Xt) + Xt∥2
+= I(µt | γd) ≤e−2t I(µ0 | γd).
+Proof. Recall the definition of relative Fisher information
+I(µt | γd) := Eµt
+
+∥∇log(pt/γd)∥2
+.
+Since ∇γd(x) = −x, we have:
+I(µt | γd) = Eµt
+
+∥st(Xt) + Xt∥2
+.
+Moreover, it is well known (e.g. Chapter 5 of Bakry et al. (2013)) that I(µt | γd) ≤exp(−2t)I(µ0 |
+γd), this concludes our proof.
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+In variance-preserving diffusion models, the forward noising process is exactly the Orn-
+stein–Uhlenbeck semigroup. Theorem 1 implies that the true score converges to the Gaussian score
+−x. Consequently, one-dimensional slices of the score become asymptotically affine antisymmetric,
+confirming our symmetry conjecture in the high-noise limit.
+The next corollary shows, the 1-step DDIM update has nearly −1 correlation at large t.
+Corollary 1 (Correlation of 1-step DDIM). With all the setup the same as above, assuming we
+have a score network ϵ(t) approximating the score function.
+Let ηt := max{Ept∥ϵ(t)(X) −
+st(X)∥2, Ept∥ϵ(t)(−X) −st(−X)∥2} be the expected (symmetrized) error. Consider one-step
+DDIM update Ft(x) = atx + bt ϵ(t)
+θ (x) := (Ft,1(x), . . . , Ft,d(x)) ∈Rd as defined in (2). Let
+vt,i := min{Varpt
+ Ft,i(X)
+
+, Varpt
+ Ft,i(−X)
+
+}.
+Then
+Corr
+ Ft,i(X), Ft,i(−X)
+
++ 1
+ ≤2 |bt|
+√vt,i
+√ηt + e−tp
+I(µ0 | γd)
+
+.
+Proof. Theorem 1 shows I(µt | γd) ≤exp(−2t)I(µ0 | γd). Write ϵ(t)
+θ
+= st +rt and st = −x+∆t,
+so that Ept∥rt(X)∥2 ≤ηt and Ept∥∆t(X)∥2 = I(µt | γd). Then
+Ft(x) = (at −bt)x + bt
+ ∆t(x) + rt(x)
+
+,
+Ft(−x) = −Ft(x) + Et(x),
+with Et(x) := bt[∆t(−x) + ∆t(x) + rt(−x) + rt(x)]. By triangle inequality of L2(pt) norm,
+∥Et∥L2(pt) ≤|bt|
+ e−tp
+I(µ0 | γd) + e−tp
+I(µ0 | γd) + 2√ηt
+
+.
+Using
+Corr
+ Ft,i(X), Ft,i(−X)
+
+= −1 +
+Cov
+ Ft,i(X), Et,i(X)
+
+p
+Var(Ft,i(X)) Var(Ft,i(−X))
+and Cauchy–Schwarz with the variance lower bounds gives
+Corr
+ Ft(X), Ft(−X)
+
++ 1
+ ≤∥Et∥L2(pt)
+√vt,i
+≤2 |bt|
+√vt,i
+ √ηt + e−tp
+I(µ0 | γd),
+as claimed.
+In practice, if vt,i > 0, the correlation is close to −1 for large t; its deviation from −1 is on the order
+of the neural network approximation error plus an exponentially decaying term Ce−t.
+B.3
+MONOTONE CONVERGENCE IN t
+Section B.2 shows that the score converges to the Gaussian score as t →∞. We now further
+prove that (1) the score error Eµt
+
+|st(Xt) + Xt|2
+and (2) the density ratio pt/γd both converge
+monotonically in t.
+B.3.1
+DENSITY RATIO CONVERGENCE
+Background: Hermite Polynomials in R:
+For x ∈R, the (probabilist’s) Hermite polynomials
+{Hn(x)}n≥0 form a sequence of polynomials defined by
+Hn(x) = (−1)n exp
+x2
+2
+ dn
+dxn exp
+
+−x2
+2
+
+.
+We summarize their known properties here. The first two can be checked by direct calculation. The
+latter two can be found on page 105 of Bakry et al. (2013).
+Proposition 1. Hermite polynomials {Hn(x)}n≥0 satisfy the following
+• (Recurrence relation) Hn+1(x) = x Hn(x) −H′
+n(x),
+n ≥0.
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+• (Orthogonality under Gaussian measure) We have:
+Z
+Hn(x)Hm(x)γ1(dx) = n!δnm,
+where γ1(dx) = (2π)−1/2e−x2/2dx denotes the one-dimensional standard Gaussian mea-
+sure, and δnm is 1 when n = m and 0 otherwise.
+• (Completeness) Hermite polynomials {Hn(x)}n≥0 form an orthogonal basis of the Hilbert
+space L2(γ) := {f :
+R
+f 2γ(dx) < ∞} equipped with inner product ⟨f, g⟩γ :=
+R
+fgγ(dx).
+• (Eigenfunction) Let L be a differential operator defined as L(f) := f ′′ −xf ′. Hermite
+polynomials {Hn(x)}n≥0 are eigenfunctions of L:
+L(Hn) = −nHn,
+n ≥0.
+Hermite Polynomials in Rd: One can naturally extend univariate Hermite polynomials to the
+multivariate setting. For x = (x1, . . . , xd) ∈Rd, let γd denote the d-dimensional standard Gaussian
+measure,
+γd(dx) := (2π)−d/2 exp
+
+−∥x∥2
+2
+
+dx.
+For a multi-index α = (α1, . . . , αd) ∈Nd, we define the multivariate Hermite polynomial
+Hα(x) :=
+d
+Y
+i=1
+Hαi(xi),
+where Hαi is the one-dimensional probabilists’ Hermite polynomial. We write |α| := α1 + · · · +
+αd and α! := α1! · · · αd!. Similar to the one-dimensional case, the family {Hα}α∈N d forms an
+orthogonal basis of the Hilbert space L2(γd):
+Z
+Rd Hα(x) Hβ(x) γd(dx) = α! δαβ.
+Monotone convergence of the density ratio.
+Recall from Section B.2 that the generator of the OU
+process
+Lf(x) = ∆f(x) −x · ∇f(x).
+and the corresponding Markov semigroup Pt = exp(tL). We show that the multivariate Hermite
+polynomials are eigenfunctions of L, and thus also of Pt.
+Proposition 2. We have:
+• LHα = −|α| Hα,
+α ∈Nd,
+• PtHα = e−|α|t Hα,
+α ∈Nd, t ≥0.
+• For every g ∈L2(γd)
+Ptg(x) =
+X
+α∈Nd
+aαe−t|α|Hα(x),
+where aα = ⟨g, Hα⟩L2(γd).
+Proof. We can directly calculate
+LHα(x) = ∆Hα(x) −x · ∇Hα(x)
+=
+X
+i
+H′′
+αi(xi)Hα−i(x−i) −
+X
+i
+xiH′
+αi(xi)Hα−i(x−i)
+=
+X
+i
+Hα−i(x−i)(H′′
+αi(xi) −xiH′
+αi(xi))
+=
+X
+i
+(−αi)Hα−i(x−i)Hαi(xi)
+= −|α| Hα(x),
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+where Hα−i(x−i) = Q
+j̸=i Hαj(xj). The second to last equality follows from the fourth property of
+Proposition 1.
+Consequently, the OU semigroup (Pt)t≥0 satisfies
+PtHα = e−t|α|Hα,
+t ≥0.
+For every g ∈L2(γd), we rewrite g according to its Hermite expansion (which is valid according to
+properties 2-3 in Proposition 1).
+g(x) =
+X
+α∈Nd
+aαHα(x),
+aα = ⟨g, Hα⟩L2(γd).
+Therefore
+Ptg(x) =
+X
+α∈Nd
+aαe−t|α|Hα(x),
+as claimed.
+In particular, let pt(x) = ft(x)γd(x) denote the density at time t of the OU process started from p0.
+It is known that ft = Ptf0. Proposition 2 implies
+ft(x) =
+X
+α∈Nd
+aαe−t|α|Hα(x) = a0 +
+X
+|α|>0
+aαe−t|α|Hα(x),
+where aα are the Hermite coefficients of f0. Since H0 ≡1 and
+a0 =
+Z
+Rd f0(x) H0(x) γd(dx) =
+Z
+Rd f0(x) γd(dx) =
+Z
+Rd p0(x) dx = 1,
+we may rewrite
+ft(x) = 1 +
+X
+|α|>0
+aαe−t|α|Hα(x).
+(3)
+We now show ft monotonically converges to 1 in L2(γd).
+Proposition 3. Let pt = ftγd be as above, and assume f0 ∈L2(γd). Then ∥ft −1∥L2(γd)
+monotonically decays to 0 at the speed of e−t.
+Proof. From (3) we have
+ft(x) = 1 +
+X
+|α|>0
+aαe−t|α|Hα(x).
+Since {Hα}α∈Nd is an orthogonal basis of L2(γd), we obtain
+∥ft −1∥2
+L2(γd) =
+X
+α∈Nd
+a2
+αe−2t|α|.
+Since each term in the sum decreases monotonically to 0, the same holds for ∥ft −1∥2
+L2(γd). The
+overall decay rate is governed by the slowest mode, which corresponds to the smallest |a| = 1, thus
+the rate of convergence is exp(−2t). Taking square roots yields the desired result.
+B.3.2
+SCORE ERROR CONVERGENCE
+Recall from Section B.2 that Eµt
+
+∥st(Xt) + Xt∥2
+= I(µt | γd). It follows from equation 5.7.2 in
+Bakry et al. (2013) that
+dI(µt | γd)
+dt
+≤−2I(µt | γd) ≤0.
+Thus I(µt | γd) is monotonically decreasing as a function of t. Further, Grönwall’s inequality implies
+I(µt | γd) ≤e−2t I(µ0 | γd).
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+B.4
+SYMMETRY PRESERVATION UNDER THE FORWARD PROCESS
+This section shows the forward process preserves any orthogonal symmetry in the data distribution.
+More precisely, let G be a subgroup of the orthogonal group O(d) in Rd (e.g., coordinate sign flips,
+coordinate permutations, and rotations). We have the following:
+Proposition 4. Assuming p0 is symmetric about µ under the action of G, i.e., for every g ∈G, we
+have p0(x) = p0(g · (x −µ) + µ) for every x. Then pt satisfies pt(x) = pt(g · (x −µt) + µt) for
+every x, and st(µt + g · x) = g · st(µt + x), where µt = e−tµ.
+Proof. Let X0 ∼p0, Z ∼N(0, Id). It is known that Xt := e−tX0 +
+√
+1 −e−2tZ ∼pt. For any
+g ∈G,
+g · (Xt −µt) + µt = g · (e−tX0 +
+p
+1 −e−2tZ −µt) + µt
+= e−t(g · (X0 −µ) + µ) +
+p
+1 −e−2tg · Z ∼pt
+where the last claim uses that g · (X0 −µ) + µ has the same distribution as X0 (by symmetry) and
+g · Z ∼N(0, Id). This proves the claim on the symmetry of pt. For the score, since pt(µt + g · x) =
+pt(µt + x), taking derivative on both sides yields:
+g⊤· ∇pt(µt + g · x) = ∇pt(µt + x).
+Since g is an orthogonal matrix, g⊤= g−1, we have:
+∇pt(µt + g · x) = g · ∇pt(µt + x).
+Dividing both sides by pt(µt + x) proves the claimed result.
+Sections B.2 (large t limit), B.3 (monotone convergence), and B.4 (symmetry perservation from
+t = 0) together provide insights for the conjecture: The forward OU process preserves all orthogonal
+symmetries of p0, including central reflections. Hence, in the idealized case where p0 is reflection-
+symmetric, the density is even and its score is odd. Proposition 4 ensures that this symmetry is
+preserved for all t. Furthermore, even when the symmetry is only approximate near t ≈0, the
+monotone convergence of pt toward the Gaussian is exponentially fast, so the forward dynamics push
+st toward a linear function in a monotone manner.
+B.5
+PROOFS IN SECTION 4
+B.5.1
+MONTE CARLO ESTIMATOR:
+Proposition 5. Denote Ez∼N(0,I)[S(DM(z))] by µ and Varz∼N(0,I)[S(DM(z))] by σ2. Assuming
+σ2 < ∞, then we have:
+• ˆµMC
+N →µ and (ˆσMC
+N )2 →σ2 almost surely, and P
+ µ ∈CIMC
+N (1 −α)
+
+→1 −α, both as N →∞.
+• E[(ˆµMC
+N −µ)2] = Var[ˆµMC
+N ] = σ2/N.
+In words, the above proposition shows: (i) Correctness: The standard Monte Carlo estimator ˆµMC
+N
+converges to the true value, and the coverage probability of CIMC
+N (1 −α) converges to the nominal
+level (1 −α). (ii) Reliability: The expected squared error of ˆµMC
+N equals the variance of a single
+sample divided by sample size. The confidence interval has width approximately 2σz1−α/2/
+√
+N.
+Proof of Proposition 5. Let Si := S
+ DM(zi)
+
+for i = 1, . . . , N. Because the noises zi are drawn
+independently from N(0, I), the random variables S1, S2, . . . are independent and identically dis-
+tributed with mean µ and variance σ2 < ∞.
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+Consistency.
+By the strong law of large numbers,
+ˆµMC
+N
+=
+1
+N
+N
+X
+i=1
+Si
+a.s.
+−−→µ.
+The sample variance estimator
+(ˆσMC
+N )2 =
+1
+N −1
+N
+X
+i=1
+ Si −ˆµMC
+N
+2 =
+1
+N −1
+N
+X
+i=1
+S2
+i −
+N
+N −1(ˆσMC
+N )2.
+The first term converges to E[S2
+1] almost surely by the law of large numbers, the second term
+converges to µ2 almost surely as shown above. Therefore (ˆσMC
+N )2
+a.s.
+−−→σ2.
+Asymptotic normality and coverage.
+The classical central limit theorem states that
+√
+N ˆµMC
+N −µ
+σ
+d−→N(0, 1).
+Replacing the unknown σ by the consistent estimator ˆσMC
+N and applying Slutsky’s theorem yields
+√
+N ˆµMC
+N −µ
+ˆσMC
+N
+d−→N(0, 1).
+Hence
+P
+ µ ∈CIMC
+N (1 −α)
+
+= P
+√
+N(ˆµMC
+N −µ)/ˆσMC
+N
+ ≤z1−α/2
+
+−→1 −α.
+Mean-squared error.
+Because ˆµMC
+N is the average of N i.i.d. variables,
+Var
+
+ˆµMC
+N
+
+= σ2
+N .
+Moreover, since ˆµMC
+N is unbiased (E
+
+ˆµMC
+N
+
+= µ), its mean-squared error
+E
+
+(ˆµMC
+N −µ)2
+= E
+
+(ˆµMC
+N −E[ˆµMC
+N ])2
+= σ2
+N .
+This completes the proof.
+B.5.2
+ANTITHETIC MONTE CARLO ESTIMATOR:
+Proposition 6. Denote E[S(DM(z))] by µ, Var[S(DM(z))] by σ2, and Cov(S+
+1 , S−
+1 ) by ρ. Assuming
+σ2 < ∞, then we have:
+• ˆµAMC
+N
+→µ and (ˆσAMC
+N
+)2 →(1 + ρ)σ2/2 almost surely as N →∞,
+• E[(µAMC
+N
+−µ)2] = Var[µAMC
+N
+] = σ2(1 + ρ)/N.
+• P
+ µ ∈CIAMC
+N
+(1 −α)
+
+→1 −α as N →∞.
+Proof. Let N = 2K and generate independent antithetic noise pairs
+ zi, −zi
+
+for i = 1, . . . , K.
+Recall
+S+
+i
+= S
+ DM(zi)
+
+,
+S−
+i
+= S
+ DM(−zi)
+
+,
+¯Si =
+1
+2
+ S+
+i + S−
+i
+
+,
+i = 1, . . . , K.
+Because the pairs are independent and identically distributed (i.i.d.), the random variables ¯S1, . . . , ¯SK
+are i.i.d. with
+E[ ¯S1] = µ
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+and
+Var[ ¯S1] = Var
+h
+1
+2
+ S+
+1 + S−
+1
+i
+(4)
+=
+
+1
+2
+2
+Var
+
+S+
+i + S−
+i
+
+(5)
+= 1
+4
+
+Var[S+
+i ] + Var[S−
+i ] + 2 Cov(S+
+i , S−
+i )
+
+(6)
+= 1
+4
+
+σ2 + σ2 + 2ρσ2
+(7)
+= 1 + ρ
+2
+σ2.
+(8)
+where we have written Cov(S+
+i , S−
+i ) = ρ σ2 as in the statement. Set ˆµAMC
+N
+= K−1 PK
+i=1 ¯Si and
+let (ˆσAMC
+N
+)2 be the sample variance of ¯S1, . . . , ¯SK. All three claims in Proposition 6 follow from
+Proposition 5.
+B.6
+AN ALTERNATIVE EXPLANATION VIA THE FKG INEQUALITY
+We also provide an expository discussion highlighting the FKG connection behind negative correlation.
+Consider the univariate case where a scalar Gaussian z is fed through a sequence of one-dimensional
+linear maps and ReLU activations. Let F be the resulting composite function. One can show that,
+regardless of the number of layers or the linear coefficients used, Corr
+ F(z), F(−z)
+
+≤0. The
+proof relies on the univariate FKG inequality (Fortuin et al., 1971), a well-known result in statistical
+physics and probability theory.
+We generalize this result to higher dimensions via partial monotonicity, under which negative
+correlation still holds.
+We first formally state and prove the claim for the univariate case in Section B.6.
+Proposition 7 (Univariate case). Let z ∼N(0, 1) and let F : R →R be the output of any
+one–dimensional feed-forward network obtained by alternating scalar linear maps and ReLU
+activations:
+h0(z) = z,
+hℓ(z) = ReLU
+ wℓhℓ−1(z) + bℓ
+
+, ℓ= 1, . . . , L,
+F(z) = hL(z).
+For all choices of depths L and coefficients {wℓ, bℓ}L
+ℓ=1,
+Corr
+ F(z), F(−z)
+
+≤0.
+Proof. An important observation is that monotonicity is preserved under composition: combining
+one monotonic function with another produces a function that remains monotonic.
+Each scalar linear map x 7→wℓx + bℓis monotone: it is non-decreasing if wℓ≥0 and non-increasing
+if wℓ< 0. The ReLU map x 7→ReLU(x) = max{0, x} is non-decreasing. Hence the final function
+F is monotone. Without loss of generality, we assume F is non-decreasing.
+FKG inequality guarantees CovZ∼N(0,1)(f(Z), g(Z)) ≥0 provided that f, g are non-decreasing.
+Therefore, CovZ∼N(0,1)(F(Z), F(−Z)) = −CovZ∼N(0,1)(F(Z), −F(−Z)) ≤0. Since
+Corr
+ F(z), F(−z)
+
+= CovZ∼N(0,1)(F(Z), F(−Z))
+q
+Var
+ F(z)
+
+Var
+ F(−z)
+ ,
+we have Corr
+ F(z), F(−z)
+
+≤0.
+To generalize the result to higher dimension, we define a function f
+: Rm
+→R to be
+partially monotone if for each coordinate j, holding all other inputs fixed, the map t
+7→
+f(x1, . . . , xj−1, t, xj+1, . . . , xm) is either non-decreasing or non-increasing. Mixed monotonic-
+ity is allowed. For example, f(x, y) = x −y is non-decreasing in x and non-increasing in y, yet still
+qualifies as partially monotone. We have the following result:
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+Proposition 8. For a diffusion model DM : Rd →Rm and a summary statistics S : Rm →R, if the
+joint map is partially monotone, then Corr(S ◦DM(Z)), S ◦DM(−Z)) ≤0.
+Now we prove the general case:
+Proof of Proposition 8. Let G := S ◦DM. For each coordinate j ∈[d] fix a sign
+sj =
++1,
+if G is non–decreasing in xj,
+−1,
+if G is non–increasing in xj.
+Write s = (s1, . . . , sd) ∈{±1}d and define, for any z ∈Rd,
+eG(z) = eG(z1, . . . , zd) := G(s1z1, . . . , sdzd).
+Similarly, define
+eH(z) := eG(−z) = G(−s1z1, . . . , −sdzd).
+By construction, eG is coordinate-wise non–decreasing and eH is coordinate-wise non–increasing.
+Because each coordinate of Z ∼N(0, Id) is symmetric, the random vectors (s1Z1, . . . , sdZd) and
+(Z1, . . . , Zd) have the same distribution. Hence
+Cov
+ G(Z), G(−Z)
+
+= Cov
+  eG(Z), eH(Z)
+
+.
+The multivariate FKG inequality (Fortuin et al., 1971) for product Gaussian measures states that,
+when U and V are coordinate-wise non–decreasing, Cov
+ U(Z), V (Z)
+
+≥0. Apply it to the pair
+  eG, −eH
+
+: both components are non–decreasing, so
+Cov
+  eG(Z), −eH(Z)
+
+≥0 =⇒Cov
+  eG(Z), eH(Z)
+
+≤0 ⇔Cov
+ G(Z), G(−Z)
+
+≤0.
+Therefore Corr
+ G(Z), G(−Z)
+
+≤0, as claimed.
+Proposition 8 relies on checking partial-monotonicity. If S is partially monotone (including any linear
+statistic), then the conditions of Proposition 8 are satisfied by, e.g., Neural Additive Models (Agarwal
+et al., 2021) and Deep Lattice Networks (You et al., 2017). Unfortunately, partial-monotonicity is in
+general hard to verify.
+While popular diffusion architectures like DiT and U-Net lack partial monotonicity, we include
+Proposition 8 as an expository attempt to highlight the FKG connection behind negative correlation.
+B.6.1
+FKG INEQUALITY FOR DDIM
+We first analyze the idealized DDIM process using the FKG inequality. A single step of the idealized
+DDIM is
+Ft(x) = atx + ctst(x),
+(9)
+where st denotes the score of pt, and at, ct ≥0 are deterministic coefficients obtained by rearranging
+(2).
+The idealized DDIM trajectory is given by the composition:
+DDIMI = F1 ◦F2 ◦F3 ◦· · · ◦FT .
+(10)
+We present two results that give sufficient conditions under which the local (one-step) DDIM update
+(9) and the global DDIM procedure (10) generate negative correlation.
+We need the following definition:
+Definition 1 (MTP2 with curvature bound). Let p : Rd →(0, ∞) be a C2 probability density. We
+say that p is multivariate totally positive of order 2 (MTP2) with curvature bound κ ≥0 if the second
+partial derivatives of log p satisfy, for all x ∈Rd,
+∂2
+ij log p(x) ≥0
+for all i ̸= j,
+and
+∂2
+ii log p(x) ≥−κ
+for all i.
+23
+
+--- Page 24 ---
+Published as a conference paper at ICLR 2026
+MTP2 distributions are widely studied in statistics and probability Karlin & Rinott (1980). In
+particular, isotropic Gaussian distributions are MTP2.
+Proposition 9 (One-step DDIM). With all the notations as above, fix t > 0, assume the distribution
+pt is MTP2 with curvature bound κt, and
+at ≥ctκt,
+then Ft is coordinatewise nondecreasing: ∂xjFt,i(x) ≥0 for all i, j and all x. Moreover, for any
+linear statistics S, we have Corr(S ◦Ft(Z)), S ◦Ft(−Z)) ≤0.
+Proof. Differentiate componentwise:
+∂Ft,i
+∂xj
+(x) = at δij + ct ∂2
+ij log pt(x).
+For i ̸= j this is ≥0 by ct ≥0 and the mixed second derivative condition. For i = j,
+∂Ft,i
+∂xi
+(x) ≥at + ct
+ −κt
+
+≥0.
+Let G = S ◦Ft. Since Ft is coordinately non-decreasing and S is linear, we have that G = S ◦Ft is
+partially monotone. Thus Corr(S ◦Ft(Z)), S ◦Ft(−Z)) ≤0 by the multivariate FKG inequality
+and Proposition 8.
+The next result shows that the idealized DDIM trajectory continues to generate negative correlation,
+as long as the curvature bound holds uniformly over all steps.
+Proposition 10 (Global DDIM chain). With all the notations as above. Assume the distribution pt is
+MTP2 with curvature bound κt, and
+at ≥ctκt
+for every t. Then DDIMI = F1 ◦F2 ◦F3 ◦· · · ◦FT is coordinatewise nondecreasing. Moreover, for
+any linear statistics S, we have Corr(S ◦DDIMI(Z)), S ◦DDIMI(−Z)) ≤0.
+Proof. Since each Ft is coordinatewise nondecreasing, their composition F1 ◦· · · ◦FT is also
+coordinatewise nondecreasing. Therefore, the composition S ◦DDIMI is partially monotone, thus
+Corr(S ◦DDIMI(Z)), S ◦DDIMI(−Z)) ≤0 as claimed.
+Remark 1. All these results remain valid if we replace the exact score ∇log pt by the neural network
+sθ, up to a constant rescaling.
+Remark 2. We note that the condition at ≥ctκt is satisfied when κt = O(1) and the probability
+flow ODE is discretized with sufficiently small step size. For the deterministic DDIM update under a
+variance-preserving schedule,
+at =
+rαt−1
+αt
+,
+ct =
+p
+1 −αt−1 −
+rαt−1
+αt
+√
+1 −αt.
+Thus at is of unit order, and ct captures the difference |αt−1 −αt|. In the continuous-time limit with
+step size ∆t and a smooth function α(t), a Taylor expansion yields at = 1+O(∆t) and ct = O(∆t);
+thus at ≥ctκt holds when ∆t is sufficiently small and κt stays bounded.
+C
+ADDITIONAL EXPERIMENTS
+C.1
+CORRELATION EXPERIMENT SETUP ON OTHER MODELS
+C.1.1
+CONSISTENCY MODEL
+We study both unconditional and conditional consistency models using publicly available check-
+points provided in Hugging Face’s Diffusers library (von Platen et al., 2022): openai/diffusers-
+cd_imagenet64_l2, openai/diffusers-cd_cat256_l2, and openai/diffusers-cd_bedroom256_l2.
+24
+
+--- Page 25 ---
+Published as a conference paper at ICLR 2026
+For unconditional models, we evaluate pre-trained models on LSUN-Cat and LSUN-Bedrooom (Yu
+et al., 2015). For each dataset, 1,600 image pairs are generated under both PN and RR noise sampling
+with 1 DDIM steps.
+For conditional models, we evaluate pre-trained models on ImageNet on 32 classes (Deng et al.,
+2009). For each class, 100 PN and RR pairs are generated with 1 steps.
+C.1.2
+GENERATIVE MODELS BEYOND DIFFUSION
+A mentioned in Section 3, we evaluate correlation on a VAE and flow-based models. Unlike the
+diffusion models, which we use public pre-trained checkpoints, both of these models required explicit
+training before evaluation. Here we describe the training setup and generation procedure.
+VAE:
+We train the unconditional VAE on MNIST following the publicly available implementation
+provided in Francis (2022). The VAE consists of a simple convolutional encoder–decoder architecture
+with a Gaussian latent prior. After training, we generate 1,600 paired samples under PN and RR
+schemes, respectively.
+Glow:
+We train the class-conditional Glow model (Kingma & Dhariwal, 2018) on CIFAR-10 using
+the normflows library. The architecture follows a multiscale normalizing flow design and Glow
+blocks. After training, we generated 100 PN and 100 RR pairs per class.
+C.2
+IMAGE EDITING
+We apply our antithetic initial noise strategy to the image editing algorithm FlowEdit (Kulikov et al.,
+2024), which edits images toward a target text prompt using pre-trained flow models.
+In Algorithm 1 of FlowEdit, at each timestep, the algorithm samples navg random noises Z ∼N(0, 1)
+to create noisy versions of the source image, computes velocity differences between source and target
+conditions, and averages these directions to drive the editing process.
+In the navg = 2 setting, we replace the two independent random samples with antithetic noises: for
+each Z ∼N(0, I) we also use −Z and average the two velocity updates.
+We compare on 76 prompts provided in FlowEdit’s official GitHub repository. For each prompt,
+we generate 10 images using both PN and RR. All other parameters follow the repository defaults.
+We evaluate performance using CLIP(semantic text–image alignment; higher is better) and LPIPS
+(perceptual distance to the source; lower is better), which jointly measure text adherence and structure
+preservation.
+As a result, PN improves the mean CLIP score, winning in 56.59% of all pairwise comparisons. It
+also reduces LPIPS, winning in 81.58% of all pairwise comparisons.
+C.3
+IMPLEMENTATION DETAIL
+We use pretrained models from Hugging Face’s Diffusers library (von Platen et al., 2022):
+google/ddpm-church-256, google/ddpm-cifar10-32, and google/ddpm-celebahq-256 for uncondi-
+tional diffusion; Stable Diffusion v1.5 for text-to-image; and the original repository from (Chung
+et al., 2023a) for guided generation. Experiments were run on eight NVIDIA L40 GPUs. The most
+intensive setup—Stable Diffusion—takes about five minutes to generate 100 images for a single
+prompt.
+C.4
+ADDITIONAL EXPERIMENTS ON PIXEL-WISE SIMILARITY
+C.4.1
+DDPM
+Antithetic sampling setup:
+Unlike DDIM, where the sampling trajectory is deterministic once the
+initial noise is fixed, DDPM adds a random Gaussian noise at every timestep. The update function in
+DDPM is
+xt−1 =
+1
+√αt
+(xt −1 −αt
+√1 −αt
+ϵθ(xt, t)) + σtzt
+25
+
+--- Page 26 ---
+Published as a conference paper at ICLR 2026
+and zt ∼N(0, 1) if t > 1, else z = 0. Therefore, in DDPM, antithetic sampling requires not only
+negating the initial noise but also negating every noise zt added at each iteration.
+Table 5 and Table 6 report the standard Pearson correlations and centralized correlation between
+pixel values of image pairs produced using the same pre-trained models under PN and RR noise
+schemes using DDPM (default 1000 steps) across CIFAR10, CelebA-HQ, and LSUN-Church. For
+each dataset, we follow the same setup explained in Section 3. We calculate the pixelwise correction
+with 1600 antithetic noise pairs and 1600 independent noises.
+Consistent with the behavior observed in DDIM, PN pairs in DDPM samples also exhibit negative
+correlation. Using the standard Pearson correlation, the mean correlation for PN pairs is strongly
+negative in all datasets—CIFAR10 (−0.73), Church (−0.45), and in the more identity-consistent
+CelebA (−0.18).
+The centralized correlation analysis further sharpens this contrast: mean PN correlations are sub-
+stantially lower (CIFAR10 −0.80, CelebA −0.67, Church −0.65). These results confirm again that
+PN noise pairs consistently introduce strong negative dependence, while RR pairs remain close to
+uncorrelated or weakly positive.
+Table 5: DDPM standard Pearson correlation coefficients for PN and RR pairs
+Statistic
+CIFAR10
+CelebA
+Church
+PN
+RR
+PN
+RR
+PN
+RR
+Mean
+-0.73
+0.04
+-0.18
+0.29
+-0.45
+0.11
+Min
+-0.95
+-0.61
+-0.80
+-0.50
+-0.90
+-0.60
+25th percentile
+-0.81
+-0.12
+-0.31
+0.16
+-0.55
+-0.02
+75th percentile
+-0.66
+0.20
+-0.05
+0.44
+-0.36
+0.23
+Max
+-0.21
+0.80
+0.44
+0.78
+0.07
+0.80
+Table 6: DDPM centralized Pearson correlation coefficients for PN and RR pairs
+Statistic
+CIFAR10
+CelebA
+Church
+PN
+RR
+PN
+RR
+PN
+RR
+Mean
+-0.80
+0.01
+-0.67
+-0.00
+-0.65
+-0.00
+Min
+-0.96
+-0.61
+-0.89
+-0.60
+-0.93
+-0.56
+25th percentile
+-0.87
+-0.15
+-0.73
+-0.15
+-0.72
+-0.12
+75th percentile
+-0.75
+0.16
+-0.62
+0.15
+-0.60
+0.11
+Max
+-0.23
+0.76
+0.14
+0.64
+-0.32
+0.72
+(a) CIFAR10
+(b) LSUN-Church
+(c) CelebA-HQ
+Figure 5: Pearson Correlation histograms for PN and RR pairs across three datasets using DDPM.
+Dashed lines indicate the mean Pearson correlation for each group.
+C.4.2
+DIFFUSION POSTERIOR SAMPLING (DPS)
+The same pattern persists in the setting of using the diffusion model as a prior for posterior sampling,
+too, which has been utilized to solve various inverse problems, such as inpainting, super-resolution,
+and Gaussian deblurring.
+26
+
+--- Page 27 ---
+Published as a conference paper at ICLR 2026
+Since there is a ground truth image available in the image restoration task, the standard pixel-wise
+correlation is calculated using the difference between reconstructed images and the corresponding
+ground truth, and the centralized correlation is calculated using the same definition described in 3.
+Although the overall standard correlation values are shifted up, due to the deterministic conditioning,
+the posterior nature of sampling—PN pairs still shows significantly lower correlations than RR pairs
+across all tasks.
+For the standard Pearson correlation, the mean PN correlations range from 0.20 to 0.27, while RR
+correlations consistently lie above 0.50. For the centralized correlation, PN correlations are strongly
+negative across all tasks (means around −0.72). In contrast, RR pairs remain centered near zero
+(mean correlations around −0.01 to −0.02).
+Table 7: DPS Pearson correlation coefficients for PN and RR pairs
+Statistic
+Inpainting
+Gaussian Deblur
+Super-resolution
+PN
+RR
+PN
+RR
+PN
+RR
+Mean
+0.28
+0.57
+0.27
+0.57
+0.20
+0.53
+Min
+-0.14
+0.05
+-0.22
+0.13
+-0.34
+0.01
+25th percentile
+0.19
+0.52
+0.17
+0.51
+0.10
+0.47
+75th percentile
+0.36
+0.63
+0.36
+0.63
+0.30
+0.60
+Max
+0.66
+0.83
+0.62
+0.83
+0.64
+0.81
+Table 8: DPS centralized correlation coefficients for PN and RR pairs
+Statistic
+Inpainting
+Gaussian Blur
+Super-resolution
+PN
+RR
+PN
+RR
+PN
+RR
+Mean
+-0.72
+-0.02
+-0.71
+-0.01
+-0.72
+-0.01
+Min
+-0.86
+-0.43
+-0.84
+-0.36
+-0.87
+-0.35
+25th percentile
+-0.76
+-0.07
+-0.75
+-0.07
+-0.76
+-0.08
+75th percentile
+-0.69
+0.04
+-0.67
+0.05
+-0.69
+0.05
+Max
+-0.14
+0.47
+0.01
+0.48
+-0.14
+0.43
+(a) Inpainting
+(b) Super-resolution
+(c) Gaussian Deblur
+Figure 6: Pearson Correlation histograms for PN and RR pairs across three tasks in DPS. Dashed
+lines indicate the mean Pearson correlation for each group.
+C.4.3
+WASSERSTEIN DISTANCE
+To complement the correlation-based analyses in the main text, we also evaluate similarity using
+the Wasserstein distance, a measure of distributional discrepancy. It quantifies the minimal “effort”
+required to transform one probability distribution into another, which means lower Wasserstein
+values indicate closer alignment between the two distributions, while higher values indicate larger
+differences.
+To calculate Wasserstein distances, we treat each generated image pair as a sample from a distribution
+under the sampling scheme, PN or RR. As shown in Table 9, PN consistently exhibits larger
+Wasserstein distances than RR across nearly all models, and the differences are statistically significant
+27
+
+--- Page 28 ---
+Published as a conference paper at ICLR 2026
+at all p < 10−10. This implies that antithetic initial noises lead to more divergent distributions than
+random sampling and confirms our results from the correlation analysis.
+Table 9: Wasserstein Distance, shown are means (SD) with corresponding t-statistics and p-values.
+Model
+Wasserstein Distance
+t-stats (p)
+PN
+RR
+LSUN-Church
+0.16 (0.10)
+0.12 (0.07)
+t = 12.09, p = 0
+CIFAR-10
+0.19 (0.14)
+0.15 (0.09)
+t = 8.30, p = 0
+CelebA-HQ
+0.17 (0.11)
+0.12 (0.07)
+t = 14.50, p = 0
+SD 1.5
+0.10 (0.06)
+0.09 (0.04)
+t = 33.11, p = 0
+DiT
+0.19 (0.15)
+0.14 (0.12)
+t = 14.17, p = 0
+VAE
+0.07 (0.05)
+0.05 (0.03)
+t = 13.24, p = 0
+Glow
+0.15 (0.09)
+0.12 (0.08)
+t = 7.92, p = 0
+C.4.4
+INFLUENCE OF THE CFG SCALE ON CORRELATION
+We extend our pixel-correlation analysis on conditional diffusion models across various Classifier-
+Free Guidance (CFG) scales. CFG (Ho & Salimans, 2022) is a technique that strengthens conditioning
+in diffusion models by interpolating between conditional and unconditional score estimates. The
+guidance scale controls this interpolation strength, with higher values producing samples more aligned
+with the conditioning signal such as prompt or class.
+We conducted experiments on both Stable Diffusion 1.5 (SD1.5) and DiT using CFG scales {1, 3, 5, 7,
+9}. For each setting, we generated 100 PN and RR noise pairs across 25 prompts/classes, measuring
+both standard and centralized correlations between the image samples.
+(a) Stable Diffusion
+(b) DiT
+Figure 7: Average pixel correlation versus CFG scale for SD1.5 and DiT. Both standard and central-
+ized correlations are shown. Shaded regions indicate standard deviation of mean correlation across
+25 prompts/classes
+As show in Figure 7, for all CFG scales, negated noise continues to produce strongly negatively
+correlated samples. At the same time, the standard correlation for both PN and RR grows as the CFG
+scale increases. This can be explained as follows: larger CFG values pull samples more strongly
+toward the conditioning signal (prompt/class), effectively shrinking the space of plausible outputs.
+As samples concentrate more tightly around the target distribution, they become more similar to one
+another. Thus, the correlations of both PN and RR pairs increase, while PN remains much more
+negative than RR.
+C.4.5
+PARTIAL NEGATION OF NOISE VECTORS
+We conducted experiments to evaluate how localized antithetic noise influences outputs of uncon-
+ditional diffusion models trained on LSUN-Church and LSUN-Bedroom. For each dataset, we
+generated 200 image pairs by sampling Z1 ∼N(0, I) and constructing Z2 by negating the upper half
+of Z1 while leaving the lower half unchanged.
+We calculate the Pearson standard correlation and the centered correlation between corresponding
+halves to quantify spatial correspondence induced by the antithetic manipulation. As shown in
+28
+
+--- Page 29 ---
+Published as a conference paper at ICLR 2026
+Figure 8, the top halves exhibit sharply negative correlations, and the bottom halves are highly
+positively correlated and visually almost identical (Figure 27, 28). This shows that the negative
+correlation effect acts locally in noise space and directly affects the corresponding spatial regions in
+the generated images.
+(a) LSUN-Church
+(b) LSUN-Bedroom
+Figure 8: Average pixel correlation of top-half and bottom-half across generated image pairs.
+C.5
+ADDITIONAL EXPERIMENTS ON THE SYMMETRY CONJECTURE
+We run additional experiments to validate the conjecture in Section 3.2. Using a pretrained score
+network and a 50-step DDIM sampler, we evaluated both CIFAR-10 and Church. For each dataset,
+we selected five random coordinates in the C × H × W tensor (channel, height, width). At every
+chosen coordinate we examined the network output at time steps t = 1, . . . , 20 (small t is close
+to the final image, large t is close to pure noise). For each t we drew a standard Gaussian sample
+x ∼N(0, Id) and computed the value of ϵ(t)
+θ (c x) at the selected coordinate. The resulting plots
+appear in Figures 9–18.
+To measure how much a one–dimensional function resembles an antisymmetric shape, we introduce
+the affine antisymmetry score
+AS(f) := 1 −
+R 1
+−1(0.5f(−x) + 0.5f(x) −¯f)2
+R 1
+−1(f(x) −¯f)2
+where ¯f :=
+R 1
+−1 fdx/2 is the average value of f on [−1, 1].
+The integral’s numerator is the squared average distance between the antithetic mean 0.5 f(−x) +
+0.5 f(x) and the overall mean ¯f, while the denominator is the full variance of f over the interval.
+The antisymmetry score is well-defined for every non-constant function f; it takes values in the range
+[0, 1] and represents the fraction of the original variance that is eliminated by antithetic averaging.
+The score attains AS(f) = 1 exactly when the antithetic sum f(x) + f(−x) is constant, that is, when
+f is perfectly affine-antisymmetric. Conversely, AS(f) = 0 if and only if f(−x) = f(x) + c for
+some constant c, meaning f is affine-symmetric.
+For each dataset we have 100 (5 coordinates×20 time steps) scalar functions; the summary statistics
+of their AS scores are listed in Table 10. Both datasets have very high AS scores: the means exceed
+0.99 and the 10% quantiles are above 0.97, indicating that antithetic pairing eliminates nearly all
+variance in most cases. Even the lowest scores (about 0.77) still remove more than three-quarters of
+the variance.
+29
+
+--- Page 30 ---
+Published as a conference paper at ICLR 2026
+Figure 9: CIFAR10: Coordinate (0, 21, 0)
+Figure 10: CIFAR10: Coordinate (1, 27, 15)
+30
+
+--- Page 31 ---
+Published as a conference paper at ICLR 2026
+Figure 11: CIFAR10: Coordinate (1, 27, 31)
+Figure 12: CIFAR10: Coordinate (1, 29, 15)
+31
+
+--- Page 32 ---
+Published as a conference paper at ICLR 2026
+Figure 13: CIFAR10: Coordinate (2, 0, 6)
+Figure 14: Church: Coordinate (2, 73, 76)
+32
+
+--- Page 33 ---
+Published as a conference paper at ICLR 2026
+Figure 15: CIFAR10: Coordinate (0, 117, 192)
+Figure 16: Church: Coordinate (0, 54, 244)
+33
+
+--- Page 34 ---
+Published as a conference paper at ICLR 2026
+Figure 17: CIFAR10: Coordinate (0, 56, 219)
+Figure 18: Church: Coordinate (1, 208, 237)
+34
+
+--- Page 35 ---
+Published as a conference paper at ICLR 2026
+Table 10: Affine antisymmetry score
+Dataset
+CIFAR10
+Church
+Mean
+0.9932
+0.9909
+Min
+0.7733
+0.7710
+1% quantile
+0.9104
+0.8673
+2% quantile
+0.9444
+0.8768
+5% quantile
+0.9690
+0.9624
+10% quantile
+0.9865
+0.9750
+Median
+0.9992
+0.9995
+C.6
+ADDITIONAL EXPERIMENTS FOR UNCERTAINTY QUANTIFICATION
+C.6.1
+UNCERTAINTY QUANTIFICATION
+The image metrics used in uncertainty quantification are used to capture different aspects of pixel
+intensity, color distribution, and perceived brightness.
+Mean pixel value is defined as the average of all pixel intensities across the image (including all
+channels). Formally, for an image I ∈RC×H×W , the mean is computed as
+µ =
+1
+HWC
+C
+X
+i=1
+H
+X
+j=1
+W
+X
+k=1
+Ii,j,k.
+Brightness is calculated using the standard CIE formula: 0.299·R+0.587·G+0.114·B to produce
+a grayscale value at each pixel, where R, G, B is the red, green, and blue color value of the given
+pixel. It is widely used in video and image compression, and approximates human visual sensitivity
+to color. The brightness of an image is then the average of the grayscale value across all pixels.
+Contrast is computed as the difference in average pixel intensity between the top and bottom halves of
+an image. Let x ∈[0, 1]C×H×W be the normalized image, we define contrast as 100·(µtop −µbottom),
+where µtop and µbottom are the average intensities over the top and bottom halves, respectively.
+Centroid measures the coordinate of the brightness-weighted center of mass of the image. For scalar
+comparison, we focus on the vertical component of the centroid to assess spatial uncertainty. After
+converting to grayscale M ∈RH×W by averaging across channels, we treat the image as a 2D
+intensity distribution and compute the vertical centroid as
+1
+PH
+i=1
+PW
+j=1 Mi,j
+H
+X
+i=1
+W
+X
+j=1
+i · Mi,j,
+where i denotes the row index.
+C.6.2
+QMC EXPERIMENTS
+RQMC confidence interval construction:
+For the RQMC experiments, we consider R inde-
+pendent randomization of a Sobol’ point set of size n, with a fixed budget of N = Rn function
+evaluations. Denote the RQMC point set in the r-th replicate as {ur,k}1≤k≤n ⊂[0, 1]d, where
+ur,k ∼Unif([0, 1]d). Applying the Gaussian inverse cumulative distribution function Φ−1 to each
+coordinate of ur,k transforms the uniform samples to standard normal samples. Consequently, the
+estimate in each replicate is given by
+ˆµQMC
+r
+= 1
+n
+n
+X
+k=1
+S
+ DM
+ Φ−1(ur,k)
+
+,
+r = 1, . . . , R.
+35
+
+--- Page 36 ---
+Published as a conference paper at ICLR 2026
+The overall point estimate is their average
+ˆµQMC
+N
+=
+1
+R
+R
+X
+r=1
+ˆµQMC
+r
+.
+Let (ˆσQMC
+R
+)2 be the sample variance of ˆµQMC
+1
+, . . . , ˆµQMC
+R
+. The Student t confidence interval is given
+by
+CIQMC
+N
+(1 −α) = ˆµQMC
+N
+± tR−1, 1−α/2
+ˆσQMC
+R
+√
+R
+,
+where tR−1, 1−α/2 is the (1 −α/2)-quantile of the t-distribution with R −1 degrees of freedom. If
+the estimates ˆµQMC
+r
+are normally distributed, this confidence interval has exact coverage probability
+1 −α. In general, the validity of Student t confidence interval is justified by CLT. An extensive
+numerical study by L’Ecuyer et al. (2023) demonstrates that Student t intervals achieve the desired
+coverage empirically.
+Exploring different configurations of R and n
+This experiment aims to understand how different
+configurations of R, the number of replicates, and n, the size of the QMC point set, affect the CI
+length of the RQMC method. The total budget of function evaluations is fixed at Rn = 3200, to be
+consistent with the AMC and MC experiments. We consider the four image metrics used in Section 4
+and one additional image metric, MUSIQ.
+For RQMC, each configuration was repeated five times, and the results were averaged to ensure
+stability. AMC and MC each consist of a single run over 3200 images. All experiments are conducted
+using the CIFAR10 dataset.
+The results are shown in Table 11 and underlined values indicate the best CI length among the three
+QMC configurations, while bold values indicate the best CI length across all methods, including MC
+and AMC. For the brightness and pixel mean metrics, the configuration with point set size n = 64 and
+number of replicates R = 50 reduces CI length the most. In contrast and centroid, the configuration
+with larger n has a better CI length. For MUSIQ, a more complex metric, changes in CI lengths
+across configurations are subtle, and the configuration with the largest R has the shortest CI length.
+While no single configuration consistently advantages, all RQMC and antithetic sampling methods
+outperform plain MC.
+Table 11: Average 95% CI length and relative efficiencies (vs MC baseline). The first three rows are
+for RQMC methods, with the configuration of R × n indicated in the first column.
+R × n
+Brightness
+Mean
+Contrast
+Centroid
+MUSIQ
+CI
+Eff.
+CI
+Eff.
+CI
+Eff.
+CI
+Eff.
+CI
+Eff.
+25 × 128
+0.37
+29.81
+0.40
+25.71
+0.22
+24.57
+0.04
+8.17
+0.13
+1.11
+50 × 64
+0.35
+32.05
+0.39
+26.94
+0.22
+23.43
+0.04
+7.35
+0.13
+1.13
+200 × 16
+0.47
+18.38
+0.49
+17.30
+0.29
+14.20
+0.05
+5.84
+0.12
+1.21
+AMC
+0.35
+32.66
+0.39
+27.12
+0.23
+22.05
+0.04
+6.96
+0.13
+1.06
+MC
+2.00
+-
+2.04
+-
+1.08
+-
+0.11
+-
+0.13
+-
+C.6.3
+DPS EXPERIMENT IMPLEMENTATION
+We evaluate the confidence interval length reduction benefits of antithetic initial noise across three
+common image inverse problems: super-resolution, Gaussian deblurring, and inpainting. For each
+task, the forward measurement operator is applied to the true image, and noisy observations are
+generated using Gaussian noise with σ = 0.05. We use the official implementation of DPS (Chung
+et al., 2023a) with the following parameters:
+• Super-resolution uses the super_resolution operator with an input shape of (1, 3, 256, 256) and an
+upsampling scale factor of 2. This models the standard bicubic downsampling scenario followed
+by Gaussian noise corruption.
+• Gaussian deblurring employs the gaussian_blur operator, again with a kernel size of 61 but with
+intensity set to 1, which is intended to test the variance reduction in a simpler inverse scenario.
+36
+
+--- Page 37 ---
+Published as a conference paper at ICLR 2026
+• Inpainting is set up using the inpainting operator with a random binary mask applied to the input
+image. The missing pixel ratio is drawn from a uniform range between 30% and 70%, and the
+image size is fixed at 256 × 256. A higher guidance scale (0.5) is used to compensate for the
+sparsity of observed pixels.
+As shown in Table 3, AMC consistently achieves shorter CI lengths than MC across all tasks and
+metrics without sacrificing reconstruction quality, implied by the L1 and PSNR metrics to measure
+the difference between reconstructed images and ground truth images.
+C.6.4
+DDS DATASET
+Data used in the DDS experiment on uncertainty quantification (Section 4) were obtained from the
+NYU fastMRI Initiative database (Knoll et al., 2020; Zbontar et al., 2018). A listing of NYU fastMRI
+investigators, subject to updates, can be found at: fastmri.med.nyu.edu. The primary goal of
+fastMRI is to test whether machine learning can aid in the reconstruction of medical images.
+37
+
+--- Page 38 ---
+Published as a conference paper at ICLR 2026
+D
+MORE VISUALIZATIONS
+Figure 19: CelebA-HQ Image Generated
+38
+
+--- Page 39 ---
+Published as a conference paper at ICLR 2026
+Figure 20: CelebA-HQ Image Generated
+39
+
+--- Page 40 ---
+Published as a conference paper at ICLR 2026
+Figure 21: CelebA-HQ Image Generated
+40
+
+--- Page 41 ---
+Published as a conference paper at ICLR 2026
+Figure 22: DiT Class 974: geyser
+41
+
+--- Page 42 ---
+Published as a conference paper at ICLR 2026
+Figure 23: DiT Class 387: lesser panda, red panda
+42
+
+--- Page 43 ---
+Published as a conference paper at ICLR 2026
+Figure 24: DiT Clas 979: valley, vale
+43
+
+--- Page 44 ---
+Published as a conference paper at ICLR 2026
+Figure 25: DiT Class 388: giant panda, panda
+44
+
+--- Page 45 ---
+Published as a conference paper at ICLR 2026
+Figure 26: Prompt: “most expensive sports car”
+45
+
+--- Page 46 ---
+Published as a conference paper at ICLR 2026
+Figure 27: Partial Negation of LSUN-Church
+46
+
+--- Page 47 ---
+Published as a conference paper at ICLR 2026
+Figure 28: Partial Negation of LSUN-Bedroom
+47

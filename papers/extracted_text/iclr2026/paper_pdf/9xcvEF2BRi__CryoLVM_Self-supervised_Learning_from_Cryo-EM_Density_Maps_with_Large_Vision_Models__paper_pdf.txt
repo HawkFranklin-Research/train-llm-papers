@@ -1,0 +1,1420 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+CRYOLVM:
+SELF-SUPERVISED
+LEARNING
+FROM
+CRYO-EM DENSITY MAPS
+WITH LARGE VISION
+MODELS
+Weining Fu1,†
+Kai Shu2,†
+Kui Xu3,*
+Qiangfeng Cliff Zhang1,*
+1 State Key Laboratory of Membrane Biology, Beijing Frontier Research Center of Biological
+Structures, Tsinghua-Peking Joint Center for Life Sciences, School of Life Sciences, Tsinghua
+University, Beijing, China
+2 State Key Laboratory of Membrane Biology-Membrane Structure and Artificial Intelligence
+Biology Branch, Hangzhou, China
+3 State Key Laboratory of Membrane Biology, Beijing Tsinghua Institute for Frontier
+Interdisciplinary Innovation, Beijing, China
+† These authors contributed equally to this work.
+* Correspondence: xukui.2016@tsinghua.org.cn, qczhang@tsinghua.edu.cn
+ABSTRACT
+Cryo-electron microscopy (cryo-EM) has revolutionized structural biology by en-
+abling near-atomic-level visualization of biomolecular assemblies. However, the
+exponential growth in cryo-EM data throughput and complexity, coupled with
+diverse downstream analytical tasks, necessitates unified computational frame-
+works that transcend current task-specific deep learning approaches with lim-
+ited scalability and generalizability. We present CryoLVM, a foundation model
+that learns rich structural representations from experimental density maps with
+resolved structures by leveraging the Joint-Embedding Predictive Architecture
+(JEPA) integrated with a SCUNet-based backbone, enabling rapid adaptation to
+various downstream tasks. We further introduce a novel histogram-based dis-
+tribution alignment loss that accelerates convergence and enhances fine-tuning
+performance. Through comprehensive evaluation across three critical cryo-EM
+tasks—density map sharpening, density map super-resolution, and missing wedge
+restoration—CryoLVM consistently outperforms state-of-the-art baselines across
+multiple density map quality metrics, confirming its potential as a versatile foun-
+dation model for a wide spectrum of cryo-EM applications.
+1
+INTRODUCTION
+All biological functions are governed by events orchestrated at the molecular level by macromolecu-
+lar assemblies (Liao et al., 2013; Gestaut et al., 2022). Elucidating their intricate structures not only
+deepens our understanding of underlying molecular mechanisms, but also lays the groundwork for
+advancements in fields like drug discovery (Congreve et al., 2020). Cryo-electron microscopy has
+emerged as a pivotal technique for resolving macromolecular structures (K¨uhlbrandt, 2014; Nogales
+& Mahamid, 2024), with deposited density maps in the Electron Microscopy Data Bank (EMDB)
+(wwPDB Consortium, 2023) growing exponentially (Lawson et al., 2016). However, cryo-EM faces
+several intrinsic pitfalls that complicate accurate structure determination. Single particle analysis
+(SPA) cryo-EM suffers from poor signal-to-noise ratio, attenuated high-frequency information, and
+anisotropic resolution arising from low-dose imaging requirements, sample heterogeneity, and pre-
+ferred specimen orientation(Rosenthal & Henderson, 2003; Liu et al., 2025). Cryo-electron tomog-
+raphy (cryo-ET) encounters additional limitations from limited per-image electron dose, missing
+wedge artifacts, and substantial noise that obscure fine structural details (Liu et al., 2022a; Tao et al.,
+2018). These challenges hinder direct structural interpretation from raw cryo-EM maps, particularly
+at resolutions lower than 4 ˚A, necessitating extensive processing pipelines with substantial manual
+intervention and domain expertise (Terwilliger et al., 2018a; Terashi & Kihara, 2018).
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+Building on these observations, the cryo-EM community has increasingly embraced machine learn-
+ing approaches across the entire structural determination pipeline. For map reconstruction, cryo-
+DRGN (Zhong et al., 2021) employs variational autoencoders to learn continuous latent represen-
+tations of conformational heterogeneity, while 3DFlex (Punjani & Fleet, 2023) models non-rigid
+motions through coordinate-based neural networks. For postprocessing, DeepEMhancer (Sanchez-
+Garcia et al., 2021) adopts a 3D U-Net architecture trained on pairs of experimental maps and
+LocScale-sharpened targets for automated masking and local sharpening, while EMReady (He et al.,
+2023) implements a Swin-Conv-UNet framework combining residual convolution for local model-
+ing with Swin transformer for non-local feature extraction. For atomic model building, deep learning
+approaches have progressed from early methods such as A2-Net (Xu et al., 2019) and DeepTracer
+(Pfab et al., 2021), which perform de novo amino acid recognition and backbone tracing from density
+maps, to more recent advances like ModelAngelo (Jamali et al., 2024), which employs graph neural
+networks with iterative refinement and leverages protein language model embeddings to jointly per-
+form atomic coordinate prediction and sequence assignment, achieving automated model building
+at expert-level quality. Despite these advances, current deep learning methods in cryo-EM remain
+predominantly task-specific and rely on supervised training paradigms requiring labeled input data,
+constraining dataset scales and yielding models with limited generalizability.
+Input density map 
+Random
+sampling
+Context voxels 
+Target voxels 
+Context Encoder
+EMA 
+Target voxel embeddings 
+Target Predicdor
+zi 
+Predicted voxel embeddings 
+Prediction 
+Loss 
+Downstream applications
+Map sharpening
+Super-resolution
+Missing wedge restoration
+Pretrain
+Finetune
+Target Encoder
+Task-specific
+Model
+Figure 1: CryoLVM framework. During pretraining, input density maps are partitioned into non-
+overlapping 3D patches, which are then randomly divided into context and target subsets. The Con-
+text Encoder processes visible context patches, and the Target Predictor takes the resulting context
+embeddings along with positional information of masked target patches to predict the corresponding
+Target Encoder outputs. A regression loss is applied between predicted and target voxel embeddings
+to encourage representational alignment. The weights of the Target Encoder are updated via an
+exponential moving average (EMA) of the Context Encoder weights. Following pretraining, the
+pretrained encoder is adapted to three downstream cryo-EM tasks through fine-tuning with task-
+specific models: density map sharpening, super-resolution, and missing wedge restoration.
+Foundation models harness self-supervised pretraining on large-scale data to develop transferable
+representations, facilitating efficient adaptation to diverse downstream applications (Wei et al., 2022;
+Achiam et al., 2023; Kaplan et al., 2020). Notably, protein language models trained on extensive se-
+quence corpora have become transformative tools for structure prediction (Lin et al., 2023), protein
+design (Verkuil et al., 2022), and function annotation (Hayes et al., 2025). While foundation models
+have recently emerged for 2D cryo-EM image processing tasks (Shen et al., 2024; Zhang et al., 2025;
+Yan et al., 2024), they remain largely unexplored in the cryo-EM density map domain. Zhou et al.
+(2024) introduced CryoFM, a flow-based foundation model for cryo-EM density maps that demon-
+strates versatility as a generative prior across multiple tasks. Nevertheless, CryoFM was trained and
+evaluated exclusively on curated high-quality density maps, with assessments conducted primar-
+ily on synthetic noise-corrupted maps. Consequently, its robustness and performance on genuinely
+noisy, low-resolution experimental maps from real cryo-EM workflows remain to be established.
+We present CryoLVM, a foundation model that introduces Joint-Embedding Predictive Architecture
+(JEPA) (Assran et al., 2023) to the cryo-EM density map domain, learning self-supervised struc-
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+tural representations that facilitate efficient adaptation across multiple downstream tasks. Unlike
+reconstruction-based pretraining methods such as masked autoencoders that predict raw voxel val-
+ues, JEPA operates in abstract representation space, naturally filtering the pervasive noise in cryo-
+EM densities while capturing high-level structural semantics. We employ a SCUNet-based encoder
+(Zhang et al., 2023) within the JEPA framework as the backbone architecture, whose hybrid design
+combining Swin Transformer and residual convolution pathways is well-suited for cryo-EM data,
+where both local atomic-level features and global cross-regional spatial relationships must be jointly
+modeled. Through pretraining on experimental cryo-EM density maps with resolved structures col-
+lected from the EMDB, followed by fine-tuning with task-specific decoders, CryoLVM attains state-
+of-the-art results across three critical downstream tasks — density map sharpening, super-resolution,
+and missing wedge restoration — demonstrating robust performance on genuinely noisy experimen-
+tal maps and its promise as a versatile foundation model for broader cryo-EM applications.
+The main contributions of this work are summarized as follows:
+• We propose CryoLVM, the first foundation model to employ JEPA with a SCUNet-based back-
+bone for self-supervised learning on 3D cryo-EM density maps, effectively combining local
+atomic-level feature extraction with global spatial context modeling to learn semantically rich
+structural representations;
+• We develop a novel histogram-based distribution alignment loss LHistKL that, when combined with
+standard reconstruction loss, enhances convergence speed and improves fine-tuning performance;
+• We conduct comprehensive experiments across three downstream tasks, demonstrating that Cry-
+oLVM consistently outperforms existing methods including DeepEMhancer, EMReady, EM-GAN
+(Subramaniya et al., 2021), and IsoNet (Liu et al., 2022a) on most evaluation metrics.
+2
+RELATED WORK
+Density map sharpening Cryo-EM density maps suffer from resolution-dependent ampli-
+tude falloff that attenuates high-frequency contrast, necessitating post-processing methods to
+restore interpretability.
+Traditional map sharpening approaches include global methods like
+phenix.auto sharpen (Terwilliger et al., 2018b) and RELION (Scheres, 2015) that apply uniform
+B-factor correction, and local methods such as LocScale (Jakobi et al., 2017) that perform spatially
+adaptive enhancement by comparing the local amplitude spectrum of the experimental map with
+that of a reference atomic model. Recent deep learning approaches have advanced this field sig-
+nificantly: DeepEMhancer employs a 3D U-Net architecture to mimic LocScale’s local sharpening
+effects (Sanchez-Garcia et al., 2021), while EMReady utilizes a 3D Swin-Conv-UNet framework
+with combined smooth L1 and structural similarity losses to optimize both local and non-local fea-
+tures of experimental cryo-EM density maps (He et al., 2023).
+Density map super-resolution Model building from low-resolution cryo-EM maps remains a ma-
+jor impediment, as current state-of-the-art methods like ModelAngelo exhibit marked performance
+degradation beyond 4 ˚A resolution (Jamali et al., 2024). For protein identification methods like
+CryoDomain (Dai et al., 2025), their accuracy also deteriorates as resolution exceeds 6-8 ˚A. These
+limitations motivate the development of super-resolution techniques, which aim to estimate high-
+resolution maps from their low-resolution counterparts and thereby facilitate downstream structural
+determination. EM-GAN represents an early deep learning approach in this domain, employing
+3D generative adversarial networks to enhance experimental cryo-EM maps in the 3-6 ˚A resolution
+range (Subramaniya et al., 2021).
+Missing wedge restoration in cryo-ET The missing wedge problem in cryo-ET stems from phys-
+ical limitations during tilt-series acquisition, where specimen geometry and mechanical constraints
+restrict image collection to an angular range of typically ±60◦(Luˇci´c et al., 2005). Incomplete
+angular sampling creates characteristic wedge-shaped gaps in Fourier space, leading to anisotropic
+resolution with severe artifacts along the beam direction, manifesting as structural elongation and
+distortion that compromise reconstruction fidelity (Wiedemann & Heckel, 2024). While classical
+approaches have implemented iterative reconstruction algorithms including SIRT (Gilbert, 1972)
+and ART (Gordon et al., 1970; Yan et al., 2019), alongside constrained optimization techniques
+like ICON (Deng et al., 2016) that impose binary assumptions such as density positivity, these
+methods offer limited recovery of missing information. Deep learning has revolutionized miss-
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+ing wedge restoration through learning complex priors directly from tomographic data. IsoNet,
+built upon a 3D U-Net architecture, iteratively recovers missing information by training on paired
+datasets—generated by rotating subtomograms to 20 orientations and imposing additional missing
+wedge artifacts—to map degraded inputs to less-degraded targets (Liu et al., 2022a).
+3
+METHODOLOGY
+3.1
+MODEL ARCHITECTURE
+CryoLVM combines Joint-Embedding Predictive Architecture (JEPA) with SCUNet backbone for
+efficient self-supervised learning on cryo-EM density maps.
+Our design addresses the unique
+challenges of volumetric biological data through strategic architectural modifications and domain-
+specific optimizations.
+Context Encoder
+Target Encoder
+Target Predictor
+...
+Pretrained Encoder
+Decoder
+Output density map
+Input density map
++
++
+Mask
+Mask
+Conv3D
+ConvTransBlock
+Bottleneck
+Linear
+Positional
+Encoding
+ViT-3D
+Block
+Conv
+Transpose3D
+EMA
+Pretraining
+Downstream
+Figure 2: CryoLVM architecture. The Context Encoder and Target Encoder use hierarchical swin-
+conv (SC) blocks for multi-scale feature extraction, with outputs converted to patch embeddings
+and combined with 3D sinusoidal positional encodings. The Target Predictor employs transformer
+blocks to predict target representations. For downstream tasks, task-specific decoder with upsam-
+pling SC blocks are jointly fine-tuned with the pretrained encoder.
+We adopt JEPA over traditional masked autoencoders for its representation-space prediction
+paradigm. Unlike voxel-level reconstruction that amplifies noise in low-SNR cryo-EM densities,
+JEPA learns semantic features by predicting masked region representation from visible context.
+This approach naturally filters noise while preserving structural information critical for downstream
+tasks. Our pretraining architecture comprises three components: Context Encoder fθc, Target En-
+coder fθt (stop-gradient), and Target Predictor gϕ. The training objective minimizes prediction loss:
+Lp = Ex,M[Σi∈MSmoothL1β(gϕ(fθc(xcontext), zi) −fθt(xi))],
+(1)
+where M denotes masked patches, zi denotes spatial position information, and SmoothL1β provides
+robust optimization with reduced sensitivity to outliers compared to L2 loss.
+Different from previous studies, we select SCUNet over conventional 3D Vision Transformer as the
+backbone for its hybrid architecture that adeptly combines local and global modeling. SCUNet’s
+swin-conv (SC) blocks partition features into dual paths: Swin Transformers capture long-range
+dependencies while residual convolutions preserve local details. This architectural choice is particu-
+larly well-suited for cryo-EM applications, where local convolutions extract atomic-level structural
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+features and global attention mechanisms model cross-regional spatial relationships across multiple
+scales. Our Context Encoder and Target Encoder consist of three downsampling SC blocks, three
+3D convolution blocks and a bottleneck SC block. Within each SC block, input features are bi-
+furcated into parallel pathways: the convolution branch employs residual 3 × 3 × 3 convolutions
+with Filter Response Normalization, while the transformer branch utilizes 3D windowed multi-head
+self-attention with window size 4 × 4 × 4. Feature fusion is achieved through 1 × 1 × 1 convo-
+lutions, enabling simultaneous local feature preservation and global context aggregation. During
+pretraining, encoder outputs are converted to patch embeddings via linear transformation and incor-
+porated with 3D sinusoidal positional encodings to preserve spatial relationships within the feature
+grid. Masks are then applied to these patch embeddings to generate context and target embeddings.
+The Target Predictor follows the JEPA framework, comprising standard transformer blocks. Final
+predictions are mapped back to encoder embedding dimension through a linear projection, ensuring
+compatibility with target outputs for loss computation. For downstream applications, task-specific
+decoders utilize upsampling SC blocks and 3D transposed convolution blocks, jointly fine-tuned
+with the pretrained encoder on labeled datasets for each target task.
+3.2
+LOSS FOR DOWNSTREAM TASKS
+Across all three downstream tasks, we employ a unified composite loss function that combines
+standard reconstruction error LMSE with distributional alignment loss LHistKL.
+To enforce statistical consistency between predicted and target densities, we design a novel
+histogram-based distribution alignment loss, denoted as LHistKL. The idea is to align the predicted
+density distribution with the ground-truth density distribution via a differentiable histogram and a
+divergence measure. Given predicted density X and target density X⋆, we first construct their soft
+histograms using Gaussian kernel weighting:
+h(x)j = 1
+N
+N
+X
+i
+exp
+ 
+−1
+2
+xi −cj
+σ
+2!
+,
+(2)
+where cj denotes the center of the j-th bin, σ controls the smoothness, and N is the number of total
+voxels.
+Then, we quantify the distributional divergence between the two histograms p = h(X) and q =
+h(X⋆) using Jensen–Shannon (JS) divergence, which is based on Kullback-Leibler (KL) divergence:
+DJS(p ∥q) = 1
+2
+X
+k
+pk log pk
+mk
++ 1
+2
+X
+k
+qk log qk
+mk
+,
+(3)
+with m = 1
+2(p + q).
+The proposed histogram KL loss is thus defined as:
+LHistKL(X, X⋆) = DJS
+ H(X)
+ H(X⋆)
+
+.
+(4)
+The final objective combines both loss components:
+Ltotal = α LMSE + (1 −α) LHistKL,
+(5)
+where hyperparameter α ∈[0, 1] balances reconstruction accuracy and distributional alignment.
+4
+EXPERIMENTS
+4.1
+PRETRAINING DATASET
+To enable effective learning of structural semantics embedded within cryo-EM density maps, we
+assembled our pretraining dataset by leveraging the training subset of Cryo2StructData (Giri et al.,
+2024), currently the most comprehensive publicly accessible repository in this domain. This curated
+collection comprises 7,392 high-resolution experimental density maps representing proteins and
+macromolecular complexes with resolutions spanning 1-4 ˚A. All density maps underwent standard-
+ized preprocessing procedures: 1) voxel sizes were uniformly resampled to 1 ˚A spacing, 2) density
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+values were clipped to the 0.01-0.99 percentile range to mitigate outlier effects and subsequently
+normalized to [0, 1]. To ensure rigorous evaluation and prevent data leakage, we systematically
+excluded density maps present in the test sets of baseline methods used for downstream task com-
+parisons, yielding a final pretraining corpus of 7,302 density maps. For CryoLVM input generation,
+we applied random spatial cropping to extract volumes of size 483.
+Table 1: Evalutation metrics of different methods on the density map sharpening test set.
+phenix.map model cc
+Chimera.MapQ
+CCbox ↑
+CCmask ↑
+CCpeaks ↑
+Q-score ↑
+Deposited
+0.744
+0.788
+0.659
+0.338
+DeepEMhancer
+0.695
+0.679
+0.659
+0.323
+EMReady
+0.878
+0.802
+0.791
+0.424
+CryoLVM
+0.894
+0.821
+0.806
+0.444
+EMD-10092
+PDB: 6S3K
+Resolution: 3.7 Å
+Deposited
+DeepEMhancer
+EMReady
+CryoLVM
+Figure 3: Comparative evaluation of density map sharpening performance across baseline and
+proposed methods.
+Cross-correlation metrics (CCbox, CCmask, CCpeaks) were calculated via
+phenix.map model cc (Afonine et al., 2018), which quantify the agreement between density maps
+and their associated atomic models over different spatial regions. Q-score was computed using
+Chimera.MapQ (Pintilie et al., 2020; 2025), providing an independent assessment of map quality
+based on local atom-to-density correlation and atomic resolvability.
+4.2
+DENSITY MAP SHARPENING
+Cryo-EM density maps suffer from resolution-dependent amplitude falloff that attenuates high-
+frequency contrast, making direct structural interpretation challenging. Density map sharpening
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+aims to computationally recover high-frequency information while preserving structural integrity,
+effectively reversing the B-factor decay that obscures fine molecular details.
+Following the established training paradigm of EMReady, we adopted a supervised learning ap-
+proach for density map sharpening using paired experimental and target maps. Target density maps
+were simulated from their corresponding structures using Chimera.molmap (Pettersen et al., 2004),
+with the resolution parameter matched to that of the paired experimental maps.
+We evaluated CryoLVM on density map sharpening using a comprehensive set of quality metrics
+computed through established cryo-EM analysis tools. As shown in Tab. 1, CryoLVM demonstrates
+superior performance across all metrics, achieving the highest scores in CCbox (0.894), CCmask
+(0.821), CCpeaks (0.806), and Q-score (0.444). These improvements indicate enhanced overall
+quality between sharpened maps, suggesting better preservation of structural features and more ac-
+curate high frequency signal recovery. The violin plots in Fig. 3 also illustrate that CryoLVM
+consistently achieves tighter distributions with higher median values, indicating robust performance
+across diverse map types and resolution ranges. Visualization for EMD-10092 in Fig. 3 show-
+cases CryoLVM’s ability to enhance fine structural details such as improved definition of secondary
+structure elements while maintaining overall molecular topology.
+Table 2: Evalutation metrics of different methods on the density map super-resolution test set
+phenix.mtriage
+CryoRes
+dmodel( ˚A) ↓
+FSC-0.143( ˚A) ↓
+FSC-0.5( ˚A) ↓
+Resolution( ˚A) ↓
+Deposited
+3.66
+3.39
+4.64
+3.81
+DeepEMhancer
+3.27
+2.72
+4.86
+3.47
+EMGAN
+2.49
+2.70
+5.46
+4.18
+CryoLVM
+2.33
+2.58
+4.58
+3.39
+EMD-20668
+PDB: 6U7H
+Resolution: 3.1 Å
+Deposited
+DeepEMhancer
+EMGAN
+CryoLVM
+Figure 4: Comparison of map super-resolution performance between different methods. FSC-based
+metrics computed using phenix.mtriage (Afonine et al., 2018). Local resolution estimates obtained
+via CryoRes (Dai et al., 2023); global resolution represents the average of voxel-wise predictions.
+4.3
+DENSITY MAP SUPER-RESOLUTION
+Cryo-electron microscopy (cryo-EM) frequently produces density maps at intermediate resolutions
+that preclude direct atomic model building. Even modest resolution improvements can greatly ben-
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+efit downstream structural analysis. Fine-grained density features are indispensible for accurately
+determining backbone geometry and side-chain conformations.
+We developed a supervised training protocol for CryoLVM based on paired density maps. Training
+data consists of experimental maps at 4-6 ˚A paired with target maps simulated from their corre-
+sponding PDB structures. Target maps were generated using Chimera.molmap with the resolution
+parameter set to 1.8 ˚A. This paired supervision constrains the model to learn a robust mapping
+from medium-resolution experimental densities to near-atomic structural detail, enabling effective
+super-resolution of cryo-EM maps.
+We benchmarked CryoLVM for density map super-resolution against DeepEMhancer and EMGAN.
+Under the phenix.mtriage (Afonine et al., 2018) metrics (Fig. 4), CryoLVM achieves the best FSC-
+based resolutions (dmodel=2.33 ˚A, FSC-0.143 = 2.58, FSC-0.5 = 4.58), significantly outperforming
+both DeepEMhancer and EMGAN. Similarly, when assessed with CryoRes (Dai et al., 2023), Cry-
+oLVM attains 3.39 ˚A versus 3.47 ˚A and 4.18 ˚A for the baselines. Visualizations for EMD-20668
+(PDB: 6U7H, 3.1 A) are shown in Fig. 4 . In the two magnified insets, CryoLVM improves back-
+bone connectivity, and aligns much more closely with ground truth. CryoLVM not only enhances
+better visual interpretability but also improves quantitative resolution metrics, facilitating more ac-
+curate downstream structure determination from intermediate-resolution cryo-EM maps.
+4.4
+MISSING WEDGE RESTORATION
+Cryo-electron tomography (cryo-ET) faces critical technical constraints: radiation sensitivity lim-
+its total electron dose, resulting in low signal-to-noise ratios, while specimen geometry restricts tilt
+angles to approximately ±60◦rather than the ideal ±90◦. As shown in Fig. 5, this limited angu-
+lar sampling creates characteristic wedge-shaped gaps in Fourier space. Missing wedge produces
+anisotropic resolution with degraded Z-axis information and structural distortions. We simulated
+missing wedge artifacts by applying a Fourier transform to the map and then masking the frequency
+domain with a wedge-shaped filter.
+Electron
+Beam 
+Source
+Figure 5: Visualization and schematic analysis of the missing wedge problem and its restoration.
+Left: schematic illustration of the missing wedge problem in cryo-electron tomography. Right: case
+result for missing wedge task. The original density map is EMD-5331 from EMDB and is added
+wedge-shaped mask for model processing.
+Fourier-domain wedge masking. Given a 3D volume V , let its Fourier transform be bV (k) at
+frequency k ∈R3. To simulate the missing wedge, we introduce an indicator mask M(k) that
+preserves only frequencies within the permitted tilt cone:
+M(k) =
+
+
+
+1,
+| arctan(kz/
+q
+k2x + k2y)| ≤θmax,
+0,
+otherwise.
+The corrupted spectrum is then
+eV (k) = M(k) bV (k),
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+and the simulated tomogram with missing wedge effect is obtained by inverse Fourier transform,
+Vmw(x) = F−1{eV (k)}.
+Here, θmax denotes the experimental tilt limit (commonly around 60◦).
+We evaluated restoration performance via phenix.mtriage (Afonine et al., 2018) and report the
+map-model FSC-based resolution metrics dmin ( ˚A) at two cutoff thresholds, FSC = 0.143 and
+FSC = 0.5. Lower dmin values indicate higher resolution and thus better restoration quality. Our
+results demonstrate that CryoLVM consistently outperforms IsoNet baseline across all evaluation
+metrics(Tab. 3): at FSC = 0.143, CryoLVM reduces dmin from 10.448 ˚A to 10.094 ˚A (∼3.39%);
+at FSC = 0.5, CryoLVM improves from 12.361 ˚A to 11.447 ˚A (∼7.39%). These quantitative
+improvements in dmin reflect CryoLVM’s greater ability to recover high-frequency structural infor-
+mation that is typically lost due to missing wedge artifacts.
+Fig.
+5 depicts a missing-wedge case, where CryoLVM is able to reconstruct fine-scale, high-
+frequency features that IsoNet fails to maintain. The magnified insets highlight a critical difference:
+while CryoLVM correctly reconstructs continuous pore-like channels, IsoNet produces fragmented
+or occluded segments that result in topologically incorrect representations of these hollow structures.
+The FSC curves comparing reconstructed maps to reference models show that CryoLVM maintains
+a higher correlation across mid-to-high spatial frequencies and reaches established cutoff thresholds
+at higher spatial frequencies than IsoNet (Fig. 6), indicating better resolution restoration.
+Table 3: Performance of different methods in
+missing wedge restoration task.
+The score is
+computed between two half maps (predicted map
+and ground truth map). Additional results are in
+Appendix G.6.
+phenix.mtriage
+Method
+FSC-0.143 ↓
+FSC-0.5 ↓
+IsoNet
+10.448
+12.361
+CryoLVM
+10.094
+11.447
+0.02
+(1/50)
+0.04
+(1/25)
+0.06
+(1/16.67)
+0.08
+(1/12.5)
+0.10
+(1/10)
+0.12
+(1/8.33)
+Spatial frequency [Å−1]
+0
+0.143
+0.333
+0.5
+0.75
+1
+Correlation
+CryoLVM
+IsoNet
+Figure 6: FSC score versus spatial frequency for
+predicted maps of IsoNet and CryoLVM (EMD-
+5331).
+4.5
+ABLATION & DISCUSSION
+To validate our design choices and understand the contribution of individual components, we con-
+ducted ablation studies examining key architectural decisions, pretraining strategies, loss configura-
+tions, and postprocessing methods. In this section, we briefly present the key findings.
+SCUNet-based models achieve better performance than their ViT counterparts across all eval-
+uated downstream tasks. To demonstrate that adopting SCUNet as the backbone over ViT yields
+consistently better performance across all downstream tasks, we compared models with different
+backbones trained using identical hyperparameters; detailed results are presented in Appendix G.1.
+Composite loss of MSE and HistKL leads to accelerated convergence and enhanced down-
+stream performance. To validate the contribution of the proposed histogram KL loss, we compared
+fine-tuning CryoLVM on the density map super-resolution task with the composite loss against with
+MSE alone; extended results are provided in Appendix G.2.
+JEPA pretraining yields transferable representations that improve downstream performance.
+To assess the effectiveness of our pretraining approach, we compared the pretrained-then-finetuned
+model against a model trained from scratch, and further compared JEPA against masked autoen-
+coder (MAE) pretraining on the map sharpening task. The pretrained model demonstrates consis-
+tent improvements across all metrics, and JEPA consistently outperforms MAE; extended results are
+presented in Appendix G.3.
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+5
+CONCLUSION
+In this paper, we present CryoLVM, the first foundation model for cryo-EM density maps that em-
+ploys Joint-Embedding Predictive Architecture with SCUNet-based backbone to learn rich structural
+representations. We introduce a novel histogram-based distribution alignment loss that accelerates
+convergence and enhances fine-tuning performance. CryoLVM consistently outperforms established
+baselines across three critical downstream tasks, showing robust performance on genuinely noisy,
+low-resolution experimental maps encountered in real-world cryo-EM workflows. We envision that
+this foundation model paradigm will facilitate broader adoption of unified AI-driven approaches in
+cryo-EM and contribute to accelerating structural biology discoveries.
+REFERENCES
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Ale-
+man, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical
+report. arXiv preprint arXiv:2303.08774, 2023.
+Pavel V Afonine, Bruno P Klaholz, Nigel W Moriarty, Billy K Poon, Oleg V Sobolev, Thomas C
+Terwilliger, Paul D Adams, and Alexandre Urzhumtsev. New tools for the analysis and validation
+of cryo-em maps and atomic models. Biological Crystallography, 74(9):814–840, 2018.
+Mahmoud Assran, Quentin Duval, Ishan Misra, Piotr Bojanowski, Pascal Vincent, Michael Rabbat,
+Yann LeCun, and Nicolas Ballas. Self-supervised learning from images with a joint-embedding
+predictive architecture. In Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition, pp. 15619–15629, 2023.
+Helen M Berman, John Westbrook, Zukang Feng, Gary Gilliland, Talapady N Bhat, Helge Weissig,
+Ilya N Shindyalov, and Philip E Bourne. The protein data bank. Nucleic acids research, 28(1):
+235–242, 2000.
+Miles Congreve, Chris De Graaf, Nigel A Swain, and Christopher G Tate. Impact of gpcr structures
+on drug discovery. Cell, 181(1):81–91, 2020.
+Muzhi Dai, Zhuoer Dong, Kui Xu, and Qiangfeng Cliff Zhang. Cryores: local resolution estimation
+of cryo-em density maps by deep learning. Journal of Molecular Biology, 435(9):168059, 2023.
+Muzhi Dai, Zhuoer Dong, Weining Fu, Kui Xu, and Qiangfeng Cliff Zhang. Cryodomain: Sequence-
+free protein domain identification from low-resolution cryo-em density maps. In Proceedings of
+the AAAI Conference on Artificial Intelligence, volume 39, pp. 119–127, 2025.
+Yuchen Deng, Yu Chen, Yan Zhang, Shengliu Wang, Fa Zhang, and Fei Sun. Icon: 3d reconstruction
+with ‘missing-information’restoration in biological electron tomography. Journal of structural
+biology, 195(1):100–112, 2016.
+Zijian Dong, Ruilin Li, Yilei Wu, Thuan Tinh Nguyen, Joanna Chong, Fang Ji, Nathanael Tong,
+Christopher Chen, and Juan Helen Zhou. Brain-jepa: Brain dynamics foundation model with
+gradient positioning and spatiotemporal masking. Advances in Neural Information Processing
+Systems, 37:86048–86073, 2024.
+Chi-Mao Fan, Tsung-Jung Liu, and Kuan-Hsien Liu.
+Sunet: Swin transformer unet for image
+denoising. In 2022 IEEE International Symposium on Circuits and Systems (ISCAS), pp. 2333–
+2337. IEEE, 2022.
+Daniel Gestaut, Yanyan Zhao, Junsun Park, Boxue Ma, Alexander Leitner, Miranda Collier, Grigore
+Pintilie, Soung-Hun Roh, Wah Chiu, and Judith Frydman. Structural visualization of the tubulin
+folding pathway directed by human chaperonin tric/cct. Cell, 185(25):4770–4787, 2022.
+Peter Gilbert. Iterative methods for the three-dimensional reconstruction of an object from projec-
+tions. Journal of theoretical biology, 36(1):105–117, 1972.
+Nabin Giri, Liguo Wang, and Jianlin Cheng. Cryo2structdata: A large labeled cryo-em density map
+dataset for ai-based modeling of protein structures. Scientific Data, 11(1):458, 2024.
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+Richard Gordon, Robert Bender, and Gabor T Herman. Algebraic reconstruction techniques (art)
+for three-dimensional electron microscopy and x-ray photography. Journal of theoretical Biology,
+29(3):471–481, 1970.
+Thomas Hayes, Roshan Rao, Halil Akin, Nicholas J Sofroniew, Deniz Oktay, Zeming Lin, Robert
+Verkuil, Vincent Q Tran, Jonathan Deaton, Marius Wiggert, et al. Simulating 500 million years
+of evolution with a language model. Science, 387(6736):850–858, 2025.
+Jiahua He, Tao Li, and Sheng-You Huang. Improvement of cryo-em maps by simultaneous local
+and non-local deep learning. Nature communications, 14(1):3217, 2023.
+Arjen J Jakobi, Matthias Wilmanns, and Carsten Sachse. Model-based local density sharpening of
+cryo-em maps. Elife, 6:e27131, 2017.
+Kiarash Jamali, Lukas K¨all, Rui Zhang, Alan Brown, Dari Kimanius, and Sjors HW Scheres. Au-
+tomated model building and protein identification in cryo-em maps. Nature, 628(8007):450–457,
+2024.
+Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child,
+Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language
+models. arXiv preprint arXiv:2001.08361, 2020.
+Werner K¨uhlbrandt. The resolution revolution. Science, 343(6178):1443–1444, 2014.
+Catherine L Lawson, Ardan Patwardhan, Matthew L Baker, Corey Hryc, Eduardo Sanz Garcia,
+Brian P Hudson, Ingvar Lagerstedt, Steven J Ludtke, Grigore Pintilie, Raul Sala, et al. Emdata-
+bank unified data resource for 3dem. Nucleic acids research, 44(D1):D396–D403, 2016.
+Maofu Liao, Erhu Cao, David Julius, and Yifan Cheng. Structure of the trpv1 ion channel determined
+by electron cryo-microscopy. Nature, 504(7478):107–112, 2013.
+Chuchao Lin, Changjun Zou, and Hangbin Xu. Scnet: A dual-branch network for strong noisy image
+denoising based on swin transformer and convnext. Computer Animation and Virtual Worlds, 36
+(3):e70030, 2025.
+Zeming Lin, Halil Akin, Roshan Rao, Brian Hie, Zhongkai Zhu, Wenting Lu, Nikita Smetanin,
+Robert Verkuil, Ori Kabeli, Yaniv Shmueli, et al. Evolutionary-scale prediction of atomic-level
+protein structure with a language model. Science, 379(6637):1123–1130, 2023.
+Yun-Tao Liu, Heng Zhang, Hui Wang, Chang-Lu Tao, Guo-Qiang Bi, and Z Hong Zhou. Isotropic
+reconstruction for electron tomography with deep learning. Nature communications, 13(1):6482,
+2022a.
+Yun-Tao Liu, Hongcheng Fan, Jason J Hu, and Z Hong Zhou. Overcoming the preferred-orientation
+problem in cryo-em with self-supervised deep learning. Nature methods, 22(1):113–123, 2025.
+Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei, Zheng Zhang, Stephen Lin, and Baining Guo.
+Swin transformer: Hierarchical vision transformer using shifted windows. In Proceedings of the
+IEEE/CVF international conference on computer vision, pp. 10012–10022, 2021.
+Zhuang Liu, Hanzi Mao, Chao-Yuan Wu, Christoph Feichtenhofer, Trevor Darrell, and Saining Xie.
+A convnet for the 2020s. In Proceedings of the IEEE/CVF conference on computer vision and
+pattern recognition, pp. 11976–11986, 2022b.
+Vladan Luˇci´c, Friedrich F¨orster, and Wolfgang Baumeister. Structural studies by electron tomogra-
+phy: from cells to molecules. Annu. Rev. Biochem., 74(1):833–865, 2005.
+Eva Nogales and Julia Mahamid.
+Bridging structural and cell biology with cryo-electron mi-
+croscopy. Nature, 628(8006):47–56, 2024.
+Eric F Pettersen, Thomas D Goddard, Conrad C Huang, Gregory S Couch, Daniel M Greenblatt,
+Elaine C Meng, and Thomas E Ferrin. Ucsf chimera—a visualization system for exploratory
+research and analysis. Journal of computational chemistry, 25(13):1605–1612, 2004.
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+Jonas Pfab, Nhut Minh Phan, and Dong Si. Deeptracer for fast de novo cryo-em protein structure
+modeling and special studies on cov-related complexes. Proceedings of the National Academy of
+Sciences, 118(2):e2017525118, 2021.
+Grigore Pintilie, Jingcheng Zhang, Thomas D Goddard, Wah Chiu, and David C Gossard. Mea-
+surement of atom resolvability in cryo-em maps with q-scores. Nature Methods, 17(3):328–334,
+2020.
+Grigore Pintilie, Chenghua Shao, Zhe Wang, Brian P Hudson, Justin W Flatt, Michael F Schmid,
+Kyle Morris, Stephen K Burley, and Wah Chiu. Q-score as a reliability measure for protein,
+nucleic acid, and small molecule atomic coordinate models derived from 3dem density maps.
+bioRxiv, 2025.
+Ali Punjani and David J Fleet. 3dflex: determining structure and motion of flexible proteins from
+cryo-em. Nature Methods, 20(6):860–870, 2023.
+Peter B Rosenthal and Richard Henderson. Optimal determination of particle orientation, absolute
+hand, and contrast loss in single-particle electron cryomicroscopy. Journal of molecular biology,
+333(4):721–745, 2003.
+Ruben Sanchez-Garcia, Josue Gomez-Blanco, Ana Cuervo, Jose Maria Carazo, Carlos Oscar S
+Sorzano, and Javier Vargas. Deepemhancer: a deep learning solution for cryo-em volume post-
+processing. Communications biology, 4(1):874, 2021.
+Sjors HW Scheres. Semi-automated selection of cryo-em particles in relion-1.3. Journal of struc-
+tural biology, 189(2):114–122, 2015.
+Yingjun Shen, Haizhao Dai, Qihe Chen, Yan Zeng, Jiakai Zhang, Yuan Pei, and Jingyi Yu. Draco:
+A denoising-reconstruction autoencoder for cryo-em. arXiv preprint arXiv:2410.11373, 2024.
+Sai Raghavendra Maddhuri Venkata Subramaniya, Genki Terashi, and Daisuke Kihara. Super reso-
+lution cryo-em maps with 3d deep generative networks. Biophysical Journal, 120(3):283a, 2021.
+Chang-Lu Tao, Yun-Tao Liu, Rong Sun, Bin Zhang, Lei Qi, Sakar Shivakoti, Chong-Li Tian, Peijun
+Zhang, Pak-Ming Lau, Z Hong Zhou, et al. Differentiation and characterization of excitatory
+and inhibitory synapses by cryo-electron tomography and correlative microscopy. Journal of
+Neuroscience, 38(6):1493–1510, 2018.
+Genki Terashi and Daisuke Kihara. De novo main-chain modeling for em maps using mainmast.
+Nature communications, 9(1):1618, 2018.
+Thomas C Terwilliger, Paul D Adams, Pavel V Afonine, and Oleg V Sobolev. A fully automatic
+method yielding initial models from high-resolution cryo-electron microscopy maps.
+Nature
+methods, 15(11):905–908, 2018a.
+Thomas C Terwilliger, Oleg V Sobolev, Pavel V Afonine, and Paul D Adams. Automated map
+sharpening by maximization of detail and connectivity. Biological Crystallography, 74(6):545–
+559, 2018b.
+Robert Verkuil, Ori Kabeli, Yilun Du, Basile IM Wicky, Lukas F Milles, Justas Dauparas, David
+Baker, Sergey Ovchinnikov, Tom Sercu, and Alexander Rives. Language models generalize be-
+yond natural proteins. BioRxiv, pp. 2022–12, 2022.
+Jason Wei, Yi Tay, Rishi Bommasani, Colin Raffel, Barret Zoph, Sebastian Borgeaud, Dani Yo-
+gatama, Maarten Bosma, Denny Zhou, Donald Metzler, et al. Emergent abilities of large language
+models. arXiv preprint arXiv:2206.07682, 2022.
+Simon Wiedemann and Reinhard Heckel. A deep learning method for simultaneous denoising and
+missing wedge reconstruction in cryogenic electron tomography. Nature Communications, 15(1):
+8255, 2024.
+The wwPDB Consortium. EMDB—the Electron Microscopy Data Bank. Nucleic Acids Research,
+52(D1):D456–D465, 11 2023. ISSN 0305-1048. doi: 10.1093/nar/gkad1019. URL https:
+//doi.org/10.1093/nar/gkad1019.
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+Kui Xu, Zhe Wang, Jianping Shi, Hongsheng Li, and Qiangfeng Cliff Zhang. A2-net: Molecular
+structure estimation from cryo-em density volumes. In Proceedings of the AAAI Conference on
+Artificial Intelligence, volume 33, pp. 1230–1237, 2019.
+Rui Yan, Singanallur V Venkatakrishnan, Jun Liu, Charles A Bouman, and Wen Jiang. Mbir: A
+cryo-et 3d reconstruction method that effectively minimizes missing wedge artifacts and restores
+missing information. Journal of structural biology, 206(2):183–192, 2019.
+Yang Yan, Shiqi Fan, Fajie Yuan, and Huaizong Shen. A comprehensive foundation model for
+cryo-em image processing. bioRxiv, pp. 2024–11, 2024.
+Jiakai Zhang, Shouchen Zhou, Haizhao Dai, Xinhang Liu, Peihao Wang, Zhiwen Fan, Yuan Pei,
+and Jingyi Yu. Cryofastar: Fast cryo-em ab initio reconstruction made easy. arXiv preprint
+arXiv:2506.05864, 2025.
+Kai Zhang, Yawei Li, Jingyun Liang, Jiezhang Cao, Yulun Zhang, Hao Tang, Deng-Ping Fan, Radu
+Timofte, and Luc Van Gool. Practical blind image denoising via swin-conv-unet and data synthe-
+sis. Machine Intelligence Research, 20(6):822–836, 2023.
+Ellen D Zhong, Tristan Bepler, Bonnie Berger, and Joseph H Davis. Cryodrgn: reconstruction of
+heterogeneous cryo-em structures using neural networks. Nature methods, 18(2):176–185, 2021.
+Yi Zhou, Yilai Li, Jing Yuan, and Quanquan Gu. Cryofm: A flow-based foundation model for
+cryo-em densities. arXiv preprint arXiv:2410.08631, 2024.
+A
+STATEMENT OF THE USE OF LARGE LANGUAGE MODELS
+Large language models were used solely to polish the academic writing of this paper. They were not
+involved in research ideation, experimental design, data analysis, or any other substantive aspects of
+the work. The authors take full responsibility for the content of the manucript.
+B
+ADDITIONAL RELATED WORK
+B.1
+FOUNDATION MODELS FOR CRYO-EM
+The emergence of foundation models has begun transforming the cryo-EM data processing land-
+scape, with recent works addressing distinct stages of the cryo-EM structural determination pipeline.
+DRACO (Shen et al., 2024) introduced a denoising-reconstruction autoencoder pretrained over
+270,000 cryo-EM movies or micrographs, demonstrating strong generalization capabilities across
+micrograph-level tasks including denoising, micrograph curation, and particle picking. CryoFastAR
+(Zhang et al., 2025) pioneered geometric foundation modeling for cryo-EM by directly predicting
+particle poses for unordered, noisy 2D projection images, facilitating acceleration in ab initio recon-
+struction compared to traditional iterative optimization approaches. Cryo-IEF (Yan et al., 2024) pre-
+sented a comprehensive foundation model pretrained on approximately 65 million particle images
+and showed excellent performance in tasks such as classifying particles from different structures,
+clustering particles by pose, and assessing image quality. These works operate on 2D cryo-EM
+images from the data acquisition and reconstruction stages and complement CryoLVM to address
+complete cryo-EM workflow from particle image processing through density map post-processing
+and analysis.
+B.2
+JEPA APPLICATIONS IN BIOLOGICAL CONTEXT
+Joint-Embedding Predictive Architecture (JEPA), first introduced by Assran et al. (2023). with I-
+JEPA, has gained significant traction in computational biology due to its ability to learn semantic
+representations through prediction in abstract embedding space rather than raw pixel-level recon-
+struction. Brain-JEPA (Dong et al., 2024) provides the most direct precedent for CryoLVM by suc-
+cessfully applying JEPA to 3D spatiotemporal biological data using functional Magnetic Resonance
+Imaging (fMRI). This pioneering brain dynamics foundation model incorporates two innovative
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+techniques tailored to volumetric biological data: Brain Gradient Positioning (BGP), which estab-
+lishes functional coordinate system for brain functional parcellation and enhances the positional
+encoding of different Regions of Interest (ROI), and Spatiotemporal Masking, which is designed
+for the unique characteristics of fMRI data to tackle with heterogeneous time-series patches. Brain-
+JEPA achieves state-of-the-art performance in dempgraphic prediction, disease diagnosis, and trait
+prediction, demonstrating JEPA’s effectiveness for complex 3D biological volumes with temporal
+dependencies.
+B.3
+SCUNET APPLICATIONS IN IMAGE DENOISING
+The SCUNet framework represents a breakthrough in hybrid architecture for image denoising, ef-
+fectively combining global modeling capabilities of Swin Transformers (Liu et al., 2021) with local
+feature extraction advantages of convolutional neural networks. Zhang et al. (2023) introduced
+SCUNet in their seminal work, proposing Swin-Conv (blocks) as the core building components
+of a UNet backbone architecture, where each SC block processes input through a 1 × 1 convolu-
+tion followed by evenly splitting feature maps into two groups that are respectively fed into Swin
+Transformer blocks and residual convolutional layers. Subsequent developments further validated
+SCUNet’s effectiveness across diverse denoising applications: SUNet (Fan et al., 2022) applies Swin
+Transformer layers as basic building blocks within UNet architecture for image denoising, achieving
+significant performance improvements on fixed-size input denoising tasks, while SCNet (Lin et al.,
+2025) proposes a dual-branch fusion network that combines Swin Transformer branches with Con-
+vNext (Liu et al., 2022b) branches, employing Feature Fusion Blocks with joint spatial and channel
+attention for adaptive output merging, demonstrating robustness under severe noise conditions and
+proving effective in real-world applications like mural image denoising.
+C
+ADDITIONAL DETAILS OF CRYOLVM
+C.1
+IMPLEMENTATION DETAILS
+Fig. 7 illustrates the detailed architecture of CryoLVM’s Context Encoder and Target Encoder. Both
+encoders share an identical hierarchical design, with Target Encoder parameters updated via expo-
+nential moving average (EMA) of Context Encoder during pretraining. The encoder architecture
+begins with an initial 3 × 3 × 3 convolution applied to the input density, followed by three consecu-
+tive down-sampling stages. Each stage consists of a Swin-Conv Block and a 2 × 2 × 2 convolution.
+Within each Swin-Conv Block, feature map is first passed through a 1 × 1 × 1 convolution, and then
+split evenly into two feature map groups, each of which is then fed into a swin transformer (SwinT)
+block and a residual 3 × 3 × 3 convolution (RConv) block separately; after that, feature maps are
+concatenated and passed through a final 1×1×1 convolution to integrate local and global modeling.
+Input density
+3×3×3 Conv
+1×1×1 Conv
+Split
+SwinT
+Block
+RConv
+Block
+Concat
+1×1×1 Conv
+Swin-Conv Block
+2×2×2 Conv
+Context / Target 
+Encoder
+Density embedding
+Figure 7: Detailed architecture of CryoLVM’s Context Encoder and Target Encoder.
+Fig. 8 illustrates the complete architecture of CryoLVM including a pretrained encoder and a task-
+specific decoder for downstream applications. The modular design enables effective transfer learn-
+ing, where the encoder captures generalizable density map representations in the pretraining stage,
+while the decoder specializes these features for particular cryo-EM tasks. The task-specific decoder
+employs a symmetric up-sampling strategy to progressively reconstruct high-quality density maps
+from the encoded density embeddings. It starts with three consecutive up-sampling stages, each
+comprising a 2 × 2 × 2 transposed convolution followed by a Swin-Conv Block. The transposed
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+convolution performs spatial up-sampling while reducing feature dimensionality, and the Swin-Conv
+Block refines the upsampled features. A critical component is the skip connections between corre-
+sponding encoder and decoder layers. Specifically, skip connections link the convolution layers of
+encoder with the transposed convolution layers of decoder. These connections preserve multi-scale
+structural information that might otherwise be lost. After that, feature map is passed through a final
+3 × 3 × 3 convolution to produce output density.
+Input density
+3×3×3 Conv
+2×2×2 Conv
+Context / Target 
+Encoder
+Swin-Conv Block
+Task-specific 
+Decoder
+Swin-Conv Block
+3×3×3 Conv
+2×2×2 ConvT
+Output density
+Figure 8: Detailed implementation of pretrained encoder and task-specific decoder for downstream
+application.
+D
+DATA CURATION AND PROCESSING
+D.1
+PREPROCESSING FOR TRAINING ACCELERATION AND MEMORY REDUCTION
+Pretraining
+To construct a high-quality pretraining dataset of cryo-EM density maps with high-
+quality structural information for CryoLVM, we focused on relatively high-resolution experimen-
+tal density maps with corresponding resolved PDB(Berman et al., 2000) structures deposited in
+EMDB (wwPDB Consortium, 2023). We utilized Cryo2StructData, currently the most compre-
+hensive publicly available depository in this domain, containing 7,600 cryo-EM density maps with
+associated structural annotations. We assembled our pretraining dataset from the training subset of
+Cryo2StructData, which comprises 7,392 density maps representing proteins and macromolecular
+complexes with resolutions spanning 1-4 ˚A. We first excluded density maps present in the test sets
+of baseline methods used for downstream task comparisons to guarantee meticulous evaluation and
+prevent data leakage, resulting in a final pretraining corpus of 7,302 density maps. Next, we pre-
+processed the pretraining density maps as follows: 1) voxel sizes were uniformly resampled to 1 ˚A
+spacing, 2) density values were clipped to the 0.01-0.99 percentile range to mitigate outlier effects
+and subsequently normalized to [0,1], 3) density maps are converted to Pytorch tensor format with
+bFloat16 precision, providing computational speedup and memory reduction.
+Density map sharpening
+We first constructed our test set by selecting 50 cryo-EM density maps
+from the established EMReady’s benchmark, ensuring direct comparison with prior methods. To
+build our training and validation sets, we collected additional single-particle cryo-EM maps at 3-6
+˚A resolutions and their corresponding atomic structures from EMDB (wwPDB Consortium, 2023)
+and PDB (Berman et al., 2000). We applied stringent quality control criteria to filter map-model
+pairs: 1) do not contain backbone atoms only, 2) do not include unknown residues, 3) do not include
+missing chain, 4) have orthogonal map axis, 5) resolution is given by the FSC-0.143 threshold, 6)
+any chain in the model does not share >30% sequence identity with any chain in the test set models.
+This yielded a total of 400 pairs of map and model as the training set, and 70 pairs of map and
+model as the validation set. Target density maps were simulated from their corresponding PDB
+structures using Chimera.molmap (Pettersen et al., 2004) with the resolution parameter matched
+to that of the paired experimental maps. We preprocessed the paired maps as follows: 1) voxel
+sizes were uniformly resampled to 1 ˚A spacing, 2) density values were clipped to the 0.01-0.99
+percentile range to mitigate outlier effects and subsequently normalized to [0,1], 3) density maps are
+converted to Pytorch tensor format with bFloat16 precision, providing computational speedup and
+memory reduction. During training, we employed a sliding window sampling strategy with stride
+24 to generate 483 input volumes and augmented training data through random flips and random
+rotations.
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+Density map super-resolution
+We constructed a test set consisting of 40 single-particle cryo-
+EM density maps, a training set with 400 maps and a validation set with 50 maps. All density
+maps exhibit resolutions ranging from 2.3-6 ˚A and satisfy the quality control criteria described
+above for our density map sharpening experiment. Target density maps were simulated from their
+corresponding PDB structures using Chimera.molmap with the resolution parameter uniformly set
+to 1.8 ˚A. We preprocessed the paired maps following the same procedure from the density map
+sharpening experiment.
+Missing wedge restoration
+In the procedure for restoring a missing wedge, input density maps
+come from Cryo-ET, which typically exhibit resolutions worse than 8 ˚A, even after subtomogram
+averaging. Thus, we chose maps with resolutions lower than 8 ˚A and applied angular masks to mimic
+the missing wedge effect. Given constraints from the Nyquist sampling theorem and computational
+efficiency, a voxel size of 4 ˚A was used instead of 1 ˚A, which was used for the density map super-
+resolution and sharpening tasks. In total, we obtained 400 training samples, 50 validation samples,
+and 40 test samples. The resolution distributions of the training and test sets are shown in Fig. 9.
+Figure 9: Resolution Distribution of Missing Wedge Restoration Task. (Left) Training Set. (Right)
+Test Set.
+Algorithm 1: Gaussian-weighted fusion of patch predictions into a full density map
+Input: Overlapping patch predictions {ˆyk}K
+k=1, their voxel coordinates {pk}K
+k=1, box size B,
+stride s, small ε > 0
+Output: Reconstructed volume M
+Require: 3D Gaussian weight kernel Wker ∈RB×B×B with entries
+wi,j,ℓ= exp
+ −∥(i,j,ℓ)−c∥2
+2
+2σ2
+
+, normalized to [1, 3] (center larger, border smaller);
+zero-initialized accumulators V, S sized to the (padded) volume. (Implementation mirrors the
+sliding-window accumulation with per-voxel weights and final normalization.)
+for k = 1, 2, . . . , K do
+Extract the region-to-update Rk ⊂V starting at pk with size B × B × B
+// Weighted accumulation of prediction and weights
+V[Rk] ←V[Rk] + ˆyk ⊙Wker
+S[Rk] ←S[Rk] + Wker
+end
+// Element-wise normalization to resolve overlaps
+˜M ←V ⊙max(S, ε)−1
+Crop ˜M to the original (unpadded) spatial extent to obtain M
+return M
+D.2
+POSTPROCESSING AFTER PREDICTION
+We performed post-processing on the predicted density maps to ensure consistency, reduce artifacts,
+and improve interpretability of reconstructed volumes. Given patch-based predictions, overlapping
+regions were fused utilizing a Gaussian-weighted scheme (See in Algo. 1), which balances contri-
+butions between central and boundary voxels to promote continuity. This blending step reduces dis-
+continuities at patch boundaries while maintaining local structural details. After weighted fusion, we
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+applied normalization to maintain consistent voxel intensity distributions across the reconstructed
+volume. This step corrects for potential intensity variations arising from the overlapping patch-based
+prediction strategy, where edge regions of patches may exhibit different contrast characteristics than
+central regions due to reduced spatial context during inference. The final step involved cropping out
+padded regions introduced during the patch-wise sliding-window prediction step. Together, these
+steps generate a clean, continuous and interpretable density map suitable for model building, reso-
+lution evaluation, and quantitative validation. The Tab. 12 shows the post processing ablation study
+for missing wedge restoration task.
+E
+EXPERIMENTAL SETTINGS
+For downstream training, we used the AdamW optimizer with an initial learning rate of 3 × 10−5,
+weight decay of 1 × 10−3, and a ReduceLROnPlateau (factor 0.9, patience 5). All experiments
+were run for 500 epochs using a batch size of 32, mixed precision (bfloat16), and DDP (Distributed
+Data Parallel). Input density maps were cropped into 483-voxel volumes, with a stride 24 during
+training and 48 during validation. To boost model robustness, we applied random flips along all
+three axes and random rotations as data augmentation. The backbone architecture was based on
+SCUNet, which takes a single input channel, uses a base dimension of 32 with head dimension 16,
+and consists of seven stages configured as [2,2,2,2,2,2,2]. Swin-Conv Blocks with a local attention
+window of 33 and zero drop-path rate were used; the output was one-channel density map. This
+design strikes a balance between local convolutional features and global attention, enabling efficient
+training on large multi-GPU clusters while preserving structural detail. The specific hyperparameters
+for downstream task training are listed in Tab. 4 and further architectural details are availble in Tab.
+5.
+Table 4: Hyperparameters for downstream task training
+Parameter
+Value
+Description
+optimizer
+AdamW
+Optimizer type
+learning rate
+3 × 10−5
+Initial LR for AdamW
+weight decay
+1 × 10−3
+Weight decay coefficient
+epochs
+500
+Number of training epochs
+batch size
+35
+Batch size per process
+loss
+α LMSE + (1 −α) LHistKL, α ∈[0, 1]
+Reconstruction loss (ℓ2)
+lr scheduler
+ReduceLROnPlateau
+Factor 0.9, patience 5 (min mode)
+mixed precision
+bfloat16
+autocast enabled
+distributed
+DDP (NCCL)
+Multi-GPU data parallel training
+input size
+483
+Input/output volume size
+train stride
+24
+Sliding-window stride (training)
+val stride
+48
+Sliding-window stride (validation)
+augmentation
+RandomFlip/RandomRotate
+3D flips and 90◦rotations
+num workers
+10
+DataLoader workers per process
+pin memory
+True
+Page-locked host memory
+F
+EVALUATION METRICS
+Fourier Shell Correlation (FSC). The Fourier Shell Correlation (FSC) is a standard metric for
+measuring the resolution of reconstructed density maps in cryo-EM. It is computed between two
+independently reconstructed half-maps F1(k) and F2(k), as the normalized cross-correlation of
+their Fourier coefficients within a frequency shell S:
+FSC(S) =
+P
+k∈S
+F1(k) F ∗
+2 (k)
+r P
+k∈S
+|F1(k)|2 P
+k∈S
+|F2(k)|2 ,
+(6)
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+Table 5: Model architecture of SCUNet
+Component
+Setting
+Description
+backbone
+SCUNet
+Swin-Conv U-Net for volumetric data
+input channels
+1
+in nc = 1
+stages / blocks
+[2, 2, 2, 2, 2, 2, 2]
+Blocks per stage (config)
+base dim
+32
+Channel width at first stage (dim)
+head dim
+16
+Attention head dimension
+window size
+3
+Local attention window (3×3×3)
+input size
+48
+Input size for model
+drop path rate
+0
+Stochastic depth disabled
+activation
+(inherited by SCUNet)
+Follows SCUNet default
+output
+1 channel
+Reconstructed high-frequency density
+where Fi(k) denotes the Fourier transform of the i-th half-map, ∗indicates complex conjugation,
+and the summation is performed over all Fourier coefficients k within the shell S. The FSC curve
+typically decays with increasing frequency, and the resolution is conventionally defined at the spatial
+frequency where FSC drops below a certain threshold (e.g., 0.143 or 0.5).
+dmodel
+. The dmodel metric serves as an effective resolution indicator that quantifies the level of
+structural detail present in cryo-EM maps. It measures the effective resolution at which the atomic
+model agrees with the experimental density, providing a practical evaluation of density map’s inter-
+pretability.
+Map–Model Correlation Coefficients (Phenix).
+The Phenix validation suite provides several
+correlation coefficients (CCs) to quantify the agreement between an atomic model and a cryo-EM
+density map (Afonine et al., 2018):
+• CCbox: correlation computed over the entire map volume;
+• CCmask: correlation restricted to voxels inside a molecular mask;
+• CCpeaks: correlation evaluated at the strongest density peaks;
+• CCvolume: correlation calculated for a user-specified molecular volume, typically repre-
+senting the region occupied by the model.
+These metrics probe complementary aspects of map-model agreement: global consistency, localized
+fit within the molecular envelope, and correspondence at prominent density features, and agreement
+within the molecular volume of interest respectively.
+Q-score
+The Q-score quantifies atomic resolvability in cryo-EM maps (Pintilie et al., 2020). For
+each atom, the local density profile is extracted from the map and compared against a reference
+Gaussian profile, with the correlation the two serving as the Q-score. A higher Q-score indicates
+that the atomic density is well resolved and closely resembles the expected Gaussian profile, while
+lower values reflect poorer local resolvability. We report the average Q-score over all atoms in the
+model, as implemented in Chimera’s MapQ plugin, to evaluate overall map quality.
+CryoRes
+CryoRes (Dai et al., 2023) is a deep learning-based method for estimating local reso-
+lution from a single cryo-EM density map. Unlike traditional approaches, it does not require half-
+maps or multiple reconstructions, making it broadly applicable in scenarios where only a final map is
+available. CryoRes predicts voxel-wise resolution estimates that highlight spatial variability in map
+quality. These local resolution annotations provide complementary information to global metrics,
+offering a more fine-grained assessment of map reliability.
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+G
+ADDITIONAL EXPERIMENT RESULTS
+G.1
+ABLATION STUDY OF SCUNET-BASED BACKBONE VS VIT-BASED BACKBONE
+The ablation results validate the effectiveness of SCUNet-based backbones relative to ViT back-
+bones across density map sharpening, super-resolution, and missing wedge restoration. As shown
+in Tab. 6, 7, and 8, as well as in the radar plots, SCUNet consistently outperforms ViT on both
+correlation- and resolution-based metrics. For comparability, metrics where lower values indicate
+better performance (e.g., FSC-based metrics) were negated so that all scores follow a higher-is-better
+convention, consistent with CCbox and related measures. The unified radar plot (Fig.10) summarizes
+these results, providing a holistic view of backbone performance across evaluation metrics.
+Table 6: Evalutation metrics of SCUNet-based and ViT-based backbone models on density map
+sharpening task.
+phenix.map model cc
+Chimera.MapQ
+CCbox ↑
+CCmask ↑
+CCpeaks ↑
+Q-score ↑
+CryoLVM (ViT)
+0.826
+0.733
+0.739
+0.387
+CryoLVM (SCUNet)
+0.894
+0.821
+0.806
+0.444
+Table 7: Evalutation metrics of SCUNet-based and ViT-based backbone models on density map
+super-resolution task.
+phenix.mtriage
+CryoRes
+dmodel( ˚A) ↓
+FSC-0.143( ˚A) ↓
+FSC-0.5( ˚A) ↓
+Resolution( ˚A) ↓
+CryoLVM (ViT)
+2.35
+2.65
+4.73
+3.41
+CryoLVM (SCUNet)
+2.33
+2.58
+4.58
+3.39
+Table 8: Evalutation metrics of SCUNet-based and ViT-based backbone models on missing wedge
+restoration task.
+phenix.mtriage
+phenix.map model cc
+FSC-0.143( ˚A) ↓
+FSC-0.5( ˚A) ↓
+CCbox ↑
+CCmask ↑
+CCvolume ↑
+CryoLVM (ViT)
+16.51
+22.15
+0.355
+0.277
+0.241
+CryoLVM (SCUNet)
+10.09
+11.45
+0.391
+0.391
+0.348
+(a) Density map sharpening
+(b) Density map super-resolution
+(c) Missing wedge restoration
+Figure 10: Radar plots comparing CryoLVM performance with SCUNet versus ViT backbones
+across three tasks.
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+G.2
+ABLATION STUDY OF COMPOSITE LOSS OF MSE AND HISTKL
+The experimental results summarized in Tab. 9 demonstrate that the proposed HistKL loss, when
+used in conjunction with the standard MSE loss, consistently outperforms the baseline MSE-only
+approach across all evaluation metrics in the density map super-resolution task. Beyond the im-
+provement of density map quality, the incorporation of HistKL loss also accelerates the training
+convergence. Our analysis reveals that the composite loss configuration reaches optimal validation
+loss at epoch 107, whereas the MSE-only baseline requires 279 epochs to achieve its best validation
+loss—representing a 2.6× reduction in training time. These results highlight the effectiveness and
+efficiency of the HistKL term in guiding model optimization.
+Table 9: Impact of different training losses on model performance.
+phenix.mtriage
+CryoRes
+Resolution( ˚A) ↓
+FSC-0.143( ˚A) ↓
+FSC-0.5( ˚A) ↓
+Resolution( ˚A) ↓
+CryoLVM (MSE)
+2.36
+2.63
+4.61
+3.45
+CryoLVM (Composite)
+2.33
+2.58
+4.58
+3.39
+G.3
+ABLATION STUDY OF PRETRAINING
+To validate the effectiveness of our JEPA-based pretraining approach, we conducted two comple-
+mentary ablation studies on the density map sharpening task. First, we compared our pretrained-
+then-finetuned model against a model trained from scratch using identical architectures and hy-
+perparameters (Table 10). The pretrained model demonstrates consistent improvements across all
+metrics. These results confirm that self-supervised pretraining on high-quality cryo-EM density
+maps enables the model to learn transferable structural representations that enhance downstream
+task performance. Second, we evaluated JEPA against the widely-used Masked-Autoencoder (MAE)
+pretraining approach (Table 11). While both methods benefit from pretraining, JEPA consistently
+outperforms MAE across all metrics.
+Table 10: Evalutation metrics of pretrained-then-finetuned and trained-from-scratch models on den-
+sity map sharpening task.
+phenix.map model cc
+Chimera.MapQ
+CCbox ↑
+CCmask ↑
+CCpeaks ↑
+Q-score ↑
+CryoLVM (Scratch)
+0.878
+0.808
+0.786
+0.437
+CryoLVM (Pretrain)
+0.894
+0.821
+0.806
+0.444
+Table 11: Evalutation metrics of JEPA-pretrained and MAE-pretrained models on density map
+sharpening task.
+phenix.map model cc
+Chimera.MapQ
+CCbox ↑
+CCmask ↑
+CCpeaks ↑
+Q-score ↑
+CryoLVM (MAE)
+0.881
+0.813
+0.791
+0.441
+CryoLVM (JEPA)
+0.894
+0.821
+0.806
+0.444
+G.4
+ABLATION STUDY OF POSTPROCESSING METHOD
+During inference, CryoLVM processes density maps using a sliding window approach with over-
+lapping patches, necessitating an effective fusion strategy to merge predictions from overlapping
+regions into a coherent output volume. We conducted an ablation study comparing two postprocess-
+ing methods: mean-weighted fusion, which assigns equal weight to all overlapping predictions, and
+Gaussian-weighted fusion, which assigns higher weights to central regions of each patch and lower
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+weights to boundary regions (as detailed in Alg. 1). To better differentiate between these two ap-
+proaches and amplify their differences, we adopted a larger stride of 24 compared to the previously
+used value of 12.
+As shown in Tab. 12, Gaussian-weighted fusion consistently outperforms mean-weighted fusion
+across all evaluation metrics for the missing wedge restoration task.
+Table 12: Comparison of two postprocessing strategies
+phenix.mtriage
+phenix.map model cc
+FSC-0.143( ˚A) ↓
+FSC-0.5( ˚A) ↓
+CCbox ↑
+CCmask ↑
+CCvolume ↑
+CryoLVM (Mean)
+10.66
+13.07
+0.390
+0.388
+0.345
+CryoLVM (Gaussian)
+9.92
+11.47
+0.391
+0.391
+0.348
+G.5
+ADDITIONAL RESULTS OF SUPER RESOLUTION TASKS
+This subsection presents extra results regarding the density map super-resolution task. As shown
+in Fig. 11, CryoLVM achieves state-of-the-art performance overall, outperforming all baselines in
+both the FSC-0.5 and the CryoRes metrics. Fig. 12 visualizes improvement in local resolution for
+the EMD-0023 example: the deposited map spans a local resolution range of 3.39 ˚A to 4.12 ˚A,
+whereas CryoLVM’s predicted map compresses that range to a 2.31 ˚A to 3.45 ˚A. This illustrates that
+CryoLVM not only enhances global resolution measures but also recovers finer structural detail in
+regions where the original map is weaker.
+Figure 11: Comparison of CryoRes estimates and FSC-0.5 for density map super-resolution task.
+EMD-0023  PDB: 6GKH  Resolution: 4.06 Å
+Deposited
+EMGAN
+DeepEMhancer
+CryoLVM
+Figure 12: Comparison of local resolution maps between different methods on case EMD-0023.
+Local resolution maps are calculated via CryoRes and visualized through Chimera.
+G.6
+ADDITIONAL RESULTS OF MISSING WEDGE RESTORATION
+To provide thorough evaluation of missing wedge restoration performance, we present additional
+quantitative metrics and visualizations beyond the main results reported in Section 4.4. As shown
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+in Tab. 13, CryoLVM achieves higher correlation coefficients in three complementary assesment
+criteria: 1) CCbox, which measures global structural coherence by evaluating correlation across the
+entire reconstruction volume; 2) CCmask, which quantifies reconstruction accuracy within a maksed
+region; and 3) CCvolume, which assesses volumetric fidelity through voxel-wise correlation analysis
+of the complete density distribution. These improvements indicate that CryoLVM not only recovers
+missing angular information more accurately but also maintains superior structural consistency. Fig.
+14 presents the FSC-based resolution metrics (FSC-0.143 and FSC-0.5), where CryoLVM exhibits
+significantly better resolution distributions, indicating more effective recovery of high-frequency
+structural information lost due to missing wedge effects. Fig. 15 provides an additional visualization
+case for EMD-5106.
+Table 13: Addition CC results for missing wedge restoration task.
+Metrics computed using
+phenix.map model cc.
+phenix.map model cc
+CCbox ↑
+CCmask ↑
+CCvolume ↑
+IsoNet
+0.364
+0.371
+0.328
+CryoLVM
+0.391
+0.391
+0.348
+Figure 13: CC-based performance evaluation for missing wedge restoration task.
+Figure 14: FSC-based performance evaluation for missing wedge restoration task.
+G.7
+VALIDATION OF IMPACT ON AUTOMATED MODEL BUILDING
+To demonstrate the practical impact of CryoLVM processing on downstream structural biology
+workflows, we conducted a case study using ModelAngelo, a state-of-the-art automated model build-
+ing tool, on EMD-6656 (PDB: 5H30, resolution: 3.5 ˚A). As shown in Fig. 16, we compared atomic
+structures built from the deposited experimental map versus the CryoLVM-sharpened map. The
+CryoLVM-processed map yielded quantifiable improvements in model quality: RMSD to the refer-
+ence structure decreased from 0.68 ˚A to 0.58 ˚A, and sequence match increased from 92% to 94.3%.
+These gains show that enhanced map quality directly translates to more accurate and complete auto-
+mated model building, reducing manual intervention requirements in structural determination work-
+flows.
+G.8
+PROTEIN SECONDARY STRUCTURE CLASSIFICATION
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+EMD-5106  PDB: 3IY1  Resolution: 18 Å
+Input (with missing wedge)
+IsoNet
+CryoLVM
+Ground Truth
+Figure 15: Additional visualization case for missing wedge task. The original density map is EMD-
+5106 from EMDB and is added wedge-shaped mask for model processing.
+EMD-6656  PDB: 5H3O  Resolution: 3.5 Å
+Deposited map + ModelAngelo 
+CryoLVM processed map + ModelAngelo 
+RMSD: 0.68 Å
+Sequence Match: 92%
+RMSD: 0.58 Å
+Sequence Match: 94.3%
+Figure 16: Comparative model building quality assessment using ModelAngelo. Atomic structures
+were built automatically from (Left) the deposited experimental map EMD-6656 (resolution: 3.5 ˚A)
+and (Right) the same map after CryoLVM sharpening.
+0-Mainly Alpha
+2-Alpha Beta
+1-Mainly Beta
+3-Few Secondary Structure
+tSNE-1
+tSNE-2
+Mainly Alpha
+Mainly Beta
+Alpha Beta
+Figure 17: Protein secondary structure classification and representation visualization results.
+23

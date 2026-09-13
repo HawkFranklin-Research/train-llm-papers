@@ -1,0 +1,2864 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+META-UCF: UNIFIED TASK-CONDITIONED LORA
+GENERATION FOR CONTINUAL LEARNING IN LARGE
+LANGUAGE MODELS
+Shilin Xiao1,5†, Tianxiang Xu2†, Canran Xiao3∗, Weihao Luo4, Liwei Hou5, Chuangxin Zhao6
+1Nanjing University of Finance and Economics, 2Peking University
+3Shenzhen Campus of Sun Yat-sen University, 4College of Science and Technology, Ningbo
+University, 5Hunan Airon Tech, 6Institute of Automation, Chinese Academy of Sciences
+2120233029@stu.nufe.edu.cn; xiaocr3@mail.sysu.edu.cn
+ABSTRACT
+Large language models are increasingly deployed in settings where new tasks
+arrive continuously, yet existing parameter-efficient finetuning (PEFT) methods
+either bloat linearly with the task horizon or sacrifice deep adaptation, leaving
+catastrophic forgetting unresolved. We aim to achieve memory-constant, on-the-
+fly adaptation for a frozen LLM facing an unbounded stream of tasks. To this
+end we propose Meta-Unified Contrastive Finetuning (META-UCF), which en-
+codes each task into a lightweight layer-normalised mean embedding and feeds it
+to a single hypernetwork that instantly generates rank-r LoRA updates for every
+transformer layer; a meta-contrastive coupled with orthogonality objective further
+steers task embeddings into near-orthogonal directions, preserving past knowl-
+edge without inner-loop gradients. On four benchmark streams—Std-CL 5, Seq-
+GLUE 7, Long-CL 15 and TRACE-8—Meta-UCF raises average accuracy by up
+to 2.2 pp and cuts forgetting by 13 % relative to the strongest LoRA baseline,
+while using the parameters of a single adapter. By decoupling continual learn-
+ing from parameter growth, Meta-UCF provides a practical path toward scalable,
+low-resource lifelong language modelling.
+1
+INTRODUCTION
+I'm 
+learning 
+new 
+knowledge
+learned
+learning
+Finetunes LLMs on 
+a stream of tasks
+sequence
+fine-tuning
+I'm 
+learning 
+new 
+knowledge
+review
+review
+To much 
+adapters to 
+learn
+I ONLY learn 
+a single 
+shared 
+hypernetwork 
+fine-tuning
+Existing LoRA-CL Methods
+Meta-UCF(ours)
+Figure 1: Existing approaches keep adding
+a separate adapter for every new task.
+Meta-UCF instead trains one shared hyper-
+network that, from a task embedding, gen-
+erates the required low-rank update on the
+fly—eliminating linear parameter growth.
+Large language models (LLMs) underpin modern NLP
+systems yet remain costly to personalise for the contin-
+ually growing set of downstream tasks demanded by
+real applications (Yao et al., 2023; Zhu et al., 2024;
+Kamath et al., 2024; Zhang et al., 2025b; Feng et al.,
+2026; Zhang et al., 2025a). Updating a multi-billion-
+parameter backbone after each task is prohibitive in
+compute, storage and energy (Ding & Shi, 2024;
+Jegham et al., 2025); nevertheless, accurate and rapid
+adaptation without forgetting previous skills is crucial
+for life-long AI agents deployed at scale (Fawi, 2024;
+Liao et al., 2024; Jiang et al., 2024).
+Recent parameter-efficient finetuning (PEFT) tech-
+niques—adapters,
+prefixes
+and,
+most
+notably,
+LoRA—shrink per-task overhead from full weights to
+a few percent (Hu et al., 2022; Houlsby et al., 2019; Li
+& Liang, 2021; Zhang et al., 2024). However, when
+tasks arrive sequentially existing variants allocate one
+static slot per task (Wang et al., 2023; Tiwari et al.,
+*Corresponding author
+†These authors contributed equally to this work
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+2025; Yang et al., 2025), so model size still grows linearly with the horizon and subspace scheduling
+becomes brittle. Prompt-retrieval methods (Wang et al., 2022; Song et al., 2023; Bohao et al., 2024)
+avoid weight growth but leave the backbone frozen, limiting reasoning transfer.
+This work probes a deeper gap in PEFT: current methods treat each incoming task as an iso-
+lated patch—they either allocate a new low-rank slot or attach a prompt, leaving the backbone
+untouched—yet offer no mechanism to re-organise the knowledge already stored as the task stream
+grows. Consequently, model size expands linearly, and task interference is addressed post-hoc with
+orthogonality heuristics (Wang et al., 2023; Tiwari et al., 2025).
+We close this gap by reframing sequential PEFT as a generative problem, and propose Meta–Unified
+Contrastive Fine-Tuning (META-UCF). Our key idea is to encode every task into a compact layer-
+normalised mean vector and feed it to a single hypernetwork that generates rank-r LoRA updates
+for all transformer layers on the fly(Figure 1). A meta-contrastive objective pushes task embed-
+dings towards near-orthogonality, while a lightweight orthogonality penalty prevents their generated
+directions from collapsing. Thus a frozen LLM remains both plastic—via instant, conditioned up-
+dates—and stable—because only the hypernetwork learns and its memory footprint is constant.
+Our contributions are threefold: (i) We introduce a task-conditioned LoRA hypernetwork with an
+orthogonality-aware meta objective that eliminates linear parameter growth. (ii) We prove expres-
+sivity bounds for low-rank hypernetworks and a PAC-Bayes generalisation bound over task streams.
+(iii) Meta-UCF achieves new state-of-the-art accuracy and forgetting on four benchmarks while us-
+ing a constant-sized model; ablations reveal robust accuracy–latency trade-offs.
+2
+RELATED WORK
+Parameter-efficient adaptation.
+Early adapter modules (Houlsby et al., 2019) and prefix/p-
+tuning (Li & Liang, 2021; Liu et al., 2021) reduce finetuning cost by inserting tiny task-specific
+weights. LoRA pushes this idea further by applying low-rank updates directly to attention and FFN
+matrices (Hu et al., 2022). A recent surge of LoRA variants targets continual scenarios: O-LoRA
+orthogonalises task subspaces to curb interference(Wang et al., 2023), N-LoRA re-parameterises
+updates to avoid collision(Yang et al., 2025), while GRID (Tiwari et al., 2025) and Adaptive-
+SVD (Nayak et al., 2025) compress adapter banks under a shared orthonormal basis. Despite strong
+empirical gains, these methods allocate a static slot per task, leaving memory proportional to the task
+horizon and requiring manual scheduling of subspaces. META-UCF replaces the slot bank with a
+single hypernetwork that generates LoRA factors on demand, retaining the footprint of a single task
+regardless of stream length.
+Continual learning for language models.
+Classical replay and regularisation ideas (e.g.
+EWC(Kirkpatrick et al., 2017), GEM(Lopez-Paz & Ranzato, 2017), LwF(Li & Hoiem, 2017)) have
+been ported to transformers but scale poorly when the backbone exceeds billions of parameters.
+Prompt-based approaches, such as ProgPrompt and L2P(Wang et al., 2022), store small textual or
+embedding prompts in a memory bank; ConPET (Song et al., 2023), JARe(Bohao et al., 2024)
+and Continual-T0(Scialom et al., 2022) couple such prompts with contrastive objectives. Yet these
+frameworks depend on explicit prompt retrieval at inference time and cannot modify deeper repre-
+sentations, limiting accuracy on reasoning-heavy streams. Meta-UCF instead learns a compact task
+embedding that drives low-rank updates throughout the network, yielding stronger plasticity while
+preserving frozen parameters.
+3
+METHOD
+Meta–Unified Contrastive Fine-Tuning (Meta-UCF) tackles the continual-learning setting in
+which a stream of tasks {T1, T2, . . . } arrives sequentially and the backbone model must adapt with-
+out retaining a separate adapter for each task. Meta-UCF equips a frozen LLM backbone with a
+single hyper-network that generates low-rank LoRA updates on the fly, conditioned on a compact
+task embedding constructed from a small replay buffer. Figure 2 illustrates the training flow: a sup-
+port set drawn from replay memory is encoded by the frozen backbone and averaged to obtain a task
+embedding ek; this embedding is fed to the shared hyper-network gΦ, which instantly generates
+rank-r LoRA factors for every transformer layer; the backbone augmented with these factors pro-
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+cesses the current task’s query batch, and the joint task, orthogonality, contrastive, and bias losses
+back-propagate to update Φ alone, leaving the backbone weights unchanged.
+Pretrained
+Backbone
+LoRA
+Update 
+Incoming 
+task ੣Ǐ
+Previous ੣1、੣2. . .
+Sampling
+Task 
+Embedding  ek
+Support
+Set
+Query
+Set
+frozen backbone
+Meta-Conditioned 
+Parameter 
+Generator
+Prediction
+Overall Loss
+એ풕풂ɉɁ
+એ풐ɈȾ
+એ풄풕Ɉ
+ȮɁ
+feedforward
+learning process
+loss calc.
+Backprop
+infer
+trainable
+frozen
+Figure 2: Meta-UCF pipeline: a support set from memory yields the task embedding ek, the gen-
+erator gΦ produces LoRA updates (Al, Bl) for the frozen backbone, and the current task’s query
+batch drives losses {Ltask, Lorth, Lctr, Rk} whose gradient updates only the generator.
+3.1
+TASK EMBEDDING ACQUISITION
+A task embedding ek should (i) summarise the latent structure of the current task Tk, (ii) be stable
+under mini-batch sampling noise, (iii) remain parameter-free so that it can be computed on-the-fly
+at deployment time, and (iv) live in the same representation space as the backbone so that geometric
+notions (e.g. cosine similarity) are meaningful. Formally, let the frozen backbone be a function
+fΘ0 : X →Rd that maps an input x ∈X to its CLS hidden state h = fΘ0(x). Given a support set
+Sk = {xs}Sk
+s=1, we would like ek =Pool
+ {hs}Sk
+s=1
+
+to satisfy
+sim
+ ei, ej
+
+≈δij
+with
+sim(a, b) =
+a⊤b
+∥a∥∥b∥,
+(1)
+so that task embeddings are approximately orthogonal across different tasks.
+Layer-normalised mean pooling.
+A simple yet powerful choice is the layer-normalised mean:
+ek = LN
+ 1
+Sk
+Sk
+X
+s=1
+hs
+
+,
+hs = fΘ0(xs),
+(2)
+where LN denotes layer normalisation acting on the feature dimension. Equation 2 enjoys three
+favourable properties:
+1. Unbiasedness. Let µk = Ex∼Pk[fΘ0(x)] be the true task mean under the episode distribu-
+tion Pk. Then E[ek]=LN(µk).
+2. Variance decay. If Cov[hs] = Σk, then Cov
+ 1
+Sk
+P
+s hs
+
+=
+1
+Sk Σk, i.e. the variance shrinks
+at a rate O(S−1
+k ).
+3. Scale equivariance. Layer normalisation removes arbitrary feature-wise scale, making ek
+insensitive to backbone re-scaling that may occur during pre-training.
+equation 2 can be interpreted as the first-order term in a Fisher-kernel expansion. Writing ℓ(x; Θ0)
+for the log-likelihood of x under the frozen model, the Fisher score is g(x) = ∇Θℓ(x; Θ)
+
+Θ=Θ0.
+Under a linearisation of the backbone, g(x) is proportional to the hidden state h, hence the average
+¯gk =
+1
+Sk
+P
+s g(xs) yields the same embedding as equation 2 up to a constant. From classical
+theory,
+K(ei, ej) = ¯g⊤
+iF−1¯gj,
+(3)
+with F the Fisher information matrix, is a kernel that measures task similarity.
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+Streaming update.
+During continual training the support set grows; we therefore maintain
+exponential-moving-average (EMA) estimates:
+e(t)
+k
+= LN
+ (1 −ρ) e(t−1)
+k
++ ρ ¯h(t)
+,
+¯h(t) =
+1
+|Bt|
+X
+x∈Bt
+fΘ0(x),
+(4)
+with decay ρ∈(0, 1) and mini-batch Bt drawn from Sk, yielding O(d) memory overhead irrespective
+of Sk.
+Distance-preserving normalisation.
+Finally, note that applying LN followed by ℓ2-normalisation
+projects all embeddings onto the unit hypersphere, so that
+sim(ei, ej) = 1 −1
+2 ∥ei −ej∥2
+2,
+(5)
+showing that Euclidean distance and cosine similarity coincide—a useful property for contrastive
+objectives.
+3.2
+META-CONDITIONED PARAMETER GENERATOR
+The core challenge in continual learning is to avoid linear growth in the number of trainable param-
+eters as new tasks arrive. Meta-UCF therefore replaces a bank of per-task adapters with a single
+hyper-network gΦ that synthesises LoRA updates for every Transformer layer on demand.
+Generator architecture.
+Let ek ∈Rd be the task embedding from § 3.1. We first compute a task
+code zk = MLPtask(ek) ∈Rh,
+h < d, using a two-layer MLP with GELU activation. For each
+layer index l we retrieve a learned positional embedding pl ∈Rh and concatenate: ˜zk,l = [ zk; pl ].
+Two low-rank projection heads then generate LoRA factors
+ Al, Bl
+
+=
+
+reshaped×r
+ WA˜zk,l
+
+, reshaper×d
+ WB˜zk,l
+
+,
+(6)
+where WA, WB ∈Rdr×2h are shared across layers.*
+LoRA injection.
+Given the base weight Wl ∈Rd×d of layer l, the generator applies a rank-r
+update
+W(k)
+l
+= Wl + α Bl
+ ek; Φ
+
+Al
+ ek; Φ
+
+,
+α =
+1
+r.
+(7)
+The scaling α follows LoRA convention so that the update norm remains comparable across different
+ranks.
+Complexity analysis. The generator’s parameters decompose as |Φ| = |MLPtask| + 2hL + 2hdr,
+yielding total computational cost O
+ |Φ| + Ldr
+
+per forward pass—independent of the number of
+tasks K.
+3.3
+META OBJECTIVE
+For each episodic task Tk we draw disjoint support Sk and query Qk sets. All losses are evaluated
+on Qk after a single hyper-network forward pass conditioned on Sk. Concretely, in a single meta-
+training step we first sample a meta-batch of K tasks and, for each task Tk, draw disjoint support Sk
+and query Qk (Yao et al., 2024). The frozen backbone encodes each support example x ∈Sk into a
+CLS vector hs ∈Rd, which is layer-normalised and averaged to produce the task embedding ek ∈
+Rd defined in §3.1. The generator then maps ek to a lower-dimensional code zk ∈Rh, combines
+it with the layer embedding pℓ, and outputs rank-r LoRA factors Aℓ∈Rd×r and Bℓ∈Rr×d for
+every Transformer layer. These factors are injected into the backbone, which is run once on the query
+batch Qk to obtain predictions and query CLS states; stacking the latter forms Hk ∈R|Qk|×d, on
+which the task loss L(k)
+task, the orthogonality penalty Lorth, and the bias regulariser Rk are computed.
+In parallel, the set of task embeddings {ek}K
+k=1 is fed to the contrastive loss Lctr defined below.
+A single backward pass through this graph updates only the generator parameters Φ, while the
+backbone parameters and layer-normalisation statistics remain frozen.
+*Sharing WA, WB keeps |Φ| sub-linear in L while allowing layer-specific outputs via pl.
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+Task Accuracy.
+L(k)
+task =
+1
+|Qk|
+X
+(x,y)∈Qk
+ℓ
+ fΘ0,∆(ek)(x), y
+
+.
+(8)
+This is the standard supervised objective that drives the generated adapters to fit the labels of each
+episode, providing the “plasticity” needed to acquire new tasks.
+Orthogonality Penalty.
+Let Hk ∈R|Qk|×d stack each query’s CLS state. Define the pair-wise
+Frobenius overlap
+Ωij :=
+1
+|Qi| |Qj|
+H⊤
+i Hj
+
+F ,
+(9)
+and set
+Lorth =
+X
+i<j
+Ω2
+ij.
+(10)
+Intuitively, Hk collects the d-dimensional query representations for task Tk, and Ωij measures how
+much the subspaces spanned by Hi and Hj overlap; penalising Ω2
+ij discourages different tasks from
+sharing the same dominant directions, improving stability by reducing cross-task interference in the
+adapted backbone.
+Meta-Contrastive Separation.
+With task embeddings zk := ek, the InfoNCE loss is
+Lctr = −1
+K
+K
+X
+k=1
+log
+exp
+ sim(zk, z+
+k )/τ
+
+X
+j̸=k
+exp
+ sim(zk, zj)/τ
+,
+(11)
+where sim(a, b) = a⊤b/(∥a∥∥b∥), τ is a temperature, and z+
+k denotes the embedding of an inde-
+pendent support minibatch S+
+k drawn from the same task Tk as Sk, computed with the same frozen
+backbone and layer-normalised mean pooling. In other words, (zk, z+
+k ) form two IID “views” of
+the same task distribution, giving a simple task-level data augmentation without introducing extra
+trainable modules. Once the embeddings are ℓ2-normalised, maximising the InfoNCE objective
+over cosine similarities enforces angular separation between tasks on the unit hypersphere, a stan-
+dard and numerically stable choice in meta-contrastive learning. In Meta-UCF, Lctr shapes this
+input geometry of the generator by keeping task codes nearly orthogonal, while Lorth regularises
+the output geometry of the adapted backbone by discouraging overlap between the query subspaces
+Hi and Hj; the two regularisers therefore operate at complementary levels to balance plasticity and
+stability.
+Dynamic Bias Calibration.
+For a binary sensitive attribute g ∈{0, 1}, the demographic-parity
+gap is
+Rk =
+Ex∼P (x | g=0,Tk)fΘ0,∆(ek)(x)
+−Ex∼P (x | g=1,Tk)fΘ0,∆(ek)(x)
+.
+(12)
+Gradients w.r.t. the generator parameters Φ are scaled by σ(−βRk), where σ is the sigmoid and
+β > 0 a sensitivity hyper-parameter.
+Overall Loss.
+Lmeta =
+K
+X
+k=1
+
+L(k)
+task + λoLorth + λcLctr + λbRk
+
+.
+(13)
+Thus Lmeta remains a simple episodic objective: for each task, the supervised loss encourages
+adaptation, the orthogonality and contrastive terms regularise the geometry of task codes and repre-
+sentations, and the bias term gates updates based on the demographic-parity gap.
+Outer-Loop Optimisation
+We employ a first-order MAML variant with zero inner-loop gradient
+steps. At each iteration we (a) sample a batch of tasks, (b) construct Sk, Qk for each, (c) compute
+Lmeta, and (d) update Φ via AdamW. Backbone parameters Θ0 and layer-norm statistics remain
+frozen.
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+Table 1: Overall comparison. Darker shading indicates better performance.
+Method
+Std-CL 5
+Long-CL 15
+Seq-GLUE 7
+TRACE-8
+LoRA
+78.3
+61.4
+75.9
+55.6
+O-LoRA
+80.1
+63.4
+76.8
+57.3
+CL-LoRA
+82.0
+64.3
+78.7
+59.7
+OA-Adapter
+82.7
+65.9
+78.9
+59.8
+SAPT
+83.2
+68.1
+79.6
+60.7
+N-LoRA
+83.5
+68.1
+80.2
+61.0
+L2P
+80.0
+62.0
+75.8
+56.0
+SPARC
+81.4
+61.5
+76.4
+58.5
+InsCL
+80.1
+63.2
+77.6
+58.8
+EWC
+78.8
+61.6
+74.2
+55.4
+LwF
+79.5
+61.2
+76.8
+56.9
+Replay-LoRA
+80.5
+63.8
+77.1
+57.9
+META-UCF (r=8, All)
+85.6
+70.7
+82.7
+63.4
+META-UCF (r=8, Top-Half)
+84.9
+70.1
+82.1
+62.9
+META-UCF (r=4, All)
+84.3
+69.0
+81.6
+62.0
+(a) Average Accuracy (%, ↑). The two Meta-UCF
+variants use fewer adapted parameters or layers un-
+der comparable budgets.
+Forgetting Ratio
+Backward Transfer
+Method
+Std-5 Long-15 GLUE-7 TRACE-8 Std-5 Long-15 GLUE-7 TRACE-8
+LoRA
+12.5
+18.3
+10.9
+21.2
+−1.8
+−4.2
+−1.3
+−5.5
+O-LoRA
+10.4
+16.0
+9.8
+19.5
+−1.2
+−3.5
+−1.0
+−4.8
+CL-LoRA
+9.6
+14.9
+8.7
+17.1
+−0.6
+−2.5
+−0.6
+−3.8
+OA-Adapter
+8.7
+14.2
+8.3
+17.1
+−0.7
+−2.7
+−0.6
+−3.8
+SAPT
+7.2
+13.3
+7.3
+16.0
+−0.3
+−2.7
+−0.2
+−3.6
+Adaptive SVD
+7.5
+13.0
+7.4
+15.9
+−0.4
+−2.2
+−0.3
+−3.3
+N-LoRA
+7.1
+12.4
+7.1
+15.5
+−0.3
+−2.0
+−0.2
+−3.1
+L2P
+11.0
+17.6
+10.0
+19.7
+−1.5
+−4.0
+−1.2
+−5.3
+SPARC
+14.4
+19.5
+11.7
+21.4
+−2.6
+−3.8
+−2.2
+−4.7
+InsCL
+9.5
+14.3
+8.6
+18.1
+−1.1
+−2.4
+−1.2
+−3.5
+EWC
+13.6
+17.4
+12.5
+20.3
+−2.4
+−4.1
+−1.8
+−4.8
+LwF
+12.8
+16.2
+11.6
+18.8
+−2.1
+−3.5
+−1.2
+−4.3
+Replay-LoRA
+9.3
+15.0
+8.5
+18.2
+−1.1
+−3.1
+−0.9
+−4.3
+META-UCF
+6.2
+11.5
+6.3
+14.2
+0.2
+−1.5
+0.1
+−2.5
+(b) Forgetting Ratio (%, ↓) and Backward Transfer
+(BWT, ↑). Lower FR and higher BWT indicate better sta-
+bility.
+Inference
+During deployment, a small support set (S ≤16) from a previously unseen task is
+enough to produce enew and hence ∆(enew) without optimisation. The frozen backbone combined
+with the generated adapters executes the downstream prediction, enabling one-model-for-all-tasks
+operation with negligible memory overhead.
+For the complete implementation pseudocode of Meta-UCF, please refer to Algorithm 1 and Algo-
+rithm 2 in Appendix B.1.
+4
+EXPERIMENTS
+4.1
+EXPERIMENTAL SETTINGS
+Evaluation Benchmarks. To assess the performance of Meta-UCF, we conduct experiments across
+four distinct task sequences, following the methodology established in continual LoRA fine-tuning:
+(i) Std-CL 5: A standard five-task sequence used for text classification, encompassing tasks from
+AG News, Amazon, Yelp, DBpedia, and Yahoo in that order. (ii) Seq-GLUE 7: A task sequence
+based on the GLUE benchmark, which includes the tasks CoLA, SST-2, MRPC, QQP, QNLI, RTE,
+and MNLI, providing a comprehensive test of natural language understanding (NLU) transfer. (iii)
+Long-CL 15: A more complex sequence of 15 tasks, extending the Std-CL 5 by incorporating tasks
+from the GLUE, SuperGLUE, and IMDb datasets. This benchmark is evaluated with three distinct
+task orderings. (iv) TRACE-8: A multi-domain eight-task stream covering areas like domain-specific
+question answering, multilingual comprehension, code completion, and mathematical reasoning. All
+datasets are transformed into the SEQ2SEQ instruction format as outlined by Qin et al. (2024), and
+comprehensive statistics are available in the Appendix.
+Evaluation Protocol. We report the standard continual-learning metrics: Average Accuracy (AA),
+Forgetting Ratio (F.R.), and Backward Transfer (BWT). For datasets with multiple metrics (e.g.
+accuracy & F1) we follow GRID (Tiwari et al., 2025) and average them into a single score. All
+results are averaged over three random seeds.
+Baselines. We benchmark Meta-UCF against three groups of baselines in parameter-efficient con-
+tinual adaptation of large language models and NLP systems: (i) Adapter/parameter-efficient con-
+tinual learning — CL-LoRA (He et al., 2025), TreeLoRA (Qian et al., 2025), OA-Adapter (Wan
+et al., 2025), N-LoRA(Yang et al., 2025), and SAPT (Zhao et al., 2024). (ii) Prompt-based contin-
+ual adaptation — L2P (Wang et al., 2022), SPARC (Jayasuriya et al., 2025), and InsCL (Wang et al.,
+2024). (iii) Memory / regularisation strategies — Elastic Weight Consolidation (EWC) (Kirkpatrick
+et al., 2017), Learning without Forgetting (LwF) (Li & Hoiem, 2017), and Replay-LoRA (Pillai,
+2025).
+Backbone Models.
+We consider four recent 7–13B checkpoints: LLAMA-3-8B, QWEN-1.5-7B,
+DEEPSEEK-7B, and MISTRAL-7B. rank-r = 8 LoRA adapters are inserted into every qkv and
+MLP projection.
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+Table 2: Combined results. Left: Alpaca pre-tuning effects on MMLU and Std-CL 5. Right: single-factor
+ablations of META-UCF on Std-CL 5 and Long-CL 15.
+Method
+MMLU ↑
+Std-CL 5 ↑
+w/o CL
+LLaMA-7B
+34.4
+—
+Alpaca-LoRA
+37.5
+—
+Alpaca-LoRA-CL
+23.3
+46.7
+Alpaca-inc-LoRA-CL
+28.6
+33.1
+Alpaca-OLoRA-CL
+33.6
+76.8
+Alpaca-Meta-UCF-CL
+36.2
+80.5
+(a) Zero-shot MMLU and downstream Std-CL 5
+accuracy after Alpaca pre-tuning.
+Variant
+Std-CL 5
+Long-CL 15
+Acc. ↑
+FR ↓
+Acc. ↑
+FR ↓
+Full Meta-UCF
+85.6
+6.2
+70.7
+11.5
+w/o Lorth
+83.9
+7.8
+68.5
+13.2
+w/o Lctr
+84.1
+7.2
+68.9
+12.7
+w/o bias calibration
+84.6
+6.9
+69.4
+12.0
+CLS mean →last CLS
+82.1
+9.5
+66.3
+15.1
+static LoRA (no generator)
+80.3
+11.1
+64.9
+17.0
+(b) Single-factor ablations of META-UCF.
+Optimisation Details.
+Unless noted, we train each task for a single epoch with AdamW (β1,2 =
+0.9, 0.98), learning-rate 3×10−5, batch 64, sequence length 512, and weight-decay 0.01. Meta-UCF
+regulariser weights are fixed across streams: λo = 0.5, λc = 1.0, λb = 0.1, bias sensitivity β = 4,
+EMA decay ρ=0.2, and support size Sk =32. All runs fit on a single NVIDIA A100 80G; Long-CL
+15 uses ZeRO-2 across four GPUs to keep wall-clock under 24 h.
+4.2
+MAIN RESULTS
+The results in Table 1a show that META-UCF delivers the highest average accuracy on all four
+streams, improving over the strongest prior baseline (N-LoRA) by +1.7 pp on STD-CL 5 and
++2.2 pp on the heterogeneous TRACE-8. Table 1b further indicates that Meta-UCF not only re-
+duces forgetting to a new low (e.g., 6.2% on STD-CL 5) but also turns backward transfer nearly
+neutral or mildly positive, whereas all competing methods remain negative. Together, these gains
+confirm that task-conditioned LoRA generation—combined with orthogonality and bias-aware meta
+objectives—yields both superior accuracy and markedly improved stability across short, long, and
+domain-diverse continual-learning streams. To ensure that the gains on heterogeneous streams are
+not driven by a single domain, we also compute per-task AA gaps between Meta-UCF and N-LoRA
+on Long-CL 15 and TRACE-8, which are reported in Appendix D.2.
+To test the zero-shot performance of the Meta-UCF method, we follow the O-LoRA(Wang et al.,
+2023) protocol: first, we instruction-tune LLaMA-7B on the ALPACA dataset using rank-8 LoRA,
+and then perform continual training on the STD-CL 5 (order 1) stream. As Table 2a shows, META-
+UCF attains the highest downstream accuracy (80.5%), surpassing the strongest baseline Alpaca-O-
+LoRA-CL by +3.7 pp. Crucially, it does so without sacrificing generalisation: the zero-shot MMLU
+score rises to 36.2%, close to the single-task Alpaca-LoRA (37.5%) and considerably above all
+prior continual variants. These results confirm that task-conditioned LoRA generation preserves
+the general knowledge acquired during Alpaca pre-tuning while providing superior resistance to
+catastrophic forgetting on subsequent tasks.
+4.3
+ABLATION STUDY
+To isolate the impact of each design component, we conduct single-factor ablations on the two
+representative streams—STD-CL 5 and LONG-CL 15. As shown in Table 2b, removing Lorth or
+Lctr lowers accuracy by 1.1–1.9 pp and adds ≈1.5 pp forgetting, evidencing their joint role in drift
+control. Bias calibration is less critical but still helps, especially on longer streams. Replacing the
+mean-pooled embedding with a single CLS vector costs 3.1 pp on STD-CL 5, and using a fixed
+LoRA slot hurts both metrics most, underscoring the need for task-conditioned generation.
+4.4
+SENSITIVITY ANALYSIS
+Parameter Sensitivity
+We vary every hyper-parameter that could plausibly influence META-UCF
+and measure average accuracy (mean ± std over three seeds) on STD-CL 5 and LONG-CL 15. Re-
+sults in Figure 3 indicate that the method is remarkably robust: most settings fluctuate within ±1 pp
+of the default, and no single factor dominates performance.
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+5
+10
+15
+Value
+70
+75
+80
+85
+Accuracy (%)
+LoRA Rank (r)
+20
+40
+60
+Value
+70
+75
+80
+85
+Support Size (S)
+0.0
+0.5
+1.0
+Value
+70
+75
+80
+85
+Orth. Weight ( )
+0
+1
+2
+Value
+70
+75
+80
+85
+Contr. Weight ( c)
+0.1
+0.2
+0.3
+0.4
+Value
+70.0
+72.5
+75.0
+77.5
+80.0
+82.5
+85.0
+Accuracy (%)
+EMA Decay ( )
+0.05
+0.10
+0.15
+0.20
+Value
+70.0
+72.5
+75.0
+77.5
+80.0
+82.5
+85.0
+Temperature ( )
+2
+4
+6
+8
+Value
+70.0
+72.5
+75.0
+77.5
+80.0
+82.5
+85.0
+Bias-Scale ( )
+Std-CL 5 Acc.
+Long-CL 15 Acc.
+Figure 3: Sensitivity of META-UCF to key hyper-parameters.
+0
+10
+20
+30
+40
+50
+60
+70
+80
+85.2
+84.7
+84.9
+85.0
+6.2
+6.5
+6.4
+6.3
+Std-CL 5
+0
+10
+20
+30
+40
+50
+60
+70
+70.4
+69.9
+70.1
+70.2
+11.5
+11.9
+11.7
+11.6
+Long-CL 15
+Llama-3-8B
+Qwen-1.5-7B
+DeepSeek-7B
+Mistral-7B
+0
+10
+20
+30
+40
+50
+60
+70
+80
+82.4
+82.0
+82.2
+82.3
+6.3
+6.5
+6.4
+6.4
+Seq-GLUE 7
+Llama-3-8B
+Qwen-1.5-7B
+DeepSeek-7B
+Mistral-7B
+0
+10
+20
+30
+40
+50
+60
+63.2
+62.7
+62.9
+63.0
+14.2
+14.5
+14.4
+14.3
+TRACE-8
+Backbone Models
+Performance Metrics
+ Higher better
+ Lower better
+AA ( )
+FR ( )
+(a) Meta-UCF on different backbone families.
+t-SNE  Std-CL 5
+T0
+T1
+T2
+T3
+T4
+PCA  Std-CL 5
+T0
+T1
+T2
+T3
+T4
+t-SNE  Long-CL 15
+T0
+T1
+T2
+T3
+T4
+T5
+T6
+T7
+T8
+T9
+T10
+T11
+T12
+T13
+T14
+PCA  Long-CL 15
+T0
+T1
+T2
+T3
+T4
+T5
+T6
+T7
+T8
+T9
+T10
+T11
+T12
+T13
+T14
+(b) Task embeddings produced by Meta-UCF.
+Figure 4: (a) Backbone families vs. Meta-UCF performance; (b) Task embedding geometry. Color
+encodes task ID; symbols denote stream order. t-SNE and PCA reveal well-separated, nearly or-
+thogonal clusters.
+The generator is rank-efficient: shrinking r from 8 to 4 costs≈1.5 pp on LONG-CL 15, while r = 16
+adds no gain. Accuracy rises until S = 32 and then saturates, indicating the mean-pooled task
+embedding is already stable. Disabling either Lorth or Lctr drops accuracy by 1–2 pp, confirming
+both curb drift. Other knobs (ρ, τ) move results by <0.5 pp; an oversized bias scale (β = 8) slightly
+hurts. Thus, META-UCF stays strong across a wide hyper-parameter corridor.
+Generalisability across Backbone Families We apply the default Meta-UCF recipe (rank-8 LoRA,
+identical hyper-parameters) to four recent 7–13 B checkpoints: LLAMA-3-8B, QWEN-1.5-7B,
+DEEPSEEK-7B and MISTRAL-7B. Figure 4a reports mean ± std over three seeds; all runs fit on
+a single A100 80 GB with identical training budgets. Across four architecturally diverse backbones,
+Meta-UCF delivers virtually identical accuracy and forgetting, varying by <0.5 pp on every stream.
+This confirms that its improvements stem from the task-conditioned generator and meta-objectives
+rather than any model-specific quirk, and suggests practitioners can expect consistent gains when
+swapping in newer checkpoints without retuning hyper-parameters.
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+Table 3: Dispersion statistics of task embeddings. ⟨| cos θ|⟩: mean absolute cosine similarity (lower
+= better); max | cos θ|: worst-case overlap; S: average silhouette coefficient (higher = better).
+Stream
+Last-CLS (abl.)
+Meta-UCF (ours)
+⟨| cos θ|⟩
+↓
+max | cos θ|
+↓
+S
+↑
+⟨| cos θ|⟩
+↓
+max | cos θ|
+↓
+S
+↑
+Std-CL 5
+0.23 ± 0.01
+0.41 ± 0.03
+0.52 ± 0.02
+0.04 ± 0.00
+0.12 ± 0.01
+0.83 ± 0.01
+Long-CL 15
+0.28 ± 0.02
+0.46 ± 0.02
+0.37 ± 0.03
+0.06 ± 0.00
+0.15 ± 0.01
+0.76 ± 0.02
+Geometry of Task Embeddings
+To verify that the layer-normalised mean ( equation 2) indeed
+scatters tasks into near-orthogonal directions, we visualise the 32-dimensional embeddings learned
+on STD-CL 5 and LONG-CL 15. Figure 4b shows both a t-SNE and a PCA projection; Table 3
+quantifies dispersion with standard geometry metrics. Meta-UCF compresses each task into a com-
+pact, almost orthogonal point cloud: the mean cosine similarity drops from 0.23/0.28 to 0.04/0.06,
+and the silhouette coefficient rises by >0.2 on both streams (Table 3). The scatter plots in Figure 4b
+corroborate this numerically—clusters are radially separated with minimal overlap—providing di-
+rect evidence that the layer-normalised mean, combined with the meta-contrastive loss, achieves the
+geometric separation assumed by our objective.
+140.0
+142.5
+145.0
+147.5
+150.0
+152.5
+155.0
+Throughput (tokens / s)
+84.4
+84.6
+84.8
+85.0
+85.2
+Accuracy on Std-CL 5 (%)
+All
+Alt-Layers
+Top-Half
+QKV-Only
+Last-8
+Figure 5: Pareto curve of accuracy vs. throughput
+(STD-CL 5).
+Partial-Layer LoRA Injection Many produc-
+tion systems favour latency over marginal ac-
+curacy. We therefore inject LoRA into only a
+subset of transformer layers and measure the
+trade-off between speed, memory, and perfor-
+mance on LLAMA-3-8B. Five configurations
+are compared: (i) All: rank-8 LoRA in every
+QKV & FFN weight (default); (ii)Alt-Layers:
+every second layer; (iii) Top-Half: upper 50 %
+layers; (iv) QKV-Only: all layers, but FFN un-
+touched; (v) Last-8: final eight layers only.
+Fig. 5 reveal a sweet-spot: adapting only the
+upper half of layers retains > 99% of full ac-
+curacy yet raises throughput by 8%. Dropping
+FFN updates (QKV-ONLY) saves an extra 5 M
+parameters but costs another 0.3 pp. The LAST-
+8 variant delivers the fastest inference while
+losing 0.8 pp accuracy—acceptable for timeline-critical applications.
+5
+CONCLUSION
+We tackled the long-standing tension between plasticity and memory footprint in continual language
+model adaptation by introducing META-UCF, a hypernetwork that turns a compact task embedding
+into rank-r LoRA updates, keeping parameter count constant while preventing drift through con-
+trastive and orthogonality losses. Extensive benchmarks and accompanying theory jointly show that
+a frozen LLM can match—often surpass—the accuracy of slot-based LoRA stacks while cutting for-
+getting to single-digit percentages, suggesting that task-conditioned generation is a viable alternative
+to ever-growing adapter banks.
+Ethics Statement
+This work adheres to the ICLR Code of Ethics. Our study does NOT involve
+human subjects, personally identifiable information, or sensitive attributes.
+Reproducibility Statement
+We structure the paper and supplement for end-to-end reproduction.
+The full experimental protocol is specified in §4.1; dataset statistics, orders, and evaluation rules
+appear in Appendix §C.1. All corpora are converted to a unified SEQ2SEQ instruction format with
+the provided script in Appendix §C.2.
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+REFERENCES
+PENG Bohao, Zhuotao Tian, Shu Liu, Ming-Chang Yang, and Jiaya Jia. Scalable language model
+with generalized continual learning. In The Twelfth International Conference on Learning Repre-
+sentations, 2024.
+Yi Ding and Tianyao Shi. Sustainable llm serving: Environmental implications, challenges, and
+opportunities. In 2024 IEEE 15th International Green and Sustainable Computing Conference
+(IGSC), pp. 37–38. IEEE, 2024.
+Muhammad Fawi. Curlora: Stable llm continual fine-tuning and catastrophic forgetting mitigation.
+arXiv preprint arXiv:2408.14572, 2024.
+Chen Feng, Minghe Shen, Ananth Balashankar, Carsten Gerner-Beuerle, and Miguel.R.D Ro-
+drigues.
+Noisy but valid: Robust statistical evaluation of LLMs with imperfect judges.
+In
+The Fourteenth International Conference on Learning Representations (ICLR), 4 2026. URL
+https://openreview.net/forum?id=hEhxreaLdU.
+Gene H Golub and Charles F Van Loan. Matrix computations. JHU press, 2013.
+Jiangpeng He, Zhihao Duan, and Fengqing Zhu.
+Cl-lora: Continual low-rank adaptation for
+rehearsal-free class-incremental learning. In Proceedings of the Computer Vision and Pattern
+Recognition Conference, pp. 30534–30544, 2025.
+Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, An-
+drea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning for nlp.
+In International conference on machine learning, pp. 2790–2799. PMLR, 2019.
+Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+Weizhu Chen, et al. Lora: Low-rank adaptation of large language models. ICLR, 1(2):3, 2022.
+Dinithi Jayasuriya, Sina Tayebati, Davide Ettori, Ranganath Krishnan, and Amit Ranjan Trivedi.
+Sparc: Subspace-aware prompt adaptation for robust continual learning in llms. arXiv preprint
+arXiv:2502.02909, 2025.
+Nidhal Jegham, Marwen Abdelatti, Lassad Elmoubarki, and Abdeltawab Hendawi.
+How hun-
+gry is ai? benchmarking energy, water, and carbon footprint of llm inference. arXiv preprint
+arXiv:2505.09598, 2025.
+Yiyang Jiang, Wengyu Zhang, Xulu Zhang, Xiao-Yong Wei, Chang Wen Chen, and Qing Li.
+Prior knowledge integration via llm encoding and pseudo event regulation for video moment
+retrieval. In Proceedings of the 32nd ACM International Conference on Multimedia, MM ’24,
+pp. 7249–7258, New York, NY, USA, 2024. Association for Computing Machinery.
+ISBN
+9798400706868.
+doi: 10.1145/3664647.3681115.
+URL https://doi.org/10.1145/
+3664647.3681115.
+Uday Kamath, Kevin Keenan, Garrett Somers, and Sarah Sorenson. Llm adaptation and utilization.
+In Large Language Models: A Deep Dive: Bridging Theory and Practice, pp. 135–175. Springer,
+2024.
+James Kirkpatrick, Razvan Pascanu, Neil Rabinowitz, Joel Veness, Guillaume Desjardins, Andrei A
+Rusu, Kieran Milan, John Quan, Tiago Ramalho, Agnieszka Grabska-Barwinska, et al. Overcom-
+ing catastrophic forgetting in neural networks. Proceedings of the national academy of sciences,
+114(13):3521–3526, 2017.
+Xiang Lisa Li and Percy Liang. Prefix-tuning: Optimizing continuous prompts for generation. arXiv
+preprint arXiv:2101.00190, 2021.
+Zhizhong Li and Derek Hoiem. Learning without forgetting. IEEE transactions on pattern analysis
+and machine intelligence, 40(12):2935–2947, 2017.
+Chonghua Liao, Ruobing Xie, Xingwu Sun, Haowen Sun, and Zhanhui Kang. Exploring forgetting
+in large language model pre-training. arXiv preprint arXiv:2410.17018, 2024.
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+Xiao Liu, Kaixuan Ji, Yicheng Fu, Weng Lam Tam, Zhengxiao Du, Zhilin Yang, and Jie Tang. P-
+tuning v2: Prompt tuning can be comparable to fine-tuning universally across scales and tasks.
+arXiv preprint arXiv:2110.07602, 2021.
+David Lopez-Paz and Marc’Aurelio Ranzato. Gradient episodic memory for continual learning.
+Advances in neural information processing systems, 30, 2017.
+David A McAllester. Pac-bayesian model averaging. In Proceedings of the twelfth annual confer-
+ence on Computational learning theory, pp. 164–170, 1999.
+Nikhil Shivakumar Nayak, Krishnateja Killamsetty, Ligong Han, Abhishek Bhandwaldar, Pra-
+teek Chanda, Kai Xu, Hao Wang, Aldo Pareja, Oleg Silkin, Mustafa Eyceoz, et al.
+Sculpt-
+ing subspaces: Constrained full fine-tuning in llms for continual learning.
+arXiv preprint
+arXiv:2504.07097, 2025.
+Sneh Pillai. Replay to remember: Retaining domain knowledge in streaming language models.
+arXiv preprint arXiv:2504.17780, 2025.
+Yu-Yang Qian, Yuan-Ze Xu, Zhen-Yu Zhang, Peng Zhao, and Zhi-Hua Zhou. Treelora: Efficient
+continual learning via layer-wise loras guided by a hierarchical gradient-similarity tree. In Inter-
+national Conference on Machine Learning, pp. 50066–50085. PMLR, 2025.
+Yiwei Qin, Kaiqiang Song, Yebowen Hu, Wenlin Yao, Sangwoo Cho, Xiaoyang Wang, Xuansheng
+Wu, Fei Liu, Pengfei Liu, and Dong Yu. Infobench: Evaluating instruction following ability in
+large language models. arXiv preprint arXiv:2401.03601, 2024.
+Thomas Scialom, Tuhin Chakrabarty, and Smaranda Muresan. Fine-tuned language models are
+continual learners. In Proceedings of the 2022 Conference on Empirical Methods in Natural
+Language Processing, pp. 6107–6122, 2022.
+Chenyang Song, Xu Han, Zheni Zeng, Kuai Li, Chen Chen, Zhiyuan Liu, Maosong Sun, and Tao
+Yang. Conpet: Continual parameter-efficient tuning for large language models. arXiv preprint
+arXiv:2309.14763, 2023.
+Anushka Tiwari, Sayantan Pal, Rohini K Srihari, and Kaiyi Ji. Task-agnostic continual prompt
+tuning with gradient-based selection and decoding. arXiv preprint arXiv:2507.14725, 2025.
+Zhiyi Wan, Wanrou Du, Liang Li, Miao Pan, and Xiaoqi Qin. Budget-adaptive adapter tuning in
+orthogonal subspaces for continual learning in llms. arXiv preprint arXiv:2505.22358, 2025.
+Xiao Wang, Tianze Chen, Qiming Ge, Han Xia, Rong Bao, Rui Zheng, Qi Zhang, Tao Gui, and
+Xuan-Jing Huang.
+Orthogonal subspace learning for language model continual learning.
+In
+Findings of the Association for Computational Linguistics: EMNLP 2023, pp. 10658–10671,
+2023.
+Yifan Wang, Yafei Liu, Chufan Shi, Haoling Li, Chen Chen, Haonan Lu, and Yujiu Yang. Inscl: A
+data-efficient continual learning paradigm for fine-tuning large language models with instructions.
+In Proceedings of the 2024 Conference of the North American Chapter of the Association for
+Computational Linguistics: Human Language Technologies (Volume 1: Long Papers), pp. 663–
+677, 2024.
+Zifeng Wang, Zizhao Zhang, Chen-Yu Lee, Han Zhang, Ruoxi Sun, Xiaoqi Ren, Guolong Su, Vin-
+cent Perot, Jennifer Dy, and Tomas Pfister. Learning to prompt for continual learning. In Pro-
+ceedings of the IEEE/CVF conference on computer vision and pattern recognition, pp. 139–149,
+2022.
+Shuo Yang, Kun-Peng Ning, Yu-Yang Liu, Jia-Yu Yao, Yong-Hong Tian, Yi-Bing Song, and
+Li Yuan. Is parameter collision hindering continual learning in llms?
+In Proceedings of the
+31st International Conference on Computational Linguistics, pp. 4243–4259, 2025.
+Jiawei Yao, Chuming Li, Keqiang Sun, Yingjie Cai, Hao Li, Wanli Ouyang, and Hongsheng Li.
+Ndc-scene: Boost monocular 3d semantic scene completion in normalized device coordinates
+space. In 2023 IEEE/CVF International Conference on Computer Vision (ICCV), pp. 9421–9431.
+IEEE Computer Society, 2023.
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+Jiawei Yao, Chuming Li, and Canran Xiao. Swift sampler: Efficient learning of sampler by 10
+parameters. Advances in Neural Information Processing Systems, 37:59030–59053, 2024.
+Dmitry Yarotsky. Error bounds for approximations with deep relu networks. Neural networks, 94:
+103–114, 2017.
+Haoting Zhang, Haoxian Chen, Donglin Zhan, Hanyang Zhao, Henry Lam, Wenpin Tang, David
+Yao, and Zeyu Zheng. Socrates: Simulation optimization with correlated replicas and adaptive
+trajectory evaluations. arXiv preprint arXiv:2511.00685, 2025a.
+Xiaofeng Zhang, Fanshuo Zeng, Yihao Quan, Zheng Hui, and Jiawei Yao. Enhancing multimodal
+large language models complex reason via similarity computation. In Proceedings of the AAAI
+Conference on Artificial Intelligence, volume 39(10), pp. 10203–10211, 2025b.
+Yunkai Zhang, Donglin Zhan, Haoting Zhang, Zuo-Jun Max Shen, Zeyu Zheng, and Qing Zhu.
+Does attention in transformers help wildfire prediction? Available at SSRN 4929315, 2024.
+Weixiang Zhao, Shilong Wang, Yulin Hu, Yanyan Zhao, Bing Qin, Xuanyu Zhang, Qing Yang,
+Dongliang Xu, and Wanxiang Che. Sapt: A shared attention framework for parameter-efficient
+continual learning of large language models. In Proceedings of the 62nd Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long Papers), pp. 11641–11661, 2024.
+Derui Zhu, Dingfan Chen, Xiongfei Wu, Jiahui Geng, Zhuo Li, Jens Grossklags, and Lei Ma. Pri-
+vauditor: Benchmarking data protection vulnerabilities in llm adaptation techniques. Advances in
+Neural Information Processing Systems, 37:9668–9689, 2024.
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+A
+THEORETICAL ANALYSIS
+A.1
+EXPRESSIVITY OF A LORA-HYPERNET
+Theorem 1 (Expressivity of a LoRA-HyperNet). Let gΦ : Rd →R2dr be a one-hidden-layer ReLU
+network
+gΦ(e) = W2σ(W1e) + b,
+whose output is reshaped into (A(e), B(e)) with rank r < d. Fix a Transformer layer weight W ∈
+Rd×d and an embedding e.
+(a) Exact realisation of any rank-r adapter. For every rank-r matrix ∆⋆= B⋆A⋆there exists Φ⋆
+such that gΦ⋆(e) = (A⋆, B⋆).
+(b) Finite-width approximation. With hidden width h, one can choose Φ so that
+B(e)A(e) −∆⋆
+F ≤C(d, r)
+√
+h
+,
+where C(d, r) = O(
+√
+dr).
+(c) Full-rank oracle bound. For any full-rank update ∆full, let ∆r be its best rank-r approximation.
+Then the same Φ achieves
+B(e)A(e) −∆full
+
+F ≤∥∆full −∆r∥F + C(d,r)
+√
+h .
+Proof. Throughout we fix the embedding dimension d, target rank r < d, and hidden width h of the
+one–hidden–layer ReLU hyper-network gΦ : Rd →R2dr defined in §3.2. For an input embedding
+e ∈Rd the network outputs a vector that is reshaped into a pair
+ A(e), B(e)
+
+with shapes d × r
+and r × d respectively, which in turn induce the rank-r LoRA update ∆(e) = B(e)A(e) ∈Rd×d
+in equation 7. We prove parts (a)–(c) in order.
+(a) Exact realisation of any rank-r adapter.
+Let ∆⋆) = B⋆A⋆be an arbitrary rank-r matrix
+with factorisation A⋆∈Rd×r, B⋆∈Rr×d. Choose hidden width h ≥2dr and split the hidden
+layer into two blocks of size dr each:
+h1 = σ(W(1)
+1 e + b(1)),
+h2 = σ(W(2)
+1 e + b(2)),
+where σ(·) = ReLU(·). Set W(1)
+1
+= 0 and choose b(1) ≻0 large enough so that h1 = b(1)
+(all activations positive), then embed vec(A⋆) directly by defining b(1) = vec
+ A⋆
+. Analogously,
+encode B⋆into h2. Finally set the output weight W2 = [ Idr Idr ] and bias b = 0. Because h1, h2
+are constant given e, gΦ(e) =
+ vec(A⋆), vec(B⋆)
+
+exactly, concluding part (a).
+(b) Finite-width approximation bound.
+Let K ⊂Rd be a compact set that contains all task
+embeddings encountered during training and inference; in practice K can be chosen as the unit
+Euclidean ball since each ek is ℓ2–normalised (§3.1). Define the target mapping
+F : e 7−→∆⋆
+for a fixed ∆⋆∈Rd×d.
+Because F is constant on K it is Lipschitz with constant 0. Applying the uniform approximation
+theorem for ReLU networks on compacta (e.g. Yarotsky, 2017) yields, for every width h ∈N,
+parameters Φ such that ∥gΦ(e) −vec(∆⋆)∥∞≤C0/
+√
+h for all e ∈K, where C0 > 0 depends
+only on d and the diameter of K. Since each entry of ∆is approximated up to C0/
+√
+h, summing
+over the d2 entries gives ∥B(e)A(e) −∆⋆∥F ≤C(d, r)/
+√
+h with C(d, r) = C0
+√
+d2 = O(
+√
+dr),
+proving (b).
+Technical note. The composition (B, A) 7→BA is bilinear; the Lipschitz constant of the product
+map is upper-bounded by max{∥B∥F , ∥A∥F } ≤∥∆⋆∥F +o(1), so the preceding entry-wise bound
+propagates to the full matrix product up to the same order.
+(c) Oracle approximation of a full-rank update.
+Let ∆full ∈Rd×d be arbitrary.
+By
+Eckart–Young–Mirsky, its best rank-r approximation is ∆r = arg minrank≤r ∥∆full −∆∥F ,
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+achieved by truncating the top-r singular triplets. Applying part (b) to ∆⋆:= ∆r produces pa-
+rameters Φ such that
+∥B(e)A(e) −∆r∥F ≤C(d, r)
+√
+h
+∀e ∈K.
+Using the triangle inequality,
+∥B(e)A(e) −∆full∥F ≤∥B(e)A(e) −∆r∥F + ∥∆r −∆full∥F
+≤∥∆full −∆r∥F + C(d, r)
+√
+h
+,
+which is the desired bound in part (c).
+It is worth noting that since Meta-UCF’s task embeddings are layer-normalised and ℓ2-normalised
+(§3.1), they lie on the unit sphere Sd−1, so the compactness assumption of Theorem 1 is exactly
+satisfied in our setting.
+A.2
+PAC-BAYES GENERALISATION
+Theorem 2 (PAC-Bayes Generalisation Across a Task Stream). Consider a sequence of i.i.d. tasks
+{Tk}K
+k=1. For each task draw a support set Sk (used only to form the embedding ek) and an inde-
+pendent query set Dk = {(xi, yi)}m
+i=1. Let the empirical and true risks of a generator parameter Φ
+be
+Ltrain
+k
+(Φ) := 1
+m
+X
+(x,y)∈Dk
+ℓ
+ fΘ0,∆(ek;Φ)(x), y
+
+,
+Ltest
+k (Φ) := E(x,y)∼Tkℓ
+ fΘ0,∆(ek;Φ)(x), y
+
+,
+where ℓ∈[0, 1] is any bounded loss. Let p(Φ) be a hyper-prior and q(Φ) the posterior returned by
+Meta-UCF after observing all tasks. Then, for every δ ∈(0, 1), with probability at least 1 −δ over
+the draw of
+
+(Sk, Dk)
+	K
+k=1,
+1
+K
+K
+X
+k=1
+Ltest
+k (q) ≤
+1
+K
+K
+X
+k=1
+Ltrain
+k
+(q) +
+s
+KL(q∥p) + log 2
+δ
+2Km
+.
+Proof. Recall that each task Tk is drawn i.i.d. from an (unknown) meta-distribution τ, after which
+we independently sample
+• a support set Sk = {x(k)
+s }Sk
+s=1 ∼P Sk
+k , used only to construct the task embedding ek =e(Sk)
+via equation 2, and
+• a query set Dk = {(x(k)
+i
+, y(k)
+i
+)}m
+i=1 ∼P m
+k , on which the empirical loss is evaluated.
+Throughout the proof we fix a bounded loss ℓ: R × Y →[0, 1], a prior distribution p(Φ) over
+generator parameters, and let q(Φ) be the posterior returned by META-UCF after observing all
+tasks.
+Step 1: Flattening the task stream.
+Define the mixture distribution P over labelled examples
+(x, y) by the hierarchical process (T , x, y) ∼τ(T ) PT (x, y). Because tasks and examples are sam-
+pled i.i.d., the concatenated query sample D := D1 ∪· · · ∪DK =
+
+(xj, yj)
+	N
+j=1,
+N := K m, is
+an i.i.d. draw of size N from P. Thus the task structure can be ignored in the PAC-Bayes analysis
+(see McAllester 1999, Theorem 2).
+Step 2: Defining the stochastic classifier.
+For any parameter realisation Φ ∼q and any task em-
+bedding ek, the LoRA update is deterministically ∆(ek; Φ) via equation 7, and the corresponding
+predictor is fΘ0,∆(ek;Φ). Because ek depends only on Sk (which is independent of Dk), the con-
+ditional distribution of ℓ
+ fΘ0,∆(ek;Φ)(x), y
+
+given (x, y) ∼P is independent across all N query
+points. Therefore each random variable
+Zj(Φ) := ℓ
+ fΘ0,∆(et(j);Φ)(xj), yj
+
+∈[0, 1],
+j = 1, . . . , N,
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+is bounded and i.i.d. when (xj, yj) ∼P. Here t(j) maps the flat index j back to its task k ∈
+{1, . . . , K}.
+Step 3: Applying the canonical PAC-Bayes bound.
+Let the empirical and true risks of a distri-
+bution Q over Φ be
+bRN(Q) := 1
+N
+N
+X
+j=1
+EΦ∼QZj(Φ),
+R(Q) := E(x,y)∼P EΦ∼Qℓ
+ fΘ0,∆(e;Φ)(x), y
+
+,
+where e is the embedding constructed from an independent support set of the same task.†
+By
+McAllester’s PAC-Bayes inequality (Thm. 2 in McAllester, 1999), for any posterior Q and any
+δ ∈(0, 1), with probability at least 1 −δ over the draw of D ∼PN,
+R(Q) ≤bRN(Q) +
+s
+KL(Q∥P) + ln 2
+δ
+2N
+,
+(14)
+where P is a fixed prior and KL(·∥·) is the Kullback–Leibler divergence.
+Step 4: Mapping back to task-level notation. Observe that
+bRN(q) =
+1
+Km
+K
+X
+k=1
+m
+X
+i=1
+EΦ∼qℓ
+ fΘ0,∆(ek;Φ)(x(k)
+i
+), y(k)
+i
+
+= 1
+K
+K
+X
+k=1
+Ltrain
+k
+(q),
+and similarly R(q) =
+1
+K
+PK
+k=1 Ltest
+k
+(q). Substituting these equalities and N = Km into equa-
+tion 14 yields exactly the claimed bound:
+1
+K
+K
+X
+k=1
+Ltest
+k
+(q) ≤
+1
+K
+K
+X
+k=1
+Ltrain
+k
+(q) +
+s
+KL(q∥p) + ln 2
+δ
+2Km
+.
+Step 5: No extra KL term from LoRA factors.
+The LoRA update ∆(ek; Φ) is a deterministic
+function of the sole random variable Φ ∼q. Hence the stochastic predictor used in the loss depends
+on q only through Φ. Consequently the divergence term in equation 14 remains KL(q∥p), with no
+additional penalty for the parameter–generation mechanism, matching the bound stated in the main
+text.
+The PAC-Bayes analysis in §A.2 follows the common meta-learning assumption that tasks are drawn
+i.i.d. from a meta-distribution. This can be interpreted as an average-case justification of parameter
+sharing, showing that a single hypernetwork can have controlled average risk as K, m grow.
+A.3
+AUXILIARY LEMMAS AND COROLLARIES
+Lemma 1 (ReLU Uniform Approximation with O(h−1/2) Rate). Let K ⊂Rd be compact and
+f ⋆: K →Rp be a constant function, f ⋆(x) ≡c ∈Rp. For every hidden width h ∈N there exists a
+one–hidden–layer ReLU network gh : Rd →Rp with at most h hidden units such that
+sup
+x∈K
+gh(x) −f ⋆(x)
+
+∞
+≤
+2∥c∥∞
+√
+h
+.
+Proof. Because f ⋆is constant, we approximate each coordinate separately. Following Yarotsky
+(2017), construct gh by evenly partitioning K into h axis–aligned hyperrectangles {Rj}h
+j=1 of equal
+†Independence ensures the conditional distribution of e given (x, y) is identical across the population, a
+technical requirement for the mixture flattening in Step 1.
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+volume, and assign to each block the constant c realised by a single active ReLU neuron.‡ The
+pointwise error per block is zero; the only mismatch occurs at the h −1 internal interfaces. Because
+K has finite perimeter, the interface measure scales like O(h−1+1/d). For d ≥1 this gives the
+desired O(h−1/2) rate after optimising the partition aspect ratio; see Yarotsky (2017, Lem. 3.2) for
+details.
+Lemma 2 (Lipschitz Constant of the Bilinear Map). Define Φ: Rd×r × Rr×d →Rd×d by
+Φ(A, B) = BA. Then for all (A, B),
+∇Φ(A, B)
+
+op ≤max
+
+∥A∥F , ∥B∥F
+	
+.
+Consequently, if ∥A∥F , ∥B∥F ≤M on a set D, then Φ is M–Lipschitz over D.
+Proof. For perturbations (δA, δB) one has Φ(A + δA, B + δB) −Φ(A, B) = B δA + δB A +
+δB δA. Discarding the second–order term and using ∥XY ∥F ≤∥X∥F ∥Y ∥F yields
+∥δΦ∥F ≤∥B∥F ∥δA∥F + ∥A∥F ∥δB∥F ,
+so the operator norm of the Jacobian is bounded by max{∥A∥F , ∥B∥F }.
+Lemma 3 (Eckart–Young–Mirsky Truncation Error). Let ∆full ∈Rd×d have singular values σ1 ≥
+· · · ≥σd ≥0. Its best rank-r approximation under any unitarily invariant norm is
+∆r := arg min
+rank≤r
+∆full −Z
+
+F ,
+achieved by keeping the top-r singular triplets. Moreover, ∥∆full −∆r∥F = (P
+i>r σ2
+i )1/2.
+Proof. Classical; see Golub & Van Loan (2013, Thm. 2.4.8).
+Corollary 1 (Frobenius Error for Theorem 1 (b)). Let the settings of theorem1 hold and assume the
+generator weights are chosen via the construction in Lem 1. Then for every e ∈K
+B(e)A(e) −∆⋆
+F ≤C(d, r)
+√
+h
+,
+C(d, r) = 2
+√
+dr ∥∆⋆∥max.
+Proof. Apply Lem 1 coordinate-wise to approximate the vectorised target vec(∆⋆) ∈Rd2 with
+sup-norm error 2∥∆⋆∥max/
+√
+h, then invoke Lem 2 with M = ∥∆⋆∥F to translate coordinate error
+to matrix–level Frobenius error.
+Lemma 4 (KL Invariance under Deterministic Transforms). Let random variables Φ ∼q and
+Z = T(Φ) where T is deterministic. For any prior p on Φ and the induced prior pT on Z,
+KL
+ q ∥p
+
+= KL
+ qT ∥pT
+
+,
+where qT is the law of Z.
+Proof. Because T is deterministic, qT is the push-forward measure of q under T, i.e., qT (A) =
+q
+ T −1(A)
+
+for measurable A. Using the change-of-variables formula and the fact that T is in-
+jective almost everywhere on its image (T acts as an identity embedding in our setting), the
+Radon–Nikodym derivatives satisfy dq
+dp = dqT
+dpT ◦T, whence the integrals defining the two KL diver-
+gences coincide.
+Corollary 2 (No Extra Complexity Penalty in Theorem2). With notation of Theorem2, the stochastic
+predictor fΘ0,∆(e;Φ) induces no additional KL term beyond KL(q∥p) since ∆(e; Φ) is a determin-
+istic map of Φ; formally,
+KL
+ fΘ0,∆(e;Φ)
+
+#q ∥
+ fΘ0,∆(e;Φ)
+
+#p
+
+= KL(q∥p).
+Proof. Instantiated from Lem4 with T(Φ) = fΘ0,∆(e;Φ).
+‡A ReLU with weight vector w and bias b ≪−1 outputs a constant over any bounded set strictly on its
+positive side.
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+Algorithm 1 META-UCF CONTINUAL TRAINING
+Require: Frozen backbone Θ0; generator gΦ; task stream {Tk}K
+k=1; episodic memory M ←∅; memory
+budget Mmax; learning rate η; loss weights (λo, λc, λb); bias scale β
+1: for k = 1 to K do
+2:
+while not converged on task Tk do
+3:
+Ssup ←SAMPLEMEMORY(M) {support set: previous tasks}
+4:
+Qk ←SAMPLETASK(Tk) {query set: current task}
+5:
+esup ←LN
+
+1
+|Ssup|
+P
+x∈Ssup CLS(x; Θ0)
+
+6:
+∆←gΦ(esup)
+7:
+H ←∅{buffer for CLS states}
+8:
+Ltask ←0
+9:
+for all (x, y, g) ∈Qk do
+10:
+ˆy ←fΘ0,∆(x)
+11:
+Ltask ←Ltask + ℓ(ˆy, y)
+12:
+H ←H ∪{CLS(x; Θ0, ∆)}
+13:
+end for
+14:
+Rk ←DEMPARITYGAP(ˆy, g) { (12)}
+15:
+γ ←σ(−βRk)
+16:
+Lorth ←ORTHLOSS(H)
+17:
+Lctr ←INFONCE(esup, M)
+18:
+L ←γ Ltask + λoLorth + λcLctr + λbRk
+19:
+Φ ←Φ −η ∇ΦL
+20:
+end while
+21:
+M ←M ∪SELECTEXEMPLARS(Tk, Mmax)
+22: end for
+23: return Φ
+B
+SUPPLEMENTARY TECHNICAL DETAILS
+B.1
+PSEUDOCODE
+Algorithmic overview. Algorithm 1 details the continual-training routine used by Meta–UCF. For
+each incoming task Tk, the method first forms a task embedding from a memory-based support set
+drawn exclusively from previous tasks, by layer-normalised averaging of frozen-CLS states. This
+embedding esup conditions a shared hyper-network gΦ that instantly synthesises low-rank LoRA
+updates ∆for all transformer layers of the frozen backbone. The current task’s query batch is
+then processed once with the adapted backbone to accumulate (i) a standard prediction loss Ltask,
+(ii) an orthogonality regulariser Lorth computed from the batchwise CLS matrix to reduce inter-
+task subspace overlap, and (iii) a meta-contrastive objective Lctr that separates task embeddings
+against the memory. A bias-calibration term Rk (demographic-parity gap) gates gradients via γ =
+σ(−βRk), yielding the composite objective L = γ Ltask + λoLorth + λcLctr + λbRk. Crucially,
+only the generator parameters Φ are updated (backbone frozen), preventing parameter growth with
+the number of tasks. After convergence on Tk, a budgeted exemplar selection step augments the
+episodic memory for future conditioning.
+Inference path. Algorithm 2 shows the deployment-time procedure. Given a small support set Snew
+from an unseen task, Meta–UCF computes enew via the same layer-normalised mean pooling over
+frozen CLS features, feeds it to the trained generator gΦ to produce task-specific LoRA adapters
+∆new, and performs a single forward pass of the frozen backbone augmented with ∆new to obtain
+the prediction ˆy. This enables one-model-for-all-tasks operation with negligible memory overhead
+and no test-time optimisation.
+C
+DETAILS OF THE EXPERIMENTAL SETUP
+C.1
+BENCHMARK STATISTICS
+Notation. |Dtr| / |Dval| / |Dte| denote train / dev / test sizes after filtering. “Tok.” denotes the mean
+input length after BPE tokenisation with the Llama-3-8B vocabulary. All corpora are lower–cased
+and stripped of HTML before tokenising.
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+Algorithm 2 META-UCF INFERENCE
+Require: Frozen backbone Θ0; trained generator gΦ; support set Snew; test example x
+1: enew ←LN
+
+1
+|Snew|
+P
+x′∈Snew CLS(x′; Θ0)
+
+2: ∆new ←gΦ(enew)
+3: ˆy ←fΘ0,∆new(x)
+4: return ˆy
+Table 4: Statistics of the four task streams used in §4.
+Stream
+Dataset
+Classes
+|Dtr|
+|Dval|
+|Dte|
+Tok. (avg)
+Std-CL 5
+AG News
+4
+120 k
+7.6 k
+7.6 k
+36
+Amazon Polarity
+2
+3.60 M
+200 k
+200 k
+84
+Yelp Polarity
+2
+560 k
+38 k
+38 k
+92
+DBpedia
+14
+560 k
+70 k
+70 k
+54
+Yahoo Answers
+10
+1.40 M
+60 k
+60 k
+64
+Seq-GLUE 7
+CoLA
+2
+8.5 k
+1 k
+1 k
+32
+SST-2
+2
+67 k
+872
+1.8 k
+25
+MRPC
+2
+3.7 k
+408
+1.7 k
+58
+QQP
+2
+364 k
+40 k
+391 k
+44
+QNLI
+2
+105 k
+5.4 k
+5.4 k
+35
+RTE
+2
+2.5 k
+277
+3 k
+42
+MNLI-m/mm
+3
+393 k
+20 k
+20 k
+48
+Long-CL 15
+Std-CL 5 (all)
+—
+—
+—
+—
+—
+IMDb
+2
+25 k
+2 k
+25 k
+110
+SuperGLUE: BoolQ
+2
+9.4 k
+3.3 k
+3.3 k
+68
+SuperGLUE: CB
+3
+250
+56
+250
+70
+SuperGLUE: Copa
+2
+400
+40
+500
+41
+SuperGLUE: MultiRC
+2
+27 k
+4.5 k
+4.8 k
+172
+SuperGLUE: WiC
+2
+5.4 k
+638
+1.4 k
+16
+GLUE (rest)
+—
+see above
+(remaining tasks identical to Seq-GLUE 7; omitted for brevity)
+TRACE-8
+HotpotQA (abstr.)
+—
+90 k
+5 k
+5 k
+142
+XNLI-en
+3
+393 k
+5 k
+5 k
+50
+CodeSearch-Java
+2
+247 k
+8.7 k
+10.3 k
+154
+GSM8K-synth
+—
+76 k
+4 k
+4 k
+256
+StackOverflow
+20
+119 k
+5 k
+5 k
+60
+SciQ
+4
+11 k
+1.2 k
+824
+71
+WikiSQL
+—
+57 k
+8 k
+8 k
+116
+TyDiQA-GoldP
+—
+34 k
+875
+3 7k
+128
+Task orders.
+The orderings used in the main experiments are identical to those in Tiwari et al.
+(2025) for Std-CL 5 and Long-CL 15 v1; for Seq-GLUE 7 we follow the COLA →...→MNLI
+curriculum suggested by Qin et al. (2024). The eight tasks of TRACE-8 are ordered by increasing
+sequence length to match the mixed-domain setting of Bohao et al. (2024).
+C.2
+INSTRUCTION-FORMAT CONVERSION SCRIPTS
+All
+corpora
+are
+converted
+to
+a
+unified
+SEQ2SEQ
+template
+compatible
+with
+transformers’ AutoModelForSeq2SeqLM. Listing 1 shows the core Python rou-
+tine
+(convert to seq2seq.py)
+used
+for
+every
+dataset;
+only
+the
+dataset-specific
+build prompt() function differs.
+Listing 1: Minimal conversion script.
+1
+#!/usr/bin/env python3
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+2
+# pylint: disable=invalid-name
+3
+"""
+4
+Convert a HF dataset into the unified instruction format:
+5
+<bos> [SYS] You are a helpful assistant. [/SYS]
+6
+### Input ###
+7
+{original_text}
+8
+### Task ###
+9
+{task_description}
+10
+### Answer ###
+11
+<eos>
+12
+"""
+13
+from datasets import load_dataset, disable_caching
+14
+from pathlib import Path
+15
+import msgspec, tqdm, argparse, json
+16
+17
+disable_caching()
+18
+19
+def build_prompt(example: dict, task_name: str) -> str:
+20
+"""Task-specific prompt construction."""
+21
+# --- Example: AG News classification ------------------
+22
+return (f"[SYS] You are a helpful assistant. [/SYS]\n"
+23
+f"### Input ###\n{example[’text’]}\n"
+24
+"### Task ###\n"
+25
+f"Classify the news article into one of the four
+categories "
+26
+f"for the AG News task.\n"
+27
+"### Answer ###")
+28
+29
+def main(args):
+30
+ds = load_dataset(args.hf_name, split=args.split, cache_dir=args.
+cache)
+31
+path_out = Path(args.out).with_suffix(".msgpack")
+32
+writer = msgspec.msgpack.Encoder().encode
+33
+with path_out.open("wb") as fp:
+34
+for ex in tqdm.tqdm(ds, desc="Serialising"):
+35
+prompt = build_prompt(ex, args.hf_name)
+36
+target = ex["label"] if "label" in ex else ex["answers"
+][0]
+37
+fp.write(writer({"prompt": prompt, "target": target}))
+38
+print("Wrote", path_out)
+39
+40
+if __name__ == "__main__":
+41
+p = argparse.ArgumentParser()
+42
+p.add_argument("--hf_name", required=True)
+43
+p.add_argument("--split", default="train")
+44
+p.add_argument("--out", required=True)
+45
+p.add_argument("--cache", default="˜/.cache/hf")
+46
+main(p.parse_args())
+Tokenisation.
+After
+conversion
+we
+tokenize
+the
+prompt
+field
+with
+llama-3-8b-tokenizer==0.3.1; the label is left as plain text and compared via string
+match during evaluation.
+Integrity checks.
+We automatically discard examples whose total length exceeds the
+max seq len=512 limit or whose label is empty, leading to the slightly smaller sample counts
+in Table 4 (≈0.7 % filtered).
+C.3
+COMPUTING INFRASTRUCTURE
+Clusters. All jobs ran on an internal Slurm cluster. Most experiments fit on 1 × NVIDIA A100-
+80GB (PCIe) with a single 32-core Intel Xeon Gold 6338 CPU. LONG-CL 15 required 4
+× A100 per run (ZeRO-2, stage offload=false). No CPU-only training was per-
+formed.
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+OS & Drivers. Ubuntu 22.04.3 LTS, CUDA 12.2, cuDNN 8.9, NCCL 2.20, OpenMPI 4.1.6, Slurm
+23.02.
+Frameworks. PyTorch 2.3.0 + CUDA, Transformers 0.22.0, PEFT 0.10.0, bitsandbytes 0.44.2,
+Deepspeed 0.14.4 (for ZeRO-2), Accelerate 0.28.0.
+Mixed Precision. bfloat16 autocast for all forward passes; gradient accumulation performed in
+bfloat16 with torch.autocast.TF32 was disabled to ensure cross-GPU reproducibil-
+ity.
+Throughput. Under the default configuration (LLAMA-3-8B, rank-8 LoRA, sequence 512, batch
+64), median throughput was 285 samples · sec−1 on a single A100-80GB.
+C.4
+HYPER-PARAMETER GRID AND SELECTION CRITERIA
+Search protocol.
+For every stream we uniformly sampled 20 configurations from the Cartesian
+product in Table 5. Each configuration was trained for one epoch on the first two tasks of the
+stream; the single-epoch dev accuracy on the second task served as proxy objective.§ The top-
+3 configurations were re-run on the full stream; the best AA was selected as default. Note that
+λo, λc, λb, β, ρ share one global configuration across all streams to avoid adaptive cherry-picking (a
+priori values in bold).
+Table 5: Hyper-parameter grid (□=log-uniform).
+Parameter
+Grid Values
+Default
+Learning rate η
+□{ 2e-5, 3e-5, 5e-5 }
+3e-5
+Batch size B
+{ 32, 64, 128 }
+64
+Rank r
+{ 4, 8, 16 }
+8
+Hidden dim h (MLP)
+{ 64, 128, 256 }
+128
+Weight decay
+□{ 0.0, 0.01, 0.05 }
+0.01
+Adam β1
+fixed = 0.9
+0.9
+Adam β2
+fixed = 0.98
+0.98
+λo (orth.)
+{ 0.25, 0.5, 1.0 }
+0.5
+λc (contrastive)
+{ 0.5, 1.0, 2.0 }
+1.0
+λb (bias)
+{ 0.05, 0.1, 0.2 }
+0.1
+Bias sensitivity β
+{ 2, 4, 8 }
+4
+EMA decay ρ
+{ 0.1, 0.2, 0.4 }
+0.2
+Support size S
+{ 16, 32, 64 }
+32
+Temp. τSNR
+{ 0.05, 0.07, 0.1 }
+0.1
+Max seq. len
+{ 256, 512 }
+512
+Validation budget. Each proxy trial consumed < 3 GPU-minutes on an A100; the complete search
+per stream therefore used < 1.5 GPU-hours.
+ZeRO-2 specifics.
+On LONG-CL 15 we retained the same η, B, r, h but enabled
+deepspeed_stage2_gather_16bit_weights_on_model_save. No search over ZeRO optimiser
+knobs was performed.
+§Following Tiwari et al. (2025) we found this proxy strongly correlated (r=0.87) with full-stream AA.
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+C.5
+RANDOM SEED AND DETERMINISM SETTINGS
+Seed pool. All tables and plots report the average over { 42, 123, 2025 }. The numbers 42 / 123 follow previous
+LoRA work; 2025 marks the submission year.
+PyTorch.
+1
+import torch, random, numpy as np, os
+2
+def seed_everything(s):
+3
+random.seed(s); np.random.seed(s); torch.manual_seed(s)
+4
+torch.backends.cuda.matmul.allow_tf32 = False
+5
+torch.backends.cudnn.deterministic = True
+6
+torch.backends.cudnn.benchmark = False
+7
+seed_everything(SEED)
+Data order. HF datasets use shuffle files=false; we instead shuffle via a stateless LCG keyed by the global
+seed, ensuring identical batches across GPU replicas and re-runs.
+Gradient noise. torch.use deterministic algorithms(True) is enabled to remove nondeterministic
+baddbmm kernels; the resulting < 1% throughput hit is accounted for in Figure 6.
+Checkpoint reproducibility. Hashes of model and optimiser states are logged on every save; we verified bit-wise
+reproducibility across two independent clusters.
+The above specifications allow any reader with access to comparable hardware (≥A100-40GB) to reproduce
+META-UCF within ±0.2 pp of the reported metrics.
+D
+ADDITIONAL EXPERIMENTS AND RESULTS
+D.1
+HISTORICAL vs. CURRENT SUPPORT SETS
+At every meta-update we draw the S = 32 support examples from either (a) Historical replay memory only
+(HIST); (b) Current task only (CURR); or (c) a 50/50 Mixed blend (MIX). We sweep the buffer budget Mmax ∈
+{128, 256, 512} and report mean ± std over three seeds. Table 6 shows that relying only on current samples cuts
+accuracy by 1.8–2.3pp and increases forgetting by +2pp, especially on the longer stream. Historical exemplars
+are thus essential for stability, yet the MIX strategy recovers about 90 % of the benefit with half the buffer,
+halving extra GPU memory.
+Strategy Mmax
+Std-CL 5
+Long-CL 15
+Extra GPU MB
+AA
+FR
+AA
+FR
+HIST
+128
+84.6 ±0.10 6.8 ±0.11 69.6 ±0.15 12.4 ±0.15
+210
+HIST
+256
+85.6 ±0.08 6.2 ±0.10 70.7 ±0.11 11.5 ±0.13
+420
+HIST
+512
+85.6 ±0.07 5.9 ±0.09 70.8 ±0.12 10.9 ±0.12
+820
+MIX
+128
+84.5 ±0.12 7.0 ±0.12 69.2 ±0.16 12.8 ±0.16
+210
+MIX
+256
+84.8 ±0.10 6.8 ±0.11 69.8 ±0.13 12.0 ±0.14
+420
+MIX
+512
+85.1 ±0.10 6.0 ±0.10 70.3 ±0.12 11.4 ±0.13
+820
+CURR
+N/A
+83.4 ±0.12 8.3 ±0.13 68.1 ±0.18 14.6 ±0.17
+0
+Table 6: Effect of support provenance and buffer size. AA = Average Accuracy (%, ↑), FR =
+Forgetting Ratio (%, ↓).
+D.2
+FULL SEED-WISE SCORES
+Tables 7–8 list seed-wise Average Accuracy (AA, %) and Forgetting Ratio (FR, %) for the two most com-
+petitive methods—N-LoRA and META-UCF —across all four task streams. The boldface row reproduces the
+micro-average reported in Tables 2 and 3 of the main paper.
+Per-task AA/FR on heterogeneous streams.
+Table 9 reports per-task average accuracy (AA) and forget-
+ting rate (FR) for N-LoRA and Meta-UCF on the heterogeneous streams, together with the absolute differences
+∆AA and ∆FR (Meta-UCF – N-LoRA). We also observe consistently lower or comparable FR across tasks,
+confirming that the stream-level improvements in Table 1 are not concentrated on a single dataset or domain.
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+Table 7: Seed-wise Average Accuracy (higher = better).
+Stream
+Method
+Seed
+Mean
+42
+123
+2025
+Std-CL 5
+N-LoRA
+83.3
+83.7
+83.5
+83.5
+Meta-UCF
+85.1
+85.3
+85.6
+85.3
+Long-CL 15
+N-LoRA
+67.9
+68.5
+67.8
+68.1
+Meta-UCF
+70.2
+70.7
+70.3
+70.4
+Seq-GLUE 7
+N-LoRA
+80.0
+80.3
+80.2
+80.2
+Meta-UCF
+82.3
+82.5
+82.3
+82.4
+TRACE-8
+N-LoRA
+60.9
+61.2
+60.8
+61.0
+Meta-UCF
+63.1
+63.3
+63.1
+63.2
+Table 8: Seed-wise Forgetting Ratio (lower = better).
+Stream
+Method
+Seed
+Mean
+42
+123
+2025
+Std-CL 5
+N-LoRA
+7.0
+7.2
+7.1
+7.1
+Meta-UCF
+6.3
+6.1
+6.2
+6.2
+Long-CL 15
+N-LoRA
+12.6
+12.1
+12.5
+12.4
+Meta-UCF
+11.6
+11.4
+11.5
+11.5
+Seq-GLUE 7
+N-LoRA
+7.0
+7.3
+7.0
+7.1
+Meta-UCF
+6.4
+6.2
+6.3
+6.3
+TRACE-8
+N-LoRA
+15.6
+15.4
+15.5
+15.5
+Meta-UCF
+14.1
+14.3
+14.2
+14.2
+D.3
+CONFIDENCE INTERVALS AND SIGNIFICANCE TESTS
+95 % confidence intervals.
+For each metric we compute CI95 = ¯x ± 1.96 σ/√n, with n = 3. Table 10
+lists the intervals for the AA metric.
+Wilcoxon signed-rank tests.
+Following Tiwari et al. (2025) we compare the per-task accuracies of Meta-
+UCF against N-LoRA using a two-sided Wilcoxon test¶ (α = 0.05). Results in Table 11 show that Meta-UCF
+significantly outperforms N-LoRA on three streams and ties on SEQ-GLUE 7. All p-values are Holm-corrected
+over four comparisons.
+Table 11: Wilcoxon signed-rank p-values (Meta-UCF vs N-LoRA, AA per task).
+Stream
+p-value (↓)
+Std-CL 5
+0.031
+Long-CL 15
+0.008
+Seq-GLUE 7
+0.087
+TRACE-8
+0.012
+D.4
+PARTIAL-LAYER LORA INJECTION: ACCURACY–LATENCY TRADE-OFF
+Each configuration was run on LLAMA-3-8B with the STD-CL 5 stream; throughput is measured on a single
+A100-80G with sequence length 512 and batch 64. The baseline (“All”) inserts rank-8 LoRA into every qkv
+and MLP projection, yielding 14.2M trainable parameters. We can find that:
+• Top-Half adapters retain > 99% of baseline accuracy while halving parameter count and gaining
++8% throughput.
+• Last 8 Layers achieve the fastest inference (+11%) with a modest 0.8pp accuracy drop—useful for
+latency-critical deployments.
+• Updating only QKV weights is more parameter-efficient than Alt-Layers but offers little extra accu-
+racy, suggesting that MLP-side adaptations matter for these tasks.
+¶Paired by task, aggregated across all three seeds.
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+Table 9: Per-task AA and FR on heterogeneous streams.
+AA (%)
+FR (%)
+Stream
+Task
+N-LoRA
+Meta-UCF
+∆AA
+N-LoRA
+Meta-UCF
+∆FR
+Long-CL 15
+Task1
+67.2
+69.4
++2.2
+12.6
+11.6
+−1.0
+Long-CL 15
+Task2
+68.7
+71.5
++2.8
+12.4
+11.3
+−1.1
+Long-CL 15
+Task3
+67.8
+70.5
++2.7
+12.2
+11.2
+−1.0
+Long-CL 15
+Task4
+67.4
+69.9
++2.5
+12.5
+11.6
+−0.9
+Long-CL 15
+Task5
+68.9
+72.0
++3.1
+12.7
+11.7
+−1.0
+Long-CL 15
+Task6
+67.6
+69.8
++2.2
+12.3
+11.5
+−0.8
+Long-CL 15
+Task7
+68.1
+70.5
++2.4
+12.1
+11.2
+−0.9
+Long-CL 15
+Task8
+67.8
+70.3
++2.5
+12.3
+11.6
+−0.7
+Long-CL 15
+Task9
+68.3
+71.0
++2.7
+12.1
+11.2
+−0.9
+Long-CL 15
+Task10
+67.7
+70.1
++2.4
+12.4
+11.6
+−0.8
+Long-CL 15
+Task11
+67.0
+69.0
++2.0
+12.6
+11.7
+−0.9
+Long-CL 15
+Task12
+69.1
+72.4
++3.3
+12.5
+11.5
+−1.0
+Long-CL 15
+Task13
+68.6
+71.6
++3.0
+12.3
+11.4
+−0.9
+Long-CL 15
+Task14
+67.9
+70.5
++2.6
+12.4
+11.6
+−0.8
+Long-CL 15
+Task15
+68.8
+72.0
++3.2
+12.6
+11.8
+−0.8
+TRACE-8
+Task1
+60.7
+63.0
++2.3
+15.6
+14.3
+−1.3
+TRACE-8
+Task2
+61.2
+63.8
++2.6
+15.8
+14.4
+−1.4
+TRACE-8
+Task3
+60.5
+62.5
++2.0
+15.2
+13.9
+−1.3
+TRACE-8
+Task4
+61.0
+63.5
++2.5
+15.5
+14.1
+−1.4
+TRACE-8
+Task5
+61.4
+64.2
++2.8
+15.9
+14.5
+−1.4
+TRACE-8
+Task6
+60.8
+62.9
++2.1
+15.3
+14.0
+−1.3
+TRACE-8
+Task7
+61.3
+63.7
++2.4
+15.6
+14.3
+−1.3
+TRACE-8
+Task8
+61.1
+63.6
++2.5
+15.1
+14.1
+−1.0
+Table 10: 95 % confidence intervals (AA, %). Parenthesised numbers show ± half-width.
+Stream
+N-LoRA
+Meta-UCF
+Std-CL 5
+83.5 ±0.50
+85.3 ±0.63
+Long-CL 15
+68.1 ±0.94
+70.4 ±0.66
+Seq-GLUE 7
+80.2 ±0.38
+82.4 ±0.29
+TRACE-8
+61.0 ±0.52
+63.2 ±0.29
+Table 12: Accuracy vs. throughput for selective LoRA injection.
+Scheme
+#Params (M) ∆Params Throughput Speed-up AA(%)
+All-Layers
+14.2
+—
+285sps
+—
+85.6
+Alt-Layers
+7.1
+–50%
+301sps
++5.6%
+84.9
+Top-Half
+7.1
+–50%
+309sps
++8.4%
+84.7
+QKV-Only
+9.2
+–35%
+314sps
++10.2%
+84.4
+Last 8 Layers
+3.6
+–75%
+317sps
++11.2%
+84.4
+D.5
+ORDER-SENSITIVITY ANALYSIS
+To assess the robustness of Meta-UCF to task ordering, we evaluate Meta-UCF and N-LoRA under multiple
+alternative permutations of the benchmark streams. For Std-CL 5, we consider the canonical order (v1), a
+permuted order that swaps the Amazon and Yahoo tasks, and a fully reversed order. For Seq-GLUE 7, we
+compare the canonical curriculum against a permutation that front-loads MNLI and RTE. For Long-CL 15, we
+follow the official v1 and v2 orders released with the benchmark. For TRACE-8, we compare the canonical
+order with a random permutation of tasks. Table 13 reports the average accuracy and forgetting ratio for both
+methods.
+Across all four streams and eight alternative task orders, Meta-UCF consistently outperforms N-LoRA: AA
+gains are stable in the range of approximately +1.6 to +2.3 percentage points, while FR is reduced by about
+0.8 to 1.8 percentage points. This suggests that the advantages of Meta-UCF are not tied to a particular task
+curriculum, but persist under natural variations of the order in which tasks are presented.
+D.6
+JOINT GEOMETRY OF TASK EMBEDDINGS AND QUERY SUBSPACES
+To make the roles of Lctr and Lorth more concrete, we analyse how task-code similarity and query-subspace
+overlap are related in practice. Recall that ek is the layer-normalised, ℓ2-normalised task embedding built from
+23
+
+--- Page 24 ---
+Published as a conference paper at ICLR 2026
+Table 13: Order-sensitivity analysis for Meta-UCF and N-LoRA.
+Stream
+Order
+Method
+AA ↑
+FR ↓
+∆AA (Meta–N)
+∆FR (Meta–N)
+Std-CL 5
+canonical (v1)
+N-LoRA
+83.5
+7.1
+–
+–
+Meta-UCF
+85.6
+6.2
++2.1
+-0.9
+Std-CL 5
+permuted (Amazon↔Yahoo)
+N-LoRA
+83.3
+7.6
+–
+–
+Meta-UCF
+84.9
+6.0
++1.6
+-1.6
+Std-CL 5
+reversed
+N-LoRA
+83.1
+7.4
+–
+–
+Meta-UCF
+84.7
+6.4
++1.6
+-1.0
+Seq-GLUE 7
+canonical
+N-LoRA
+80.2
+7.1
+–
+–
+Meta-UCF
+82.7
+6.3
++2.5
+-0.8
+Seq-GLUE 7
+permuted (MNLI/RTE front)
+N-LoRA
+80.0
+7.4
+–
+–
+Meta-UCF
+82.1
+6.6
++2.1
+-0.8
+Long-CL 15
+canonical (v1)
+N-LoRA
+68.1
+12.4
+–
+–
+Meta-UCF
+70.7
+11.5
++2.6
+-0.9
+Long-CL 15
+official v2
+N-LoRA
+67.9
+12.7
+–
+–
+Meta-UCF
+70.1
+10.9
++2.2
+-1.8
+TRACE-8
+canonical
+N-LoRA
+61.0
+15.5
+–
+–
+Meta-UCF
+63.4
+14.2
++2.4
+-1.3
+TRACE-8
+random permutation
+N-LoRA
+60.8
+15.9
+–
+–
+Meta-UCF
+63.0
+14.5
++2.2
+-1.4
+0.00
+0.05
+0.10
+0.15
+0.20
+0.25
+|cos(ei, ej)| (task-code similarity)
+0.15
+0.20
+0.25
+0.30
+ij (query subspace overlap)
+AG Amazon
+AG Yelp
+AG DBpedia
+AG Yahoo
+Amazon Yelp
+Amazon DBpedia
+Amazon Yahoo
+Yelp DBpedia
+Yelp Yahoo
+DBpedia Yahoo
+Last-CLS ablation ( =0.66)
+Meta-UCF ( =0.78)
+Figure 6: Joint geometry of task codes and query subspaces on STD-CL 5. Each point corresponds
+to a task pair (i, j), plotting task-code similarity | cos(ei, ej)| on the x-axis and query-subspace
+overlap Ωij on the y-axis.
+the support set (§3.1), and Hk ∈R|Qk|×d stacks the adapted CLS states on the query set (§3.3). For each task
+pair (i, j) on STD-CL 5, we compute:
+• the absolute task-code similarity | cos θij| := |⟨ei, ej⟩|,
+• the query-subspace overlap Ωij =
+1
+|Qi||Qj| ∥H⊤
+i Hj∥F .
+We report these statistics for both the Last-CLS ablation (where ek is a single frozen CLS vector) and Meta-
+UCF.
+Observations. On STD-CL 5, the Last-CLS ablation yields task-code similarities in the range | cos(ei, ej)| ∈
+[0.14, 0.24] and overlaps Ωij ∈[0.25, 0.31], with a moderate correlation ρ ≈0.66 between the two. Under
+Meta-UCF, task codes are substantially more dispersed on the unit sphere: most pairs have | cos(ei, ej)|<0.06,
+while query overlaps drop to Ωij ∈[0.11, 0.19]. The correlation between | cos(ei, ej)| and Ωij remains
+only moderately strong (ρ ≈0.78) and far from deterministic: several pairs exhibit very small task-code
+similarity (| cos(ei, ej)| ≈0.02) but still show noticeable overlap (Ωij ≈0.15). This empirically supports
+the design choice that Lctr and Lorth are not redundant: Lctr shapes the input geometry of task codes fed to the
+generator, while Lorth directly regularises the output geometry of adapted query representations to curb residual
+interference.
+24
+
+--- Page 25 ---
+Published as a conference paper at ICLR 2026
+E
+LLM USAGE
+We used a large language model for minor English editing (grammar/wording/clarity) and small, localized code
+fixes (e.g., resolving syntax errors, adding missing imports). The LLM did not contribute to research ideation,
+experimental design, data processing, analysis, or figure generation. All technical content and results were
+produced and verified by the authors, who take full responsibility for the manuscript.
+25

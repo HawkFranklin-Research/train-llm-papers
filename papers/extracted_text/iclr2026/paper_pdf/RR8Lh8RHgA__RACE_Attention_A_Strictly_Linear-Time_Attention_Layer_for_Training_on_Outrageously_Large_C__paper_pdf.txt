@@ -1,0 +1,2442 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+RACE ATTENTION: A STRICTLY LINEAR-TIME AT-
+TENTION LAYER FOR TRAINING ON OUTRAGEOUSLY
+LARGE CONTEXTS
+Sahil Joshi
+Agniva Chowdhury
+Amar Kanakamedala
+Ekam Singh
+Evan Tu
+Anshumali Shrivastava
+Department of Computer Science
+Rice University
+Houston, TX 77005, USA
+{sj157,ac508,ask20,es100,et62,as143}@rice.edu
+ABSTRACT
+Softmax Attention has a quadratic time complexity in sequence length, which
+becomes prohibitive to run at long contexts, even with highly optimized GPU ker-
+nels. For example, FlashAttention-2/3 (exact, GPU-optimized implementations
+of Softmax Attention) cannot complete a single forward–backward pass of a sin-
+gle attention layer once the context exceeds ∼4 million tokens on an NVIDIA
+GH200 (96 GB). We introduce Repeated Arrays-of-Count Estimators (RACE)
+Attention, a kernel-inspired alternative to Softmax Attention that is strictly lin-
+ear in sequence length and embedding size. RACE Attention replaces the ex-
+ponential kernel with a sharpened angular similarity, and approximates atten-
+tion outputs via Gaussian random projections and soft Locality-Sensitive Hash-
+ing (LSH), avoiding construction of the full attention matrix. Across language
+modeling, masked language modeling, and text/image classification, RACE At-
+tention matches or outperforms strong baselines up to 64K sequence length while
+reducing wall-clock time and memory usage. In addition, we conduct a con-
+trolled scaling study on a single attention layer and demonstrate processing of
+up to 12 million tokens on an NVIDIA GH200 GPU and 75 million tokens on
+an Intel Xeon® Gold 5220R CPU in a single forward–backward pass, which
+is well beyond the capabilities of current state-of-the-art attention implementa-
+tions. RACE Attention thus offers a practical and theoretically grounded mech-
+anism for long-context training on today’s hardware.
+We release our code at
+https://github.com/sahiljoshi515/RACE_Attention.
+1
+INTRODUCTION
+The Transformer (Vaswani et al., 2017; Dehghani et al., 2019) is the backbone of modern sequence
+modeling across language, vision (Parmar et al., 2018), and speech (Luo et al., 2020). We have seen
+remarkable improvements over the past few years in reasoning and understanding capabilities. Most
+of these are attributed to the increased parameters of the transformers along with the capability to
+process longer context windows than before. All this progress, however, rests on a computationally
+expensive primitive: Softmax Attention, whose time scales quadratically with context length. As
+models and contexts grow, spanning multi-document reasoning, long-form code, audio, and video,
+the quadratic barrier increasingly dictates who can train and deploy capable systems. Industrial
+labs mitigate the cost with large-scale distributed hardware; most practitioners cannot. There is a
+growing need for attention mechanisms that are accurate, fast, and memory-efficient. To highlight
+the limits of Softmax Attention: even with FlashAttention-2/3 (Dao, 2024; Shah et al., 2024), the
+state-of-the-art GPU implementations, a single forward–backward pass of a single attention layer
+(1 batch, 4 heads, 128 embedding size) remains computationally and memory intensive and cannot
+process sequences beyond ∼4 million tokens on an NVIDIA GH200 (96 GB) GPU. Clearly, to
+achieve an outrageously long context where the target context size is hundreds of millions of tokens
+or beyond, fundamental rethinking of attention (Bahdanau et al., 2014) will be required.
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+Figure 1: This figure demonstrates the difference between the linear complexity of RACE Attention
+and the quadratic complexity of Softmax Attention. Specifically, we highlight how the final repre-
+sentation o5 is computed under Softmax versus RACE. In Softmax, the entire fifth column of the
+attention score matrix is required. In contrast, RACE does not require the full matrix; instead, it
+aggregates statistics within LSH-mapped buckets, utilizing the appropriate collision probability α to
+compute o5.
+Linearized and Low-Rank Approximations to Quadratic Attention: Due to the significance of
+the problem, a very large body of work attempts to accelerate attention by approximating softmax
+with linear approximations (Zeng et al., 2021) or clever kernel feature maps (Katharopoulos et al.,
+2020; Choromanski et al., 2021; Peng et al., 2021; Qin et al., 2022). A work more closely re-
+lated to ours is YOSO Attention (Zeng et al., 2021), which also approximates a powered angular
+kernel using hard LSH. Despite this same kernel formulation, the underlying estimators differ sub-
+stantially. RACE Attention leverages a smooth, differentiable relaxation of classical RACE-based
+hashing (Coleman & Shrivastava, 2020) to approximate the powered angular kernel. More impor-
+tantly, YOSO lacks formal theoretical guarantees on its approximation quality and a mechanism
+that enables causal language modeling. RACE addresses both of these limitations: Sections 3.2
+and 3.3 develop a theoretically grounded estimator with quantifiable approximation error, and Al-
+gorithm 2 presents a practical attention mechanism that naturally supports causal settings. We defer
+an in depth comparison between RACE and YOSO to Section 3.1. Two notable lines of work in
+the direction of linearly approximating attention are Linear Attention (Katharopoulos et al., 2020)
+and Performer (Choromanski et al., 2021). Linear Attention replaces the softmax similarity with a
+simple positive kernel via a feature map, e.g. ϕ(x) = elu(x) + 1. This lets the attention be re-
+ordered into associative sums, achieving linear computation. Although such a kernel trick reduces
+computational complexity, it often degrades accuracy, as clearly demonstrated by our experiments
+in Section 4. Performer takes a different approach and cleverly leverages the classical idea of ap-
+proximating the exponential of an inner product using Random Fourier Features (Rahimi & Recht,
+2007). However, this strategy comes with its own drawbacks. In particular, the method incurs a
+time complexity that is quadratic in the embedding size, which offsets many of the intended compu-
+tational savings. Furthermore, it is well established that approximations based on Random Fourier
+Features require high-dimensional representations to achieve satisfactory accuracy (Backurs et al.,
+2017). Our experimental results in fig. 4 reinforce this limitation by showing that these methods
+exhibit poor scalability in practice.
+Another category of work replaces the full N × N attention matrix with a low-rank surrogate.
+Some methods learn length-wise projections for keys/values (e.g., Linformer), while others use
+Nystr¨om landmarks to approximate Softmax Attention matrix with a rank-k decomposition (e.g.,
+Nystr¨omformer). These approaches reduce the leading cost from O(N 2d) to O(Nkd), at the cost
+of choosing (and occasionally increasing) k to maintain accuracy (Wang et al., 2020; Xiong et al.,
+2021). Moreover, these methods provide no support for autoregressive tasks. As shown in Section 4,
+our method outperforms Linformer in accuracy despite Linformer having 13% more parameters than
+the other methods. Beyond the empirical shortcomings, a deeper conceptual issue persists: existing
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+approximation approaches lack a rigorous mathematical framework to characterize the trade-offs be-
+tween efficiency and accuracy. For example, while Performer provides strong kernel-approximation
+guarantees, a general framework connecting efficiency knobs (e.g., feature count m) to downstream
+accuracy remains limited, and strong accuracy frequently entails large m in practice. As a result,
+design decisions often appear ad hoc and fragile, leaving methods vulnerable to instability between
+tasks and settings. Taken together, these limitations explain why, despite the abundance of approxi-
+mations, Softmax Attention continues to remain the most widely adopted and reliable formulation.
+Sparsity is Complementary: We note that there is also a popular line of work (Beltagy et al.,
+2020; Zaheer et al., 2020; Kitaev et al., 2020; Han et al., 2024; Petrick et al., 2022) that exploits
+structural information in natural language, with sparsity in attention being among the most widely
+studied. These approaches are complementary to our proposal, which focus on making the attention
+mechanism itself more efficient and mathematically grounded. In principle, our method can be inte-
+grated with structural priors such as sparsity to further improve scalability and accuracy. However,
+since our objective in this paper is to develop fundamentally efficient attention, we will not discuss
+this line of structural approaches further, instead we view combining them with our method as an
+important direction for future work.
+Key Idea: Standard attention relies on the well-known softmax function, computing
+O = softmax
+
+QK⊤
+√
+d
+
+V ,
+(1)
+where the softmax is applied row-wise so that attention weights are nonnegative and sum to one.
+In this paper, we leverage an alternative to the softmax—namely, a higher-degree monomial of an
+angular kernel based on cosine geometry:
+O =
+
+1 −
+cos−1(QK⊤)
+π
+γ
+V
+(2)
+Eq. 2 should be read as an informal analogue to Eq. 1, where the angular kernel replaces the expo-
+nential. A more precise definition, with explicit cosine normalization and row-wise normalization,
+is given in Section 3.1. We argue that, for sufficiently large values of γ, this formulation closely
+mimics the behavior of softmax and refer to it as Angular Attention in the subsequent sections.
+Importantly, it admits a linear-time approximation algorithm. In particular, we leverage the connec-
+tion (Section 2.2) between Repeated Arrays-of-Count Estimators (RACE) (Coleman & Shrivastava,
+2020; Luo & Shrivastava, 2018) and the angular kernel to design our algorithm in Section 3.2. We
+therefore refer to our proposed method as RACE Attention.
+RACE Attention is a drop-in replacement for Softmax Attention. We evaluate it in Transformers on
+causal language modeling, masked language modeling, and text/image classification (Section 4 and
+Appendix A.2). By reframing similarity around a powered angular kernel and using differentiable
+LSH-based sketches, it provides a principled alternative that supports very long contexts on com-
+modity hardware. The sketching view keeps constant factors small: each query mixes with only a
+fixed bank of S = LR bucket summaries rather than all N keys. Since we never materialize the
+full attention matrix, the working set stays compact and activation memory drops, enabling much
+longer sequences with reduced latency. In contrast, FlashAttention-2/3 (Dao, 2024; Shah et al.,
+2024) reduce the memory footprint of attention via tiling, but still require computing all key-query
+interactions, preventing processing of much longer sequences at comparable speed, as shown in
+fig. 4. In addition to our novel findings about RACE Attention and rigorous supporting experimental
+evidence, we provide the following:
+I. Long-context scaling: RACE scales to sequence lengths far beyond prior attention mechanisms,
+processing up to 75M tokens on CPU and 12M tokens on GPU in a single forward–backward pass
+of a single attention layer, using the same hyperparameters as in our accuracy evaluations.
+II. Trainable RACE: We introduce a differentiable sketch by replacing hard hashing with smooth
+soft assignments over hypercube corners, enabling end-to-end training.
+III. CPU/GPU pre-training: Our approach supports both causal (autoregressive) and non-causal
+(bidirectional) pre-training on CPU and GPU, with custom OpenMP/CUDA kernels that compute
+causal prefix operations in a single streaming pass for linear-time, memory-efficient training.
+IV. Theoretical Insights: Section 3.3 establishes approximation guarantees based on the LSH
+framework and analyzes how the parameters L (number of hash tables) and R (buckets per table)
+govern the variance–accuracy tradeoff.
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+2
+BACKGROUND
+2.1
+LOCALITY-SENSITIVE HASHING (LSH)
+An LSH family H for a similarity Sim makes near pairs collide more often than far pairs. Formally,
+H is (S0, cS0, p1, p2)-sensitive if for all x, y ∈RD,
+(
+Sim(x, y) ≥S0 ⇒Prh∼H[h(x) = h(y)] ≥p1,
+Sim(x, y) ≤cS0 ⇒Prh∼H[h(x) = h(y)] ≤p2,
+where p1 > p2 and c < 1. Such families enable sublinear-time approximate nearest-neighbor data
+structures. A convenient sufficient condition, satisfied by SimHash and WTA (Charikar, 2002; Yag-
+nik et al., 2011; Chen & Shrivastava, 2018), is that the collision probability is a monotone function
+of similarity, Prh∼H[h(x) = h(y)] = f(Sim(x, y)) with f increasing.
+2.2
+RACE SKETCH
+RACE (Coleman & Shrivastava, 2020; Coleman et al., 2020) shows that any similarity expressible
+as a (non-negative) linear combination of LSH collision kernels can be sketched using ACE-style
+estimation (Luo & Shrivastava, 2018). It provides an unbiased estimator of kernel-density sums for
+LSH collision kernels and their powers. In particular, RACE estimates P
+x∈D k(x, q)p by hashing
+items into counters and reading the counters addressed by the query; averaging across L independent
+rows reduces variance.
+Lemma 1 (Theorem 1 of (Coleman & Shrivastava, 2020)). Given a dataset D, an LSH family H
+with finite range [1, R] and a parameter p, construct an LSH function h(x) →[1, Rp] by concate-
+nating p independent hashes from H. Let A be an ACE array constructed using h(x). Then for any
+query q,
+E
+
+A[h(q)]
+
+=
+X
+x∈D
+k(x, q)p
+3
+INTRODUCING RACE ATTENTION
+Algorithm 1 RACE Attention (non-causal)
+Input: Q, K, V ∈RN×d; number of hash tables L; number of hyperplanes P; temperature β > 0.
+Output: bO ∈RN×d.
+1: for ℓ= 1, . . . , L do
+2:
+Draw W (ℓ) ∈RP ×d with rows w(ℓ)
+p
+i.i.d.
+∼N(0, Id).
+3:
+Define the corner set V = {±1}P (R = 2P ) with vr ∈{±1}P .
+4:
+Build Φ(ℓ)
+Q , Φ(ℓ)
+K ∈RN×R with rows
+[ϕ(ℓ)(x)]r =
+exp{β (tanh(W (ℓ)x))⊤vr}
+P
+r′ exp{β (tanh(W (ℓ)x))⊤vr′},
+x ∈{Qi, Kj}
+5:
+Per-table bucket statistics:
+A(ℓ) = (Φ(ℓ)
+K )⊤1N ∈RR,
+B(ℓ) = (Φ(ℓ)
+K )⊤V ∈RR×d.
+6: end for
+7: Compute average across tables: Num =
+1
+L
+PL
+ℓ=1 Φ(ℓ)
+Q B(ℓ) and Den =
+1
+L
+PL
+ℓ=1 Φ(ℓ)
+Q A(ℓ).
+8: Return bO ←diag(Den)−1 Num
+3.1
+SOFTMAX-LIKE SIMILARITIES THAT ADMIT LINEAR-TIME ESTIMATION
+Given a sequence of N
+tokens,
+a Transformer produces for each position i a query
+Qi
+∈
+Rd,
+and for every position j a key Kj
+∈
+Rd and a value Vj
+∈
+Rd.
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+Figure 3: Comparison of Softmax and Angular kernels at different sharpening levels γ. As γ (non-
+linearity) increases, Angular transitions from flat similarity scores to a sharper distribution, recover-
+ing behavior similar to the exponential in Softmax.
+Figure 2: Frobenius error between An-
+gular and Softmax Attention vs. γ.
+The output at position i is a weighted sum of the values,
+where the weight on Vj reflects the relevance of token j
+to token i. In the standard formulation (Vaswani et al.,
+2017), relevance is computed via the scaled dot product
+given by Eq. 1. This choice guarantees two useful prop-
+erties of the attention weights: (i) non-negativity and (ii)
+they sum to one, so Oi is a convex combination of the
+values. Equally important, the exponential introduces a
+strong non-linear mapping from similarity scores to atten-
+tion weights, amplifying small score differences. This ob-
+servation suggests a broader view: attention weights can
+be derived from any normalized highly non-linear (expo-
+nential like) similarity function. Let sim : Rd × Rd →
+R≥0 be any non-negative similarity function. We can de-
+fine normalized similarity attention as
+Oi =
+PN
+j=1 sim(Qi, Kj) Vj
+PN
+j=1 sim(Qi, Kj)
+(3)
+Our quest is for finding non-linear (softmax-like) similarity kernels that admit accurate linear-time
+estimation, eliminating the quadratic cost of attention in both training and inference. Similar to
+YOSO (Zeng et al., 2021), we argue that a good starting point is a well known LSHable (Coleman &
+Shrivastava, 2020; Choromanski et al., 2017) angular similarity. It is well behaved and normalized,
+in particular, it depends only on the angle between the vectors Qi and Kj and is invariant to their
+norms: sim(Qi, Kj) = 1−cos−1
+Q⊤
+i Kj
+∥Qi∥∥Kj∥
+
+/π. However, unlike exponential in softmax, the raw
+angular kernel is relatively flat near high similarity values, reducing its ability to sharply discriminate
+between nearly aligned vectors. To increase contrast, we propose to exponentiate the angular kernel
+with a sharpening parameter γ, which accentuates differences among highly similar pairs. After
+sharpening the kernel, the similarity function becomes as follows:
+sim(Qi, Kj) =
+
+1 −cos−1
+
+Q⊤
+i Kj
+∥Qi∥∥Kj∥
+
+/π
+γ
+(4)
+In fig. 3, we show that for sufficiently large γ, the angular kernel becomes almost indistinguishable
+from softmax kernel. This is expected because a higher degree monomial like x12 behaves similarly
+to an exponential. Furthermore, in fig. 2 we plot the frobenius error between Angular and Softmax
+Attention. The error sharply decreases as γ increases, demonstrating that softmax-level sharpness
+can be achieved with modest polynomial degree (e.g., γ = 8).
+In its current form, evaluating the attention with similarity given by Eq. 4 is no different from soft-
+max. It naively still requires all N 2 query-key interactions. Fortunately, any constant exponentiation
+of angular kernel, belongs to a family, that admits efficient kernel density estimation using RACE
+sketches (Coleman & Shrivastava, 2020), and we use these sketches to approximate the kernel in
+linear time obtaining an algorithmically efficient alternative to Softmax Attention!
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+Finally, as outlined in Section 1, YOSO (Zeng et al., 2021) and our method operate on the same
+kernel in Eq. 4, but differ fundamentally in how attention is computed. YOSO employs hard LSH to
+generate Bernoulli collision indicators, yielding an unbiased estimator of the unnormalized attention
+numerator PN
+j=1 sim(Qi, Kj)Vj in Eq. 3. It then applies a post-hoc ℓ2 normalization, which does
+not correspond to standard attention normalization. Since this hard formulation is non-differentiable,
+YOSO relies on surrogate lower-bound gradients derived from additional Bernoulli samples rather
+than directly differentiating the kernel. This introduces quadratic complexity in the embedding
+dimension d, resulting in poor scalability during end-to-end training (see fig. 5c). To see how RACE
+constructs a smooth, differentiable LSH-based estimator that is linear in d in contrast to YOSO, refer
+to Section 3.2.
+3.2
+THE FINAL ALGORITHM
+At a high level, RACE avoids explicitly approximating the N×N attention matrix, which would
+otherwise remain quadratic. Instead, RACE sketches the sufficient statistics needed to compute
+attention outputs directly in linear time. Fig. 1 illustrates this difference using o5, the output em-
+bedding of token 5. In Softmax Attention, computing o5 requires the full attention column, whereas
+RACE softly assigns queries and keys (Qs and Ks) into R LSH-indexed bucket summaries under the
+same LSH scheme. The values are weighted by the key probabilities and then combined with the
+query probabilities. Averaging over L independent hash tables further reduces variance, following
+standard sketching practice. Comprehensive visualizations are provided in Appendix (figs. 7, 8).
+We next formalize the RACE Attention mechanism in Algorithm 1. As described in Section 2.2,
+one final technical hurdle remains: the RACE algorithm is non-differentiable. We get around the
+non-differentiability of RACE sketches by replacing discrete bucket assignments with soft proba-
+bilities and using standard cross-entropy loss, preserving differentiability for end-to-end training.
+Algorithm 1 consists of three key stages: (i) Soft bucketization: Each query/key x ∈Rd is ran-
+domly projected via W (ℓ) hyperplanes and softly assigned to R = 2P corners with distribution
+ϕ(ℓ)(x) (steps 2–4), (ii) Bucket aggregation: For each table ℓ, we form per-bucket statistics by
+accumulating key weights and their weighted values, namely the mass vector A(ℓ) ∈RR and the
+value-sum matrix B(ℓ) ∈RR×d, so that A(ℓ)[r] is the total (soft) mass in bucket r and B(ℓ)[r, :]
+is the corresponding sum of values. (step 5), (iii) Global normalization: The algorithm averages
+across L tables to form Num =
+1
+L
+P
+ℓΦ(ℓ)
+Q B(ℓ) and Den =
+1
+L
+P
+ℓΦ(ℓ)
+Q A(ℓ), and reconstructs the
+final outputs as bO = diag(Den)−1 Num (steps 7–8).
+A useful way to interpret Algorithm 1 is through the kernel perspective introduced in Section 2.2.
+In classical RACE (Coleman & Shrivastava, 2020), P random hyperplanes generate a hash h(x) =
+sign(W (ℓ)x), and two vectors collide under this hash with probability Pr[h(Qi) = h(Kj)] = Sij :=
+sim(Qi, Kj), which is exactly the P-powered angular kernel in Eq. 4 with γ = P. In soft RACE,
+we keep this geometric structure intact, but replace the hard sign map with a smooth approxima-
+tion: we compute a “soft” sign vector tanh(W (ℓ)x) and evaluate its alignment with each of the
+R = 2P corner sign patterns vr ∈{±1}P , assigning x to buckets with nonzero probability via a
+softmax over these alignments. This turns the discrete collision event of classical RACE into a dif-
+ferentiable quantity while preserving its underlying angular dependence. In particular, vectors with
+small angular distance still assign most of their mass to the same buckets, mirroring the behavior
+of the P-powered angular kernel. As a result, the per-table quantity ϕ(ℓ)(Qi)⊤ϕ(ℓ)(Kj) serves as
+a smooth approximation to the P-powered angular similarity that our attention mechanism seeks
+to approximate. We formalize these kernel quantities in the Section 3.3, where the RACE-based
+approximation bSij is introduced.
+Computational Complexity: The per-table runtime of Algorithm 1 can be decomposed according
+to its main steps: Step 2 (random projections) costs O(NdP), Step 3 (logits over R = 2P corners)
+costs O(NPR), and Step 5 (bucket aggregation) costs O(NRd). The global accumulation in Step 7
+adds O(NRd) per table. Thus, the per-table runtime is O(NdP + NPR + NRd) = O(NRd),
+with memory O(NR + Rd). Across L tables, this becomes O(LNRd) time and O(L(NR + Rd))
+space. Compared to FlashAttention-2/3’s O(N 2d) time and O(Nd) space, RACE is more efficient
+since R, L ≪N and R, L ≪d, even for moderate N and d.
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+3.3
+THEORETICAL ANALYSIS OF ALGORITHM 1
+Algorithm 1 is presented in terms of random projections, soft bucketization, and per-bucket aggre-
+gation. For analysis it is easier to take a kernel approximation view of attention. Each hash table
+ℓ= 1, . . . , L induces a randomized feature map ϕ(ℓ) : Rd →RR, where R = 2P is the number of
+hypercube corners, and defines the approximate kernel bS(ℓ)
+ij =
+ ϕ(ℓ)(Qi)
+⊤ϕ(ℓ)(Kj). Then, averag-
+ing across L independent tables yields bS = 1
+L
+PL
+ℓ=1 bS(ℓ). This view places soft RACE Attention in
+the language of kernel methods: it replaces the angular kernel (γ = P) in Eq. 4 with the random-
+ized sketch bS based on LSH-style features. Since ϕ(ℓ)(x) is a softmax distribution, the approximate
+kernel bS inherits concentration properties from the underlying random Gaussian projections. This
+allows us to analyze its deviation from the target angular kernel using standard tools from random-
+ized numerical linear algebra (RandNLA) (Tropp, 2015). Our analysis requires the following two
+mild assumptions on the target kernel S:
+(A1) Row sums of S are bounded away from zero i.e., smin := mini(S1)i ≥C1N for some con-
+stant C1 > 0, which ensures stable normalization in attention.
+(A2) Spectral norm of S is bounded i.e., ∥S∥2 ≤C2N, which follows from Sij ∈[0, 1].
+Several comments are necessary to better understand the above structural conditions. Condition
+(A1) rules out degenerate cases where a query has vanishing similarity with all keys, which would
+make the row-normalization in attention unstable. In practice this assumption is mild: with learned
+representations, attention rows rarely collapse to near-zero mass, so requiring smin ≥C1N simply
+rules out degenerate cases where a query is effectively isolated (assigns negligible weight to almost
+all keys). Condition (A2) is even less restrictive: since Sij ∈[0, 1], the worst case is attained by
+the all-ones matrix JN, whose spectral norm is exactly ∥JN∥2 = N. Thus bounding ∥S∥2 ≤C2N
+merely rules out pathological growth beyond this trivial maximum, and is always satisfied with
+C2 = 1. We are now ready to state our main quality-of-approximation result:
+Theorem 2. Let Q, K, V ∈RN×d be the query, key, and value matrices. For parameters L, P, and
+β, and under conditions (A1) and (A2), the estimator bO produced by Algorithm 1 satisfies
+∥bO −O∥rms = O
+
+P
+β +
+q
+log(N/δ)
+L
+
+∥V ∥F
+with probability at least 1−δ. Here, O ∈RN×d with the ith row Oi is defined using Eqs. equation 3
+and equation 4 with γ = P, and ∥bO −O∥rms :=
+q
+1
+N
+PN
+i=1 ∥bOi −Oi∥2
+2 denotes per-token root-
+mean-square (RMS) error between O and bO.
+The bound decomposes into a bias term O(P/β) and a variance term O(
+p
+log(N/δ)/L). Larger β
+reduces the bias, while increasing L reduces the variance. The dependence on P arises because pow-
+ering the angular kernel by P makes collisions sharper, but soft bucketization (finite β) smooths out
+these decisions and introduces an additional bias. To keep this bias small, β should be scaled with P.
+In particular, as β, L →∞, the approximation error vanishes. In fact, taking L = Θ(log N) prevents
+the variance from exploding. Together, this kernel reinterpretation provides a precise RandNLA lens
+for analyzing RACE Attention, with L, P, and β jointly governing its accuracy-efficiency trade-offs.
+The proof of Theorem 2, together with all intermediate lemmas, is deferred to Appendix B due to
+space constraints.
+Remark (Causal masking): Our language modeling experiments (Tables 4 and 8) use causal RACE
+Attention, implemented efficiently in OpenMP/CUDA (Algorithm 2). Our theory, however, covers
+only the non-causal setting. Extending Theorem 2’s bias-variance guarantees to the causal case re-
+mains an open problem, since the cumulative-sum constraint interacts non-trivially with the random-
+feature construction. A rigorous causal analysis is a key direction for future work.
+4
+EXPERIMENTS
+To ensure comparability and avoid cherry-picking, we adopt the standard evaluation suites used
+in prior efficient-attention work—Linear Attention, Linformer, and Random Feature Attention
+(RFA) (Katharopoulos et al., 2020; Wang et al., 2020; Peng et al., 2021). We evaluate text clas-
+sification on QNLI, SST-2, IMDB, Yahoo, and Arxiv (Rajpurkar et al., 2016; Socher et al., 2013;
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+Table 1: Long-context classification performance on a 40GB A100 GPU. Train/Test denote per-
+epoch runtimes in seconds, and Acc. denotes accuracy.
+Arxiv Long-Document Classification
+16K
+32K
+64K
+Method
+Train ↓
+Test ↓
+Acc. ↑
+Train ↓
+Test ↓
+Acc. ↑
+Train ↓
+Test ↓
+Acc. ↑
+RACE (P=2,L=2)
+80.5s
+3.9s
+70.3%
+282s
+15s
+89.4%
+561s
+22s
+97.14%
+RACE (P=3,L=3)
+82.4s
+4.0s
+71.3%
+289s
+15.6s
+90.6%
+584s
+22.5s
+97.92%
+RACE (P=4,L=4)
+84.7s
+4.1s
+70.8%
+300s
+16s
+91.1%
+594s
+22.9s
+97.4%
+Linear
+83.8s
+4.0s
+67.9%
+286s
+15.9s
+87.3%
+591s
+22.8s
+96.35%
+Linformer-128
+86s
+3.2s
+64.1%
+296s
+10.7s
+87.5%
+616s
+15.2s
+97.4%
+Performer-256
+128s
+5.8s
+68.9%
+449s
+24.6s
+86.5%
+952s
+35s
+96.61%
+FlashAttention2
+95.7s
+3.7s
+69.8%
+471s
+20s
+89.7%
+1645s
+47s
+97%
+Table 2: Comparison of attention methods across
+diverse tasks.
+Method
+CIFAR-10 @1024
+QNLI @2048
+Tiny Stories @1024
+Acc. (%) ↑
+Acc. (%) ↑
+PPL ↓
+RACE (P=2, L=2)
+63.7
+60.7
+4.2
+RACE (P=3, L=3)
+62.5
+60.7
+3.2
+RACE (P=4, L=4)
+65.9
+61.1
+2.6
+Linear
+60.0
+60.7
+7.0
+Linformer-128
+63.7
+60.6
+3.7
+FlashAttention2
+61.44
+61.1
+2.7
+Angular (γ=8)
+61.69
+61.7
+2.5
+Performer-256
+64.9
+61.0
+10.0
+Sigmoid
+57.2
+61.1
+3.7
+Table 3: Food-101 @ 16K (Image
+Classification)
+Method
+Train ↓
+Test ↓
+Acc. ↑
+RACE (P=2, L=2)
+891s
+37s
+42.4%
+RACE (P=3, L=3)
+950s
+40s
+43.5%
+RACE (P=4, L=4)
+1042s
+42s
+40.3%
+Linear
+1166s
+44s
+41.4%
+Linformer-128
+1250s
+49s
+20.2%
+Performer-256
+2546s
+105s
+42.4%
+FlashAttention2
+2600s
+95s
+42.1%
+Maas et al., 2011; Zhang et al., 2015; He et al., 2019); autoregressive language modeling on
+WikiText-103 and PTB (Merity et al., 2017; Marcus et al., 1993); masked language modeling on
+Tiny Stories (Eldan & Li, 2023); image classification on CIFAR-10, FashionMNIST, and Food-
+101 using ViT architecture (Krizhevsky, 2009; Xiao et al., 2017; Bossard et al., 2014; Dosovitskiy
+et al., 2021); and long-context reasoning on Long Range Arena tasks (e.g., ListOps and Text Re-
+trieval) (Tay et al., 2021). Together, these benchmarks span bidirectional and autoregressive model-
+ing, as well as moderate- and long-context text and image classification. During training, we treat
+β, introduced in Algorithm 1, as a trainable parameter.
+Beyond standard benchmarks, we conduct extreme-length scaling experiments on a single attention
+layer, reaching sequences of tens of millions of tokens while using the same hyperparameters as in
+the accuracy evaluations. Finally, FlashAttention-2/3 are exact fused implementations of Softmax
+Attention, and we use the terms interchangeably when reporting accuracy and runtime.
+Baselines: We compare RACE against widely used baselines with publicly available implementa-
+tions: FlashAttention2 (Dao et al., 2022), Linear Attention (Katharopoulos et al., 2020), Performer
+(Choromanski et al., 2021), Linformer (Wang et al., 2020), Sigmoid Attention (Ramapuram et al.,
+2025), and YOSO (Zeng et al., 2021). These span exact, kernel-linear, and low-rank approximations.
+All models are tuned per authors’ guidelines and trained under identical settings.
+Is RACE Attention as Accurate as Transformers?
+We report text-classification, image-
+classification, and masked language modeling results in Tables 1, 2, and 3. Specifically, in Ta-
+ble 3, “Train/Test” denote per-epoch runtimes in seconds, and “Acc.” denotes accuracy. Results
+for Linear Attention, Linformer, and Performer were collected using batch size 1 due to out-of-
+memory failures at batch size 8. In contrast, both RACE and FlashAttention2 remain memory-
+efficient at this sequence length and are evaluated with batch size 8. Additional experiments can
+be found in Appendix, refer to Tables 6, 7, 9, and 10. For autoregressive language modeling,
+RACE matches softmax-level perplexity on WikiText-103 and improves upon it on PTB (Tables 4
+and 8). These results indicate that RACE preserves accuracy in the overlapping regime while deliv-
+ering consistent gains on moderate- and long-context settings. Unless stated otherwise, all methods
+use the same Transformer backbone (layers, heads, embedding size, dropout) and training budget.
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+(a) GPU: RACE (P = 2, L = 2)
+(b) GPU: RACE (P = 3, L = 3)
+(c) GPU: RACE (P = 4, L = 4)
+(d) GPU scaling
+(e) CPU-RACE vs. GPU-Baselines
+(f) CPU scaling
+Figure 4: Scaling stress-tests on GPU and CPU: All plots use logarithmic axes and report a single
+forward–backward pass (batch size 1, 4 attention heads, d=128) of a single attention layer. Lin-
+former and Performer use the same hyperparameters as in Table 2. (a–d) compare the scaling behav-
+ior of RACE against attention baselines on GPU, while (e–f) show scaling for RACE (P=3, L=3)
+on CPU, highlighting its superior efficiency at long sequence lengths.
+Table 4: WikiText-103 @ 1024
+Method
+PPL ↓
+RACE (P=2, L=2)
+23.9
+RACE (P=2, L=3)
+23.4
+RACE (P=3, L=3)
+21.9
+RACE (P=3, L=4)
+21.5
+RACE (P=4, L=4)
+20.9
+FlashAttention2
+20.9
+Angular (γ=8)
+19.0
+We train with identical optimizers, schedulers, and batch sizes;
+full hyperparameters appear in Table 5. Metrics are reported from
+the best-validation checkpoint. All accuracy experiments were
+conducted on a single NVIDIA A100 GPU.
+Can we reach 100 million context window on popular hard-
+ware?
+Now, we evaluate how RACE Attention scales across
+common hardware relative to strong baselines. For RACE, we use
+sketch parameters (P, L) chosen to match FlashAttention2’s ac-
+curacy/perplexity on the same tasks in Table 2. For each method,
+we measure the wall-clock time for a single forward–backward
+pass of a single attention layer with 1 batch, 4 heads, and em-
+bedding size 128, as a function of sequence length, stress-testing
+context lengths up to 100 million tokens. Since FlashAttention-2/3 are designed specifically for GPU
+hardware, we use PyTorch’s optimized F.scaled dot product attention implementation
+as the FlashAttention baseline when reporting CPU scaling results.
+How far can we scale attention on standard Intel Xeon® Gold 5220R CPU? RACE scales to
+sequences of up to 75 million tokens for a single forward–backward pass of a single attention layer
+on CPU. By contrast, FlashAttention becomes prohibitively slow at ∼2 million tokens due to the
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+(a) GPU-RACE Speedup
+(b) CPU-RACE Speedup
+(c) YOSO vs. RACE on GPU
+Figure 5: Speedup of RACE relative to GPU-only attention baselines, with RACE executed on
+GPU in (a) and on CPU in (b). (c) YOSO (CUDA kernel) fails beyond 32K tokens due to memory
+constraints, whereas RACE continues to scale to much longer sequences.
+quadratic time scaling in sequence length N (see fig. 4f). It is worth noting that FlashAttention does
+not run out of memory on the CPU DRAM. RACE is more than 10000× faster than FlashAtten-
+tion at context length of ∼33 million. RACE finishes comfortably under 10 seconds for a single
+forward-backward pass on this hardware while FlashAttention takes approximately 105 seconds on
+the same hardware. Although the absolute runtime grows with N, RACE’s speedup over FlashAt-
+tention increases. At 75 million tokens, RACE finishes in about 100 seconds. This is expected
+because RACE is linear and FlashAttention is quadratic in N. The experiments also highlight that
+linear attentions’ approximations are not only inaccurate but also significantly slower and have large
+memory overheads due to large hidden constants (see fig. 6 in Appendix). They run about an order
+of magnitude slower than RACE Attention and even go out of memory at ∼33 million tokens.
+How far can we scale attention on the most powerful GH200 GPU? An NVIDIA GH200 has
+96GB of memory. Here, we observe a similar trend. RACE scales up to 12 million tokens for
+a single forward-backward pass of a single attention layer, whereas FlashAttention-2/3 and Sig-
+moid Attention becomes impractical around ∼4 million tokens (see fig. 4). At ∼4 million tokens
+RACE takes merely 0.1 seconds to finish, while FlashAttention2 needs about 550 seconds, making
+RACE about 5500× faster on GPUs for processing 4 million tokens. Additionally, RACE is about
+5000× faster than Sigmoid and 2600× faster than FlashAttention3 for processing 4 million tokens
+(see fig. 5a). FlashAttention removes the quadratic memory cost of attention scores, but exact at-
+tention still requires storing token-level Q, K, V, and O activations and their gradients, incurring
+O(BHNd) memory. For large N, this linear footprint alone exceeds GPU HBM capacity. In con-
+trast, RACE compresses queries and keys into R bucket summaries per table, reducing activation
+memory to O(BHL(NR + Rd)), which scales more favorably on GPU even than the linear atten-
+tion baselines that exhaust memory at approximately ∼4 million tokens (see fig. 4). As a result,
+RACE supports contexts up to 3.5× longer than FlashAttention-2/3 and Sigmoid Attention.
+Right Algorithm beats Hardware Acceleration: While GPUs offer substantial speedups for a
+fixed algorithm, comparing FlashAttention-2/3 and Sigmoid on a high-end GH200 GPU against
+RACE on a single CPU highlights the impact of algorithmic acceleration.
+Fig. 4e reports the
+runtime of a single forward–backward pass of a single attention layer as the context length in-
+creases. For short to moderate sequences (N ≲131K), the GPU’s massive parallelism dominates
+and FlashAttention-2/3 remain faster. Beyond this scale, however, the asymptotic behavior becomes
+decisive: the GPU kernels begin to saturate, and RACE becomes faster. At a sequence length of ∼4
+million tokens (the largest supported by FlashAttention-2/3 in our configuration), RACE on CPU is
+roughly 40× faster than FlashAttention-2 and Sigmoid Attention on GPU, and about 20× faster than
+FlashAttention-3 (see fig. 5b). These results show that, in the long-context regime, state-of-the-art
+GPU attention kernels are fundamentally constrained by their quadratic dependence on sequence
+length. In contrast, RACE’s algorithmic efficiency enables it to outperform even the most advanced
+GPU-accelerated methods by a wide margin, despite executing on substantially weaker hardware.
+5
+CONCLUSION
+We introduce RACE Attention, a linear-time, memory-efficient alternative to Softmax Attention that
+approximates a sharpened angular kernel via RACE sketches. This formulation will enable substan-
+tially more efficient key–value caching during inference and suggests a clear path toward optimized
+CUDA kernels that preserve favorable scaling behavior and theoretical guarantees in autoregressive
+settings. We leave a full exploration of these directions to future work.
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+ACKNOWLEDGMENTS
+We would like to thank the anonymous reviewers for their helpful comments. We are also grateful
+to Aditya Desai and Zhaozhuo Xu for their valuable insights and thought-provoking discussions.
+This work was supported by the National Science Foundation (NSF) CCF-2336612 and Rice Ken
+Kennedy Institute (K2I) Generative AI Cluster Funding.
+ETHICS STATEMENT
+Our work is focused on speeding up algorithm and reducing the memory complexity for Attention.
+As such, it could have significant broader impacts by allowing practitioners to train models fast
+and deploy them in constrained resource settings. Our experimental work uses publicly available
+datasets to evaluate the performance of our algorithm; no ethical considerations are raised.
+REPRODUCIBILITY STATEMENT
+We provide the source code and configuration for the key experiments (Language Modelling,
+Masked Language Modelling, and Classification) including instructions on how to generate data and
+train the models. All proofs are stated in the appendix with explanations and underlying assump-
+tions. We thoroughly checked the implementation and also verified empirically that the proposed
+algorithm holds.
+REFERENCES
+Arturs Backurs, Piotr Indyk, and Ludwig Schmidt. On the fine-grained complexity of empirical risk
+minimization: Kernel methods and neural networks. Advances in Neural Information Processing
+Systems, 2017.
+Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. Neural machine translation by jointly
+learning to align and translate. arXiv preprint arXiv:1409.0473, 2014.
+Iz Beltagy, Matthew E. Peters, and Arman Cohan. Longformer: The long-document transformer.
+arXiv preprint arXiv:2004.05150, 2020.
+Lukas Bossard, Matthieu Guillaumin, and Luc Van Gool. Food-101 – mining discriminative com-
+ponents with random forests. In European Conference on Computer Vision, 2014.
+Moses S. Charikar. Similarity estimation techniques from rounding algorithms. In Proceedings of
+the 34th Annual ACM Symposium on Theory of Computing, 2002.
+Beidi Chen and Anshumali Shrivastava. Densified winner take all (wta) hashing for sparse datasets.
+In Proceedings of the 34th Conference on Uncertainty in Artificial Intelligence (UAI), 2018.
+arXiv:1810.00115.
+Krzysztof Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tam´as
+Sarl´os, Peter Hawkins, Jared Davis, Afroz Mohiuddin, Łukasz Kaiser, David Belanger, Lucy
+Colwell, and Adrian Weller. Rethinking attention with performers. In International Conference
+on Learning Representations, 2021.
+Krzysztof M. Choromanski, Mark Rowland, and Adrian Weller. The unreasonable effectiveness
+of structured random orthogonal embeddings. In Advances in Neural Information Processing
+Systems, 2017.
+Benjamin Coleman and Anshumali Shrivastava. Sub-linear RACE sketches for approximate kernel
+density estimation on streaming data. In World Wide Web Conference, 2020.
+Benjamin Coleman, Richard Baraniuk, and Anshumali Shrivastava. Sub-linear memory sketches
+for near neighbor search on streaming data. In International Conference on Machine Learning,
+2020.
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+Tri Dao. FlashAttention-2: Faster attention with better parallelism and work partitioning. In Inter-
+national Conference on Learning Representations, 2024.
+Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher R´e. FlashAttention: Fast and
+memory-efficient exact attention with io-awareness. In Advances in Neural Information Process-
+ing Systems, 2022.
+Mostafa Dehghani, Stephan Gouws, Oriol Vinyals, Jakob Uszkoreit, and Lukasz Kaiser. Universal
+transformers. In International Conference on Learning Representations, 2019.
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszko-
+reit, and Neil Houlsby. An image is worth 16x16 words: Transformers for image recognition at
+scale. In International Conference on Learning Representations, 2021.
+Ronen Eldan and Yuanzhi Li.
+Tinystories: How small can language models be and still speak
+coherent english? arXiv preprint arXiv:2305.07759, 2023.
+Insu Han, Rajesh Jayaram, Amin Karbasi, Vahab Mirrokni, David Woodruff, and Amir Zandieh. Hy-
+perattention: Long-context attention in near-linear time. In International Conference on Learning
+Representations, 2024.
+Jun He, Liqun Wang, Liu Liu, Jiao Feng, and Hao Wu. Long document classification from local
+word glimpses via recurrent attention learning. IEEE Access, 7:40707–40718, 2019.
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Franc¸ois Fleuret. Transformers are
+rnns: Fast autoregressive transformers with linear attention. In International Conference on Ma-
+chine Learning, 2020.
+Nikita Kitaev, Łukasz Kaiser, and Anselm Levskaya.
+Reformer: The efficient transformer.
+In
+International Conference on Learning Representations, 2020.
+Alex Krizhevsky. Learning multiple layers of features from tiny images. Technical report, University
+of Toronto, 2009.
+Chen Luo and Anshumali Shrivastava.
+Arrays of (locality-sensitive) count estimators (ace):
+Anomaly detection on the edge. In World Wide Web Conference, 2018.
+Haoneng Luo, Shiliang Zhang, Ming Lei, and Lei Xie. Simplified self-attention for transformer-
+based end-to-end speech recognition. CoRR, abs/2005.10463, 2020.
+Andrew L. Maas, Raymond E. Daly, Peter T. Pham, Dan Huang, Andrew Y. Ng, and Christopher
+Potts. Learning word vectors for sentiment analysis. In Association for Computational Linguis-
+tics, 2011.
+Mitchell P. Marcus, Beatrice Santorini, and Mary Ann Marcinkiewicz. Building a large annotated
+corpus of english: The penn treebank. Computational Linguistics, 19:313–330, 1993.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture
+models. In Proceedings of the International Conference on Learning Representations (ICLR),
+2017.
+Niki Parmar, Ashish Vaswani, Jakob Uszkoreit, Lukasz Kaiser, Noam Shazeer, Alexander Ku, and
+Dustin Tran. Image transformer. In International Conference on Machine Learning, 2018.
+Hao Peng, Nikolaos Pappas, Dani Yogatama, Roy Schwartz, Noah A. Smith, and Lingpeng Kong.
+Random feature attention. In International Conference on Learning Representations, 2021.
+Frithjof Petrick, Jan Rosendahl, Christian Herold, and Hermann Ney. Locality-sensitive hashing
+for long context neural machine translation. In International Conference on Spoken Language
+Translation, 2022.
+Zhen Qin, Weixuan Sun, Hui Deng, Dongxu Li, Yunshen Wei, Baohong Lv, Junjie Yan, Lingpeng
+Kong, and Yiran Zhong. cosformer: Rethinking softmax in attention. In International Conference
+on Learning Representations, 2022.
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+Ali Rahimi and Benjamin Recht. Random features for large-scale kernel machines. In Advances in
+Neural Information Processing Systems, 2007.
+Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. SQuAD: 100,000+ questions
+for machine comprehension of text. In Empirical Methods in Natural Language Processing, 2016.
+Jason Ramapuram, Federico Danieli, Eeshan Dhekane, Floris Weers, Dan Busbridge, Pierre Ablin,
+Tatiana Likhomanenko, Jagrit Digani, Zijin Gu, Amitis Shidani, and Russ Webb. Theory, analysis,
+and best practices for sigmoid self-attention. In International Conference on Learning Represen-
+tations, 2025.
+Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao.
+Flashattention-3: Fast and accurate attention with asynchrony and low-precision. In Advances
+in Neural Information Processing Systems, 2024.
+Richard Socher, Alex Perelygin, Jean Wu, Jason Chuang, Christopher D. Manning, Andrew Ng,
+and Christopher Potts. Recursive deep models for semantic compositionality over a sentiment
+treebank. In Empirical Methods in Natural Language Processing, 2013.
+Yi Tay, Mostafa Dehghani, Samira Abnar, Yikang Shen, Dara Bahri, Philip Pham, Jinfeng Rao,
+Liu Yang, Sebastian Ruder, and Donald Metzler. Long Range Arena: A benchmark for efficient
+transformers. In International Conference on Learning Representations, 2021.
+Joel A. Tropp. An introduction to matrix concentration inequalities. Foundations and Trends in
+Machine Learning, 8(1-2):1–230, 2015.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Infor-
+mation Processing Systems, 2017.
+Sinong Wang, Belinda Z. Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention
+with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+Han Xiao, Kashif Rasul, and Roland Vollgraf. Fashion-MNIST: a novel image dataset for bench-
+marking machine learning algorithms. arXiv preprint arXiv:1708.07747, 2017.
+Yunyang Xiong, Zhanpeng Zeng, Rudrasis Chakraborty, Mingxing Tan, Glenn Fung, Yin Li, and
+Vikas Singh. Nystr¨omformer: A nystr¨om-based algorithm for approximating self-attention. In
+AAAI conference on artificial intelligence, 2021.
+Jay Yagnik, Dennis Strelow, David A. Ross, and Ruei-Sung Lin. The power of comparative reason-
+ing. In 2011 International Conference on Computer Vision, 2011.
+Manzil Zaheer, Guru Guruganesh, Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Onta˜n´on,
+Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, and Amr Ahmed. Big bird: Transformers
+for longer sequences. In Advances in Neural Information Processing Systems, 2020.
+Zhanpeng Zeng, Yunyang Xiong, Sathya Ravi, Shailesh Acharya, Glenn M. Fung, and Vikas Singh.
+You only sample (almost) once: Linear cost self-attention via bernoulli sampling. In International
+Conference on Machine Learning, 2021.
+Xiang Zhang, Junbo Zhao, and Yann LeCun. Character-level convolutional networks for text clas-
+sification. In Neural Information Processing Systems, 2015.
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+A
+APPENDIX
+A.1
+LLM USAGE
+An LLM was used exclusively to refine the language and improve clarity across the manuscript. It
+was not used for idea generation, experimental design, analysis, or to produce results.
+A.2
+ADDITIONAL NOTES ON EXPERIMENTS
+Table 5: Experiment Setup and Hyperparameters
+Dataset
+Task
+Hyperparameters
+PTB
+Language Modeling
+N=128; layers=1; heads=2; d=128; batch=16; lr=6e−4; β’s=(0.9,
+0.999); ϵ=1e−8; wd=0.1; dropout = 0.3; epochs=70
+WikiText-103
+Language Modeling
+N=1024; layers=8; heads=8; d=512; batch=16; lr=6e−4; β’s=(0.9,
+0.999); ϵ=1e−8; wd=0.1; dropout=0.1; epochs=100
+IMDB
+Text Classification
+N=512; layers=1; heads=2; d=128; batch=32; lr=1e−5; wd=5e−5;
+dropout=0.1; epochs=150
+Yahoo
+Text Classification
+N=256; layers=1; heads=2; d=128; batch=32; lr=1e−5; wd=5e−5;
+dropout = 0.1; epochs=100
+ListOps
+Text Classification
+N=2000; layers=8; heads=8; d=512; batch=16; lr=1e−5; wd=1e−5;
+dropout=0.1; epochs=40
+Text Retrieval
+Text Classification
+N=8000; layers=4; heads=2; d=384; batch=1; lr=2e−4; wd=1e−2;
+dropout=0.1; epochs=20
+Tiny Stories
+Masked Language Modelling
+N=512-1024; layers=6; heads=4; d=384; batch=32;
+lr=6e−4;
+β’s=(0.9, 0.999); ϵ=1e−8; wd=0.1; dropout=0.1; epochs=150; sto-
+ries=20000
+QNLI
+Text Classification
+N=2048; layers=4; heads=8; d=384; batch=32; lr=1e−5; wd=5e−5;
+dropout=0.1; epochs=100
+SST-2
+Text Classification
+N=1024; layers=4; heads=8; d=384; batch=32; lr=1e−5; wd=5e−5;
+dropout=0.1; epochs=100
+CIFAR-10
+Image Classification
+N=1024; layers=2; heads=4; d=384; batch=32; lr=6e−4; β’s=(0.9,
+0.999); ϵ=1e−8; wd=0.1; dropout=0.1; epochs=75
+FashionMNIST
+Image Classification
+N=784; layers=2; heads=4; d=384; batch=32; lr=6e−4; β’s=(0.9,
+0.999); ϵ=1e−8; wd=0.1; dropout=0.1; epochs=75
+Food-101
+Image Classification
+N=16384; layers=8; heads=8; d=512; batch=8; lr=3e−4; wd=0.001;
+dropout=0.1; epochs=100; grad accum steps=4
+Arxiv
+Text Classification
+N=16K-64K; layers=4;
+heads=4;
+d=256;
+batch=2;
+lr=3e−4;
+wd=0.01; dropout=0.1; epochs=100; grad accum steps=16
+Description:
+Unless otherwise specified, we adopt a linear warmup–decay learning-rate sched-
+ule. Let T denote the total number of optimizer updates,
+T = epochs × len(train loader).
+The learning rate increases linearly from 0 to the base learning rate (reported in Table 5) over the
+first 0.01T updates, and then decays linearly to 0 over the remaining T −0.01T updates. The
+learning-rate scheduler is stepped once per optimizer update. We use the AdamW optimizer with
+hyperparameters listed in Table 5. For experiments with a learning rate below 2 × 10−4, we do
+not apply linear warmup or a learning-rate scheduler; instead, we train the model using a constant
+learning rate for the number of epochs specified in Table 5.
+Data Pre-processing for Arxiv: To evaluate long-context classification performance, we construct
+16K-, 32K-, and 64K-token variants of the ArXiv dataset using a two-stage preprocessing pipeline.
+First, we tokenize all documents with a basic English tokenizer and retain only those whose raw
+token length exceeds a predefined minimum threshold, ensuring that each example contains suffi-
+ciently long context. Next, we perform streaming sequence packing. Documents are grouped by
+class and concatenated sequentially until a target sequence length of 16K, 32K, or 64K tokens is
+reached. To maintain high packing efficiency, only very small residual fragments are discarded.
+This procedure yields long, contiguous sequences that preserve the natural structure of individual
+documents while enabling fixed-length training. After balancing classes, the resulting dataset sizes
+are as follows: 16K (1,947 training examples, 209 test examples), 32K (3,650 training examples,
+520 test examples), and 64K (3,882 training examples, 384 test examples).
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+Table 6:
+FashionMNIST @
+784
+Method
+Accuracy
+RACE (P=2, L=5)
+87.7%
+RACE (P=3, L=5)
+87.5%
+RACE (P=4, L=4)
+86.6%
+RACE (P=4, L=5)
+85.7%
+Linformer-128
+87.7%
+FlashAttention2
+87.2%
+Angular (γ=8)
+86.4%
+Linear
+85.8%
+Performer-256
+86.6%
+Table 7: Tiny Stories @ 512
+Method
+Perplexity
+RACE (P=3, L=4)
+3.9
+RACE (P=4, L=4)
+3.3
+RACE (P=5, L=4)
+2.7
+RACE (P=5, L=5)
+5.1
+Linear
+6.0
+Angular (γ=8)
+2.9
+FlashAttention2
+3.1
+Linformer-128
+4.6
+Performer-256
+7.1
+Table 8: Penn Tree Bank @
+128
+Method
+Test PPL
+RACE (P=2, L=2)
+54.7
+RACE (P=3, L=3)
+54.2
+RACE (P=4, L=4)
+53.4
+Angular (γ=8)
+58.8
+Angular (γ=12)
+57.6
+Linear
+73.2
+FlashAttention2
+55.4
+Table 9: Comparison of attention methods on
+Long Range Arena
+Method
+ListOps @2000
+Text Retrieval @8000
+Acc. (%) ↑
+Acc. (%) ↑
+RACE (P=2, L=2)
+41.9%
+80.3%
+RACE (P=3, L=3)
+41.3%
+80.8%
+RACE (P=4, L=4)
+41.6%
+80.9%
+Linformer-128
+38.9%
+76.1%
+FlashAttention2
+41.4%
+80.5%
+Angular (γ=8)
+42.2%
+OOM
+Linear
+39.6%
+80.6%
+Performer-256
+40.2%
+80.8%
+YOSO-16
+41.0%
+80.2%
+Table 10: Comparison of attention methods on nat-
+ural language understanding tasks
+Method
+Yahoo @256
+IMDB @512
+SST-2 @1024
+Acc. (%) ↑
+Acc. (%) ↑
+Acc. (%) ↑
+RACE (P=2, L=2)
+66.9%
+80.6%
+76.7%
+RACE (P=3, L=3)
+66.6%
+81.3%
+77.1%
+RACE (P=4, L=4)
+67.2%
+81.3%
+79.4%
+Linformer-128
+64.7%
+78.2%
+75.1%
+FlashAttention2
+67.2%
+80.0%
+78.5%
+Angular (γ=8)
+67.0%
+79.6%
+77.2%
+Linear
+66.9%
+80.9%
+78.0%
+Performer-256
+64.9%
+81.0%
+77.3%
+(a) CPU: RACE (P = 2, L = 2)
+(b) CPU: RACE (P = 3, L = 3)
+(c) CPU: RACE (P = 4, L = 4)
+(d) d scaling @ N=65536
+(e) GPU: RACE (P = 4, L = 4)
+Figure 6: (a–c) CPU results for different (P, L). (d) Linear attention scales quadratically in d, while
+RACE scales linearly (fixed N=65536). (e) GPU scaling under hyperparameters different from
+fig. 4.
+Data Pre-processing for Food-101:
+To evaluate long-context image classification on the Food-
+101 dataset with a 16K token context length, we reduce the dataset size by discarding 50 classes. We
+train the model on 20,000 samples and evaluate it on a held-out test set of 2,500 samples. Images are
+processed using a patch size of 4, an input resolution of 512 × 512, and a stride of 4. All remaining
+hyperparameters are reported in Table 5.
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+B
+PROOF OF THEOREM 2
+This section provides a complete, self-contained theoretical treatment showing that our RACE At-
+tention closely approximates Angular Attention. We give explicit high-probability bounds for (i)
+the kernel error, (ii) the attention matrix error with a clean separation of numerator vs. denominator
+effects, and (iii) the end-to-end output error (Theorem 2). Let’s also reintroduce the notations for
+the convenience of the reader.
+B.1
+SETUP AND ASSUMPTIONS
+Data. Sequence length N, head (per-head) dimension d. Queries/keys are unit vectors:
+Qi, Kj ∈Rd
+with
+∥Qi∥2 = ∥Kj∥2 = 1,
+i, j ∈{1, . . . , N}.
+Target kernel (P-powered angular).
+κ(Qi, Kj) := κang(Qi, Kj)P =
+
+1−1
+π cos−1(Q⊤
+i Kj)
+P
+∈[0, 1],
+S ∈RN×N with Sij = κ(Qi, Kj).
+Soft RACE features. For each ensemble ℓ= 1, . . . , L:
+• Draw P random hyperplanes W (ℓ) ∈RP ×d whose rows w(ℓ)
+t
+are i.i.d.
+• Corners V = {±1}P (size R = 2P ), with corner vectors vr ∈{±1}P .
+• Logits s(ℓ)(x; r) := [tanh(W (ℓ)x)]⊤vr, temperature β > 0.
+• Define the (probability) feature ϕ(ℓ)(x) by
+[ϕ(ℓ)(x)]r =
+exp{β s(ℓ)(x; r)}
+P
+r′ exp{β s(ℓ)(x; r′)}.
+RACE kernel and matrices.
+For each ensemble, define the per-table kernel matrix
+bS(ℓ)
+ij = (ϕ(ℓ)(Qi))⊤(ϕ(ℓ)(Kj)),
+bS = 1
+L
+L
+X
+ℓ=1
+bS(ℓ).
+Let the (single-table) bias matrix be ˜B := E[bS(ℓ)] −S.
+Assumptions.
+For convenience, we restate the two assumptions from Section 3.3
+• (A1) Row sums of S are bounded away from zero i.e., smin := mini(S1)i ≥C1N for
+some constant C1 > 0, which ensures stable normalization in attention.
+• (A2) Spectral norm of S is bounded i.e., ∥S∥2 ≤C2N, which follows from Sij ∈[0, 1].
+Notation: We denote ∥· ∥2 as spectral norm for a matrix and Euclidean norm for a vector, ∥· ∥F
+for the Frobenius norm of a matrix and for a matrix M, we denote ∥M∥∞= maxi
+P
+j |Mij|, is the
+induced row-sum norm.
+B.2
+KERNEL CONSTRUCTION WITH THE BIAS TERM
+We begin by formalizing how a single hash table induces a kernel matrix via the soft RACE features.
+The next lemma records norm properties that will be used repeatedly.
+Lemma 3 (Bounds for a single ensemble). Let Φ(ℓ)
+Q
+∈RN×R be the matrix with the i-th row
+ϕ(ℓ)(Qi)⊤and Φ(ℓ)
+K defined analogously. Then:
+1. bS(ℓ) = Φ(ℓ)
+Q
+ Φ(ℓ)
+K
+⊤.
+2. Each row of Φ(ℓ)
+Q and Φ(ℓ)
+K is a probability vector; hence ∥Φ(ℓ)
+Q ∥F , ∥Φ(ℓ)
+K ∥F ≤
+√
+N.
+3. Consequently ∥bS(ℓ)∥F ≤N.
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+Proof. Each ϕ(ℓ)(x) is a softmax over R = 2P corners, so entries are nonnegative and sum to 1.
+Item (1) is by definition of bS(ℓ)
+ij . For (2), every row p satisfies ∥p∥2 ≤∥p∥1 = 1, hence ∥Φ(ℓ)
+Q ∥2
+F =
+P
+i ∥ϕ(ℓ)(Qi)∥2
+2 ≤N (and similarly for Φ(ℓ)
+K ). Item (3) follows from ∥AB∥F ≤∥A∥F ∥B∥F .
+Having controlled the feature-induced matrix norms, we quantify the zero-mean fluctuation of one
+ensemble around its expectation and prepare moment bounds needed for matrix concentration. Note
+that the hash projections W (ℓ) (and hence bS(ℓ)) are independent for ℓ= 1, . . . , L.
+Lemma 4. Let X(ℓ) := bS(ℓ) −E[bS(ℓ)] and write
+∆:= bS −S = 1
+L
+L
+X
+ℓ=1
+X(ℓ) + ˜B.
+Then:
+1. E[X(ℓ)] = 0.
+2. ∥X(ℓ)∥2 ≤2N.
+3. With
+v := max
+(
+L
+X
+ℓ=1
+E
+
+1
+LX(ℓ)
+1
+LX(ℓ)⊤
+2
+,
+
+L
+X
+ℓ=1
+E
+
+1
+LX(ℓ)⊤
+1
+LX(ℓ)
+2
+)
+,
+we have v ≤4N 2/L.
+Proof. (1) By definition, X(ℓ) = bS(ℓ) −E[bS(ℓ)], hence E[X(ℓ)] = E[bS(ℓ)] −E[bS(ℓ)] = 0.
+(2) By Lemma 3(3) we have ∥bS(ℓ)∥2 ≤∥bS(ℓ)∥F ≤N. By convexity of the spectral norm,
+∥E[bS(ℓ)]∥2 ≤E
+
+∥bS(ℓ)∥2
+
+≤N.
+Therefore, by the triangle inequality,
+∥X(ℓ)∥2 = ∥bS(ℓ) −E[bS(ℓ)]∥2 ≤∥bS(ℓ)∥2 + ∥E[bS(ℓ)]∥2 ≤2N.
+(3) Let Y (ℓ) := 1
+LX(ℓ). Then
+L
+X
+ℓ=1
+E
+
+Y (ℓ)(Y (ℓ))⊤
+= 1
+L2
+L
+X
+ℓ=1
+E
+
+X(ℓ)(X(ℓ))⊤
+.
+Using subadditivity of ∥· ∥2, Jensen, and ∥AB∥2 ≤∥A∥2∥B∥2,
+
+L
+X
+ℓ=1
+E
+
+Y (ℓ)(Y (ℓ))⊤
+
+2
+≤1
+L2
+L
+X
+ℓ=1
+E
+
+X(ℓ)(X(ℓ))⊤
+2 ≤1
+L2
+L
+X
+ℓ=1
+E
+
+∥X(ℓ)∥2
+2
+
+≤1
+L2
+L
+X
+ℓ=1
+(2N)2 = 4N 2
+L .
+The same bound holds for
+PL
+ℓ=1 E
+
+(Y (ℓ))⊤Y (ℓ)
+2 by symmetry. Taking the maximum of the
+two yields v ≤4N 2/L.
+To convert the moment and uniform bounds above into a high-probability spectral-norm bound, we
+invoke a standard matrix Bernstein inequality from Tropp (2015), stated next for completeness.
+Lemma 5 (Matrix Bernstein). If Z(ℓ) ∈Rm×n are independent mean-zero matrices with ∥Z(ℓ)∥2 ≤
+H and variance proxy v, then for any t > 0,
+P
+ 
+X
+ℓ
+Z(ℓ)
+
+2
+≥t
+!
+≤(m + n) exp
+
+−
+t2/2
+v + Ht/3
+
+.
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+Next, applying Lemma 5 with the parameters established in Lemma 4, we obtain the following
+nonasymptotic deviation bound for the kernel estimator.
+Theorem 6 (Kernel deviation with explicit constants). With probability at least 1 −δ,
+∥bS −S∥2 ≤∥˜B∥2 + 4 N
+√
+L
+r
+log2N
+δ
++ 4
+3
+N
+L log2N
+δ .
+Proof. First, rewrite bS −S as
+bS −S = 1
+L
+L
+X
+ℓ=1
+bS(ℓ) −S = 1
+L
+L
+X
+ℓ=1
+
+bS(ℓ) −E[bS(ℓ)]
+
++
+
+E[bS(ℓ)] −S
+
+= 1
+L
+L
+X
+ℓ=1
+X(ℓ) + ˜B.
+By the triangle inequality,
+∥bS −S∥2 ≤
+
+1
+L
+L
+X
+ℓ=1
+X(ℓ)
+
+2
++ ∥˜B∥2.
+It remains to upper bound the random term with high probability.
+Set Z(ℓ) :=
+1
+LX(ℓ). Then the Z(ℓ) are independent, mean-zero, N × N random matrices. From
+Lemma 4(2) we have ∥X(ℓ)∥2 ≤2N. Therefore, ∥Z(ℓ)∥2 ≤H := 2N
+L . Similarly, Lemma 4(3)
+gives v ≤4N2
+L . Applying Lemma 5 with m = n = N yields
+P
+ 
+L
+X
+ℓ=1
+Z(ℓ)
+
+2
+≥t
+!
+≤2N exp
+
+−
+t2
+2 (v + Ht/3)
+
+.
+Let u := log 2N
+δ . To make the RHS ≤δ, it suffices that
+t2
+2 (v + Ht/3) ≥u
+⇐⇒
+t2 −2uH
+3
+t −2u v ≥0.
+Choose
+t = 2√v u + 2
+3 H u.
+Writing a := 2√vu and b := 2
+3Hu (so t = a + b) gives
+t2 −2uH
+3
+t −2uv = (a + b)2 −2uH
+3
+(a + b) −2uv = (4vu −2uv) +
+
+8
+3 −4
+3
+
+Hu√vu ≥0.
+Therefore,
+
+L
+X
+ℓ=1
+Z(ℓ)
+
+2
+≤2√v u + 2
+3 H u
+with probability at least 1 −δ.
+Plugging v ≤4N2
+L
+and H = 2N
+L yields
+
+L
+X
+ℓ=1
+Z(ℓ)
+
+2
+≤2
+r
+4N 2
+L
+u + 2
+3 · 2N
+L u = 4 N
+√
+L
+√u + 4
+3
+N
+L u.
+Since PL
+ℓ=1 Z(ℓ) = 1
+L
+PL
+ℓ=1 X(ℓ), we conclude that
+
+1
+L
+L
+X
+ℓ=1
+X(ℓ)
+
+2
+≤4 N
+√
+L
+r
+log2N
+δ
++ 4
+3
+N
+L log2N
+δ
+with probability ≥1 −δ,
+and therefore
+∥bS −S∥2 ≤∥˜B∥2 + 4 N
+√
+L
+r
+log2N
+δ
++ 4
+3
+N
+L log2N
+δ ,
+as claimed.
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+The deviation bound decomposes into a variance term and a (deterministic) bias term ˜B. We now
+bound ˜B explicitly as a function of β and P. Before stating the result, we introduce the following
+technical result that proves a deterministic inequality and will be required to bound ∥˜B∥2.
+Lemma 7. Let p, q ∈RR be probability vectors with nonnegative entries summing to one. Let
+a ∈arg maxr pr and b ∈arg maxr qr. Then
+p⊤q −1{a = b}
+ ≤(1 −pa) + (1 −qb).
+Proof. We consider two cases.
+Case 1: a = b. Then 1{a = b} = 1 and
+|p⊤q −1| = 1 −p⊤q ≤1 −paqa
+since p⊤q ≥paqa.
+By the inequality (1 −x)(1 −y) ≥0 ⇒1 −xy ≤(1 −x) + (1 −y), we obtain
+1 −p⊤q ≤(1 −pa) + (1 −qa) = (1 −pa) + (1 −qb).
+Case 2: a ̸= b. Then 1{a = b} = 0. Because b maximizes q, we have qr ≤qb for all r and
+qa ≤1 −qb (since the total mass outside b is 1 −qb). Hence
+p⊤q = paqa +
+X
+r̸=a
+prqr ≤pa(1 −qb) + qb
+X
+r̸=a
+pr = pa(1 −qb) + (1 −pa)qb.
+Finally,
+(1 −pa) + (1 −qb) −
+
+pa(1 −qb) + (1 −pa)qb
+
+= 2(1 −pa)(1 −qb) ≥0,
+so p⊤q ≤(1 −pa) + (1 −qb).
+Combining both cases gives the desired bound.
+Lemma 8 (Bounding the bias term). Fix P ≥1 and β > 0. With S and ˜B as above, let c :=
+2 tanh(1). Then
+∥˜B∥2 ≤
+4
+√
+2π
+NP
+β
++
+
+4
+√
+2πe−1/2
+NP e−cβ.
+Proof. Let us denote the inner product similarity by ρ := Q⊤
+i Kj, and recall that the angular kernel
+is κang(Qi, Kj) := 1 −1
+π cos−1(ρ) From standard LSH theory, for P i.i.d. Gaussian hyperplanes
+W (ℓ) ∈RP ×d, the probability that all P bits match is exactly:
+P (hP (Qi) = hP (Kj)) = κang(Qi, Kj)P = Sij.
+Now define the softmax sketch feature for the hash table ℓ:
+s(ℓ)(x; r) := tanh(W (ℓ)x)⊤vr,
+[ϕ(ℓ)(x)]r :=
+eβs(ℓ)(x;r)
+P
+r′ eβs(ℓ)(x;r′) ,
+where vr ∈{±1}P denotes the binary corner vectors of length P, and R = 2P . Let bS(ℓ) ∈RN×N
+be the kernel matrix for a single hash table:
+E(bS(ℓ)
+ij ) := E
+
+ϕ(ℓ)(Qi)
+⊤
+ϕ(ℓ)(Kj)
+
+,
+Sij := κang(Qi, Kj)P ,
+and recall the bias matrix is ˜B := E[bS(ℓ)] −S. Our goal is to bound ∥˜B∥2. To do this, fix any pair
+(i, j) and note:
+|E(bS(ℓ)
+ij ) −Sij| =
+E
+
+ϕ(ℓ)(Qi)
+⊤
+ϕ(ℓ)(Kj)
+
+−P[hP (Qi) = hP (Kj)]
+ .
+Next, let r⋆(x) = arg maxr s(ℓ)(x; r) = sign(u(x)) denote the maximizing corner for x, where
+ut(x) = tanh(w⊤
+t x). The function s(ℓ)(x; r) = PP
+t=1 ut(x) rt is a linear form over the binary
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+corners r ∈{±1}P . To evaluate the normalization term in the softmax, note that the exponentials
+factorize across coordinates because rt appears only in the term ut(x)rt. Hence,
+X
+r∈{±1}P
+eβs(ℓ)(x;r) =
+X
+r1=±1
+· · ·
+X
+rP =±1
+
+eβ P
+t ut(x)rt
+=
+X
+r1=±1
+· · ·
+X
+rP =±1
+P
+Y
+t=1
+eβut(x)rt
+=
+P
+Y
+t=1
+ X
+rt=±1
+eβut(x)rt
+!
+=
+P
+Y
+t=1
+ eβut(x) + e−βut(x)
+=
+P
+Y
+t=1
+2 cosh(β|ut(x)|),
+where the last equality uses the evenness of the hyperbolic cosine, cosh(z) = cosh(|z|). Therefore,
+the softmax probability assigned to the dominant corner r⋆(x) can be written in closed form as
+[ϕ(ℓ)(x)]r⋆(x) =
+eβ P
+t |ut(x)|
+Q
+t 2 cosh(β|ut(x)|) =
+P
+Y
+t=1
+eβ|ut(x)|
+eβ|ut(x)| + e−β|ut(x)| =
+P
+Y
+t=1
+σ
+ 2β|ut(x)|
+
+,
+where σ(z) = 1/(1+e−z) denotes the logistic function. This factorization expresses the max-corner
+mass as a product of per-coordinate logistic terms.
+To bound the total probability mass outside the dominant corner, we use the inequality 1 −Q
+t(1 −
+at) ≤P
+t at for at ∈[0, 1], which we apply to at = 1 −σ(2β|ut(x)|). Hence,
+1 −[ϕ(ℓ)(x)]r⋆(x) = 1 −
+P
+Y
+t=1
+σ(2β|ut(x)|) ≤
+P
+X
+t=1
+ 1 −σ(2β|ut(x)|)
+
+≤
+P
+X
+t=1
+e−2β|ut(x)|,
+(5)
+where the final inequality follows from the standard logistic bound 1 −σ(z) ≤e−z for all z ≥0.
+Intuitively, this means that the total softmax probability mass outside the most likely corner decays
+exponentially with the scaled activation strength β|ut(x)| along each coordinate. Now, for each bit,
+ut(x) = tanh(w⊤
+t x) with w⊤
+t x ∼N(0, 1). Let Z := w⊤
+t x. Then
+E[e−2β|ut(x)|] = E[e−2β| tanh(Z)|].
+We split into two regions. (1) On |Z| ≤1, we use | tanh z| ≥
+|z|
+2 , so e−2β| tanh(Z)| ≤e−β|Z|.
+Hence
+E[e−2β| tanh(Z)|1|Z|≤1] ≤
+2
+√
+2π
+Z 1
+0
+e−βze−z2/2 dz ≤
+2
+√
+2π · 1
+β .
+(2) On |Z| > 1, we use tanh z ≥tanh(1), so e−2β| tanh(Z)| ≤e−2β tanh(1). Thus
+E[e−2β| tanh(Z)|1|Z|>1] ≤e−2β tanh(1)P(|Z| > 1) = 2e−2β tanh(1) P(Z > 1) ≤e−2β tanh(1)
+r
+2
+π e−1/2 ≤e−cβ ,
+where the second last bound is due to Mill’s inequality and the last inequality follows from the fact
+that
+q
+2
+πe−1/2 ≤1. Here c = 2 tanh(1). Combining the two expectations we get,
+E[e−2β|ut(x)|] ≤
+2
+√
+2π β + e−cβ,
+c = 2 tanh(1).
+Substituting back into Eq. equation 5, we obtain
+E
+
+1 −[ϕ(ℓ)(x)]r⋆(x)
+
+≤
+2P
+√
+2π β + O(Pe−cβ).
+Next, let p := ϕ(ℓ)(Qi) and q := ϕ(ℓ)(Kj) denote the softmax feature vectors for Qi and Kj, and
+let a := r⋆(Qi), b := r⋆(Kj) be their respective dominant corners. By the deterministic inequality
+in Lemma 7
+|p⊤q −1{a = b}| ≤(1 −pa) + (1 −qb),
+valid for any probability vectors p, q and indices a, b, we have
+|E[bS(ℓ)
+ij ] −Sij| =
+E[p⊤q] −P[a = b]
+ ≤E[1 −pa] + E[1 −qb].
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+Using the bound on the expected softmax tail probability for both Qi and Kj then gives
+|E[bS(ℓ)
+ij ] −Sij| ≤2
+
+2P
+√
+2π β + O(Pe−cβ)
+
+=
+4P
+√
+2π β + O(Pe−cβ).
+(6)
+Therefore,
+∥˜B∥2 ≤∥˜B∥F ≤N sup
+i,j
+| ˜Bij| ≤N
+
+4P
+√
+2π β + O(Pe−cβ)
+
+.
+This proves the claim.
+We now propagate the kernel-level error into the attention matrix. This requires controlling the
+normalization (row sums) and its inverse, which we address next.
+B.3
+FROM KERNELS TO ATTENTION (NUMERATOR VS. DENOMINATOR)
+Let bS = S + ∆, D = diag(S1), and bD = diag(bS1) = D + E. Define the attention matrices
+A := D−1S,
+bA := bD−1 bS.
+The following lemma ties the row-sum perturbation E to ∆and gives a simple invertibility condition
+for bD.
+Lemma 9 (Row-sum and inverse diagonal control). Recall that smin = mini Dii > 0. Then
+1. ∥E∥2 ≤∥∆∥∞≤
+√
+N ∥∆∥2.
+2. If ∥E∥2 ≤smin/2, then ∥bD−1∥2 ≤2/smin.
+Proof. (1) Row-sum control. Since bS = S + ∆and bD = diag(bS1), we rewrite
+E := bD −D = diag
+ (bS −S)1
+
+= diag(∆1).
+Hence each diagonal entry is Eii = (∆1)i = PN
+j=1 ∆ij, so
+∥E∥2 = max
+i
+|Eii| = max
+i
+(∆1)i
+ ≤max
+i
+N
+X
+j=1
+|∆ij| = ∥∆∥∞.
+For the second inequality, by Cauchy–Schwarz on each row i,
+N
+X
+j=1
+|∆ij| ≤
+√
+N
+ N
+X
+j=1
+∆2
+ij
+1/2
+=
+√
+N ∥∆i,·∥2.
+Moreover,
+max
+i
+∥∆i,·∥2 = max
+i
+∥∆⊤ei∥2 ≤∥∆⊤∥2∥ei∥2 = ∥∆∥2.
+Taking the maximum over i yields
+∥∆∥∞= max
+i
+X
+j
+|∆ij| ≤
+√
+N max
+i
+∥∆i,·∥2 ≤
+√
+N ∥∆∥2.
+(2) Inverse diagonal control. Because bD = D + E is diagonal, its smallest diagonal entry satisfies
+min
+i
+bDii = min
+i (Dii + Eii) ≥min
+i
+Dii −max
+i
+|Eii| = smin −∥E∥2.
+If ∥E∥2 ≤smin/2, then mini bDii ≥smin/2 > 0, so bD is invertible and
+∥bD−1∥2 = max
+i
+1
+bDii
+≤
+1
+smin −∥E∥2
+≤
+1
+smin −smin/2 =
+2
+smin
+.
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+Assumption (A1) ensures D has diagonals of order N, but we must still control E. The next lemma
+shows that the condition ∥E∥2 ≤smin/2 holds with high probability once L and β are moderately
+large.
+Lemma 10 (Concentration bound for E). Recall E = bD −D = diag((bS −S)1) and assume (A1):
+smin ≥C1N. Then with probability at least 1 −δ,
+∥E∥2 ≤N
+q
+1
+2L log 2N2
+δ
++
+4
+√
+2π
+NP
+β
++ O
+ NPe−cβ
+,
+c = 2 tanh(1).
+In particular, ∥E∥2 ≤1
+2smin holds with probability at least 1 −δ whenever
+L ≥
+8
+C2
+1
+log2N 2
+δ
+,
+β ≥
+32
+C1
+√
+2π P,
+in which case the exponentially small term NPe−cβ can be absorbed into constants.
+Proof. Since
+E = bD −D = diag((bS −S)1),
+we have
+∥E∥2 = max
+i
+
+N
+X
+j=1
+(bSij −Sij)
+.
+Decompose the kernel error as
+bS −S = (bS −E[bS]) + (E[bS] −S) = (bS −E[bS]) + ˜B,
+where ˜B is the bias matrix.
+Hence for any row i,
+
+X
+j
+(bSij −Sij)
+ ≤
+X
+j
+|bSij −E[bSij]| +
+X
+j
+| ˜Bij|
+≤N max
+j
+|bSij −E[bSij]| + N max
+j
+| ˜Bij|.
+Taking the maximum over i gives
+∥E∥2 ≤N max
+i,j |bSij −E[bSij]| + N max
+i,j | ˜Bij|.
+Each bSij is an average of L i.i.d. random variables bS(ℓ)
+ij ∈[0, 1]. By Hoeffding’s inequality,
+Pr(|bSij −E[bSij]| > ϵ) ≤2e−2Lϵ2.
+A union bound over all N 2 entries yields that with probability at least 1 −δ,
+max
+i,j |bSij −E[bSij]| ≤
+q
+1
+2L log 2N2
+δ .
+Eq. 6 gives the entrywise bias bound
+max
+i,j | ˜Bij| ≤
+4
+√
+2π
+P
+β + O(Pe−cβ).
+Combining the bounds proves
+∥E∥2 ≤N
+q
+1
+2L log 2N2
+δ
++
+4
+√
+2π
+NP
+β
++ O(NPe−cβ).
+Under assumption (A1), smin ≥C1N. Thus ∥E∥2 ≤1
+2smin is ensured whenever
+q
+1
+2L log 2N2
+δ
++
+4
+√
+2π
+P
+β ≤C1
+2 .
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+A sufficient explicit choice is
+L ≥8
+C2
+1
+log2N 2
+δ
+,
+β ≥
+16
+C1
+√
+2π P,
+while the exponentially small term is absorbed into constants for moderate β.
+Now, with row-sums controlled, we relate bA and A exactly through a decomposition that isolates
+the contributions of ∆in both the numerator and denominator.
+Lemma 11 (Exact perturbation identity and bound).
+bA −A = bD−1∆+ ( bD−1 −D−1)S.
+Moreover, whenever ∥E∥2 < smin,
+∥bA −A∥2 ≤
+∥∆∥2
+smin −∥E∥2
++
+∥S∥2 ∥E∥2
+smin(smin −∥E∥2).
+Proof. Using bS = S + ∆and bD = D + E,
+bA −A = bD−1 bS −D−1S = bD−1∆+ ( bD−1 −D−1)S.
+For the bound, we apply the submultiplicativity property of norms. When ∥E∥2 < smin, we have
+∥D−1∥2 = 1/smin and ∥bD−1∥2 ≤1/(smin −∥E∥2). Moreover,
+∥bD−1 −D−1∥2 = ∥bD−1(D −bD)D−1∥2 ≤∥bD−1∥2 ∥E∥2 ∥D−1∥2 ≤
+∥E∥2
+smin(smin −∥E∥2).
+Hence,
+∥bA −A∥2 ≤∥bD−1∥2 ∥∆∥2 + ∥bD−1 −D−1∥2 ∥S∥2 ≤
+∥∆∥2
+smin −∥E∥2
++
+∥S∥2 ∥E∥2
+smin(smin −∥E∥2).
+Specializing Lemma 11 to the regime ∥E∥2 ≤smin/2 (guaranteed w.h.p. by Lemma 10), we obtain
+a concise spectral bound for ∥bA −A∥2 in terms of ∥∆∥2.
+Lemma 12 (Attention deviation). If ∥E∥2 ≤smin/2, then
+∥bA −A∥2 ≤2∥∆∥2
+smin
++ 2∥S∥2
+s2
+min
+√
+N ∥∆∥2.
+Proof. From Lemma 11,
+∥bA −A∥2 ≤
+∥∆∥2
+smin −∥E∥2
++
+∥S∥2 ∥E∥2
+smin(smin −∥E∥2).
+Since ∥E∥2 ≤smin/2, it follows that
+1
+smin −∥E∥2
+≤
+1
+smin/2 =
+2
+smin
+.
+Substituting this bound gives
+∥bA −A∥2 ≤2∥∆∥2
+smin
++ 2∥S∥2
+s2
+min
+∥E∥2
+By Lemma 9(1), ∥E∥2 ≤∥∆∥∞≤
+√
+N ∥∆∥2. Therefore,
+∥bA −A∥2 ≤2∥∆∥2
+smin
++ 2∥S∥2
+s2
+min
+√
+N ∥∆∥2,
+which proves the claim.
+23
+
+--- Page 24 ---
+Published as a conference paper at ICLR 2026
+Finally, we translate attention deviation into end-to-end output deviation by a single multiplication
+with the value matrix V , yielding the main finite-sample guarantee.
+Theorem 13 (End-to-end output error). Let V ∈RN×d be the value matrix. With probability at
+least 1 −δ, if ∥E∥2 ≤smin/2 then
+∥bO−O∥F ≤
+
+2
+smin + 2∥S∥2
+√
+N
+s2
+min
+ 
+4
+√
+2π
+NP
+β
++ O
+ NPe−cβ
++ 4 N
+√
+L
+q
+log 2N
+δ + 4
+3
+N
+L log 2N
+δ
+
+∥V ∥F ,
+where c = 2 tanh(1).
+Proof. By the estimator identity, bO = bAV and O = AV , hence using submultiplicativity of the
+Frobenius norm,
+∥bO −O∥F = ∥( bA −A)V ∥F ≤∥bA −A∥2 ∥V ∥F .
+Under the condition ∥E∥2 ≤smin/2, Lemma 12 (Attention deviation) gives
+∥bA −A∥2 ≤
+
+2
+smin + 2∥S∥2
+√
+N
+s2
+min
+
+∥bS −S∥2.
+Applying Theorem 6 (Kernel deviation) yields, with probability at least 1 −δ,
+∥bS −S∥2 ≤∥˜B∥2 + 4 N
+√
+L
+r
+log2N
+δ
++ 4
+3
+N
+L log2N
+δ .
+Finally, substitute the explicit bias bound from Lemma 8:
+∥˜B∥2 ≤
+4
+√
+2π
+NP
+β
++ O
+ NPe−cβ
+,
+c = 2 tanh(1).
+Combining the three equations proves the stated inequality:
+∥bO −O∥F ≤
+
+2
+smin + 2∥S∥2
+√
+N
+s2
+min
+ 
+4
+√
+2π
+NP
+β
++ O
+ NPe−cβ
++ 4 N
+√
+L
+q
+log 2N
+δ + 4
+3
+N
+L log 2N
+δ
+
+∥V ∥F .
+(7)
+Proof of Theorem 2. Under assumptions (A1) and (A2), we have smin ≥C1N and ∥S∥2 ≤C2N.
+Therefore, the prefactor on the r.h.s. of Eq. equation 7 boils down to
+2
+smin
++ 2∥S∥2
+√
+N
+s2
+min
+≤
+2
+C1N + 2C2N
+√
+N
+C2
+1N 2
+= O
+ 1
+√
+N
+
+.
+(8)
+Therefore, combining eqs. equation 7 and equation 8 yields
+∥bO −O∥F =O
+
+1
+√
+N
+
+NP
+β +
+N
+√
+L
+q
+log 2N
+δ + N
+L log 2N
+δ + NPe−cβ
+∥V ∥F
+=O
+
+P
+√
+N
+β
++
+q
+N
+L log 2N
+δ +
+√
+N
+L log 2N
+δ + P
+√
+N e−cβ
+∥V ∥F .
+(9)
+Dividing both sides of Eq. equation 9 by
+√
+N to express the bound in terms of the per-token RMS
+error gives
+∥bO −O∥rms ≤O
+
+P
+β +
+q
+log(2N/δ)
+L
++ 1
+L log 2N
+δ + Pe−cβ
+∥V ∥F .
+To compare the last two variance terms, observe that
+1
+L log 2N
+δ
+q
+log(2N/δ)
+L
+=
+q
+log(2N/δ)
+L
+.
+Hence, whenever L ≥log(2N/δ) = Θ(log N), the (1/L) log(2N/δ) term is asymptotically domi-
+nated by
+p
+log(2N/δ)/L and can therefore be absorbed into it. The exponentially small correction
+Pe−cβ is also negligible for moderate values of β. Absorbing all constants and the mild difference
+between log(2N/δ) and log(N/δ) into the Big-O, we obtain
+∥bO −O∥rms = O
+
+P
+β +
+q
+log(N/δ)
+L
+
+∥V ∥F ,
+with probability at least 1 −δ. This completes the proof.
+24
+
+--- Page 25 ---
+Published as a conference paper at ICLR 2026
+B.4
+CAUSAL RACE ATTENTION
+Algorithm 2 RACE Attention (causal)
+Input: Q, K, V ∈RN×d; number of hash tables L; number of hyperplanes P; temperature β > 0.
+Output: bO ∈RN×d.
+1: for ℓ= 1, . . . , L do
+2:
+Draw W (ℓ) ∈RP ×d
+// P random hyperplanes
+3:
+Define the corner set V = {±1}P (R = 2P ) with vr ∈{±1}P
+// R corners
+4:
+Build Φ(ℓ)
+Q , Φ(ℓ)
+K ∈RN×R with rows
+[ϕ(ℓ)(x)]r =
+exp{β(tanh(W (ℓ)x))⊤vr}
+P
+r′ exp{β(tanh(W (ℓ)x))⊤vr′},
+x ∈{Qi, Kj}.
+5:
+Initialize cumulative bucket statistics: A(ℓ)
+cum ←0R ∈RR, B(ℓ)
+cum ←0R×d ∈RR×d.
+6:
+for t = 1, . . . , N do
+7:
+Φ(ℓ)
+K [t, :] ∈RR,
+Vt ∈Rd
+8:
+A(ℓ)
+cum ←A(ℓ)
+cum + (Φ(ℓ)
+K [t, :])⊤
+// RR
+9:
+B(ℓ)
+cum ←B(ℓ)
+cum + (Φ(ℓ)
+K [t, :])⊤Vt
+// RR×d
+10:
+Φ(ℓ)
+Q [t, :] ∈RR
+11:
+num(ℓ)
+t
+←Φ(ℓ)
+Q [t, :] B(ℓ)
+cum
+// (1 × R) · (R × d) = Rd
+12:
+den(ℓ)
+t
+←Φ(ℓ)
+Q [t, :] A(ℓ)
+cum
+// (1 × R) · (R) = R
+13:
+end for
+14: end for
+15: For each t = 1, . . . , N:
+Numt = 1
+L
+L
+X
+ℓ=1
+num(ℓ)
+t
+∈Rd,
+Dent = 1
+L
+L
+X
+ℓ=1
+den(ℓ)
+t
+∈R,
+bOt = Numt
+Dent
+∈Rd.
+16: Return: bO =
+
+
+bO⊤
+1...
+bO⊤
+N
+
+∈RN×d.
+We implemented the causal version (see Algorithm 2) efficiently using OpenMP/CUDA-based par-
+allelization rather than a naive nested-loop approach. Each hash table is processed in a separate
+thread with its own cumulative bucket arrays, and updates are performed incrementally in a sin-
+gle left-to-right scan. This avoids redundant recomputation at every step using torch.cumsum() and
+enables CPU/GPU-level parallel execution with negligible synchronization overhead.
+25
+
+--- Page 26 ---
+Published as a conference paper at ICLR 2026
+Figure 7: RACE Attention pipeline from the inputs Q, K, V ∈RN×d to the output O ∈RN×d:
+queries/keys are soft-hashed into R buckets across L tables, keys/values form per-bucket summaries,
+and each query mixes the bucket summaries to produce O.
+Figure 8: An intuitive schematic of how RACE Attention runs with L hash tables and R buckets
+per table. Similarity between Queries and Keys is highest if they both assign a higher mass to same
+buckets across all hash tables.
+26

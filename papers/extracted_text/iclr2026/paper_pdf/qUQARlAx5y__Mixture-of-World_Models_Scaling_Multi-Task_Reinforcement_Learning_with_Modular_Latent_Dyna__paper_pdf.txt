@@ -1,0 +1,2958 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+MIXTURE-OF-WORLD MODELS:
+SCALING MULTI-TASK REINFORCEMENT LEARNING
+WITH MODULAR LATENT DYNAMICS
+Boxuan Zhang† Weipu Zhang⋄Zhaohan Feng† Wei Xiao† Jian Sun† Jie Chen⋆Gang Wang†∗
+†National Key Lab of Autonomous Intelligent Unmanned Systems, Beijing Institute of Technology
+⋆Department of Control Science and Engineering, Harbin Institute of Technology
+⋄Jiangxing Intelligence Inc.
+{zhangboxuan,zhfeng,xiaowei,sunjian,chenjie,gangwang}@bit.edu.cn
+weipuzhang.academic@gmail.com
+ABSTRACT
+A fundamental challenge in multi-task reinforcement learning (MTRL) is achiev-
+ing sample efficiency in visual domains where tasks exhibit significant hetero-
+geneity in both observations and dynamics. Model-based RL (MBRL) offers a
+promising path to sample efficiency through world models, but standard mono-
+lithic architectures struggle to capture diverse task dynamics, leading to poor re-
+construction and prediction accuracy. We introduce the mixture-of-world models
+(MoW), a scalable architecture that integrates three key components: i) modu-
+lar VAEs for task-adaptive visual compression, ii) a hybrid Transformer-based
+dynamics model combining task-conditioned experts with a shared backbone,
+and, iii) a gradient-based task clustering strategy for efficient parameter alloca-
+tion. On the Atari 100K benchmark, a single MoW agent (trained once over
+Atari 26 games) achieves a mean human-normalized score of 110.4%, competi-
+tive with the score 114.2% achieved by the recent STORM—an ensemble of 26
+task-specific models—while requiring 50% fewer parameters. On Meta-World,
+MoW attains a 74.5% average success rate within 300K steps, establishing a
+new state-of-the-art. These results demonstrate that MoW provides a scalable
+and parameter-efficient foundation for generalist world models.
+1
+INTRODUCTION
+The pursuit of sample-efficient reinforcement learning (RL) has led to significant progress in com-
+plex domains, from game-playing (Silver et al., 2016; Hansen et al., 2024) to robotic control (Ye
+et al., 2020). However, these advances are often confined to single-task settings, where the learned
+policies lack generalization (Yu et al., 2020a; Feng et al., 2026). Multi-task RL (MTRL) aims to
+overcome this by learning a unified policy across a diverse task suite (Yang et al., 2020). While
+model-free methods have been extended to MTRL (Xing et al., 2025), they inherit the poor sample
+efficiency of their single-task counterparts (Mnih et al., 2015; Schulman et al., 2017), limiting their
+applicability in real-world scenarios where data is scarce (Xia et al., 2018; Huang et al., 2025).
+In single-task settings, model-based RL (MBRL) has emerged as a path to achieving greater sample
+efficiency. World models learn compact latent representations of environment dynamics, enabling
+policy optimization entirely through “latent imagination” (Ha & Schmidhuber, 2018; Hafner et al.,
+2019; 2025). These methods typically combine a variational autoencoder (VAE) with a latent recur-
+rent state-space model (RSSM) using e.g., a recurrent neural network (RNN) (Hafner et al., 2019)
+or Transformer (Vaswani, 2017), and have shown remarkable success (Zhang et al., 2025; Hafner
+et al., 2025; Micheli et al., 2022; Zhang et al., 2023).
+Scaling world models to multi-task, visual domains presents a fundamental challenge: the inherent
+visual and dynamic heterogeneity across tasks. A single world model must simultaneously capture
+*Corresponding author
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+C
+C
+Agent
+Agent
+Shared Transformer
+Router
+. . .
+Expert 1
+Transformer Blocks
+Enc1
+Dec1
+Enc2
+Dec2
+Expert 2
+Expert Ne
+C
+Expert Ne-1
+Figure 1: Overview of the mixture-of-world models (MoW) architecture. Task-specific observations
+are encoded through specialized VAEs, with dynamics modeled by a mixture-of-Transformer experts
+routed via task embeddings. The design enables modular latent dynamics handling while maintain-
+ing parameter efficiency. Here, at time t for task k, ot
+k, rt
+k, ct
+k and at
+k denote the high-dimensional
+observation, reward, termination flag, and action, respectively. The stochastic representation zt
+k is
+sampled from the distribution Zt
+k, which is encoded from the observation ot
+k. The hidden state ht
+k
+is learned by the hybrid Transformer architecture, while ek represents the learnable task embedding
+and Ne is the number of experts.
+disparate visual features while accurately predicting task-specific dynamics—objectives that often
+conflict in practice, straining the capacity of monolithic architectures (Yu et al., 2020b). Simply
+conditioning a shared model on task identity often proves insufficient without abundant expert data
+(Hansen et al., 2024). Crucially, for visual MBRL, the model must achieve high-fidelity recon-
+struction to enable effective policy learning in the latent space—a challenge that remains largely
+unaddressed in MTRL.
+In this work, we propose the mixture-of-world models (MoW), a novel architecture designed for
+parameter- and sample-efficient MTRL in visual domains. The MoW explicitly addresses multi-
+task heterogeneity through a modular design. It employs a set of task-specific VAEs for visual
+encoding and a spatial-temporal dynamics core composed of a mixture of expert Transformers,
+guided by learned task embeddings. To ensure effective module specialization, we introduce a task
+prediction loss that enhances task discrimination in the latent space and an expert balance loss to
+prevent module collapse. Furthermore, we develop a gradient-based task clustering strategy during
+a warm-up phase to share components across tasks, significantly improving parameter efficiency.
+We evaluate MoW on two challenging benchmarks: the Atari 100K benchmark (discrete control)
+and Meta-World (continuous control). Our results demonstrate that a single MoW agent achieves
+human-normalized score performance competitive with an ensemble of 26 task-specific models on
+Atari while using half the parameters, and a 74.5% success rate on Meta-World within 300K steps,
+setting a new state-of-the-art. Ablation studies confirm the contribution of each component.
+Our main contributions are summarized below.
+• The MoW architecture: A mixture-of-world models with modular VAEs and transformer
+experts that captures diverse task dynamics while maintaining reconstruction fidelity.
+• Specialized losses: Task prediction and expert balance losses that enable effective task
+discrimination and balanced utilization across expert components.
+• Gradient-based clustering: A warm-up strategy that optimizes parameter sharing by clus-
+tering tasks based on gradient similarity, enhancing model efficiency.
+• State-of-the-art performance:
+Empirical validation on Atari 100K and Meta-World
+demonstrating superior sample efficiency and parameter scaling.
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+2
+RELATED WORK
+2.1
+MULTI-TASK REINFORCEMENT LEARNING
+Multi-task reinforcement learning seeks to develop agents capable of generalizing across a diverse
+set of tasks by leveraging shared experience and representations. A dominant paradigm in online
+MTRL employs task-conditioned policies, where a unified network or value function is conditioned
+on task identifiers or embeddings (Xu et al., 2020; Sodhani et al., 2021b). This approach has success-
+fully adapted celebrated model-free algorithms like PPO (Schulman et al., 2017) and SAC (Haarnoja
+et al., 2018) to multi-task settings, though they inherit the sample inefficiency inherent to model-free
+RL methods. Offline MTRL methods, such as those based on decision Transformers (Lee et al.,
+2022; Kong et al., 2025), learn from fixed datasets of expert demonstrations. While effective within
+their data constraints, these approaches cannot improve through online interaction and are typically
+limited to state-based inputs, where errors in task conditioning can critically degrade performance
+when extended to visual inputs.
+The mixture-of-experts (MoE) architecture, widely successful in scaling large language models to
+trillions of parameters by virtue of their modular, sparsely activated design (Fedus et al., 2022; Lep-
+ikhin et al., 2020), has recently been applied to MTRL. In such models, only a small subset of experts
+is invoked for each input token, enabling dramatic increases in model capacity without proportional
+growth in computational cost. Methods like MOORE (Hendawy et al., 2023) and D2R (He et al.,
+2024) incorporate MoE into SAC, improving knowledge sharing and specialization. However, these
+approaches remain evaluated primarily on low-dimensional state spaces and are hampered by the
+sample inefficiency of model-free learning. The significantly greater challenge of high-dimensional
+visual inputs-with their complex perception and dynamics-remains largely unaddressed by existing
+model-free MoE methods.
+2.2
+WORLD MODELS FOR REINFORCEMENT LEARNING
+World models have emerged as a powerful approach for improving sample efficiency in RL by
+enabling learning from imagined trajectories. Early work like SimPLe (Kaiser et al., 2019) demon-
+strated the potential of learned models for policy learning. The Dreamer series (Hafner et al., 2019;
+2025) advanced this paradigm with recurrent state-space models that support long-horizon latent
+imagination. Recently, Transformers have shown strong performance as world models due to their
+capacity for long-range dependency modeling. IRIS (Micheli et al., 2022) and ∆-IRIS (Micheli
+et al., 2024) employ VQ-VAEs (Van Den Oord et al., 2017) for discrete visual tokenization, while
+STORM (Zhang et al., 2023) achieves state-of-the-art results on Atari with a customized Trans-
+former architecture. DIAMOND (Alonso et al., 2024) explores diffusion-based world models oper-
+ating directly in pixel space, improving visual fidelity.
+Critically, these advances all focus on single-task RL settings. While TD-MPC2 (Hansen et al.,
+2024) extends model-based principles to multi-task domains, it operates on low-dimensional state
+inputs rather than more challenging visual observations and relies on expert data. The challenge of
+building world models that simultaneously handle diverse visual inputs and dynamics across multi-
+ple tasks—while maintaining reconstruction fidelity for effective latent imagination—remains open.
+Our work directly addresses this gap by introducing a modular architecture specifically designed for
+multi-task visual world models.
+3
+METHOD
+We consider a multi-task setting with K tasks collectively denoted by T = {T1, T2, · · · , TK}.
+Each task Tk is a partially observable Markov decision process (POMDP) defined by the tuple
+Mk = (Ok, Ak, Pk, Rk, γk), where Ok is the observation space, Ak is the action space, Pk is
+the transition dynamics, Rk is the reward function, and γk ∈[0, 1) is the discount factor. The
+objective is to learn a single policy π that maximizes the expected discounted return across all tasks:
+PK
+k=1 E(ok,ak)∼π,Pk
+P∞
+t=1 γt−1
+k
+Rk(ot
+k, at
+k)
+
+.
+From the preceding observations and discussions, our key insight is that constructing a mixture of
+world models across heterogeneous tasks, along with performing imagination and training in paral-
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+lel, enables the development of a more generalizable multi-task agent while significantly possessing
+the parameter scalability.
+3.1
+ARCHITECTURE OVERVIEW
+The MoW consists of two primary modules: a perceptual module that encodes high-dimensional
+visual observations into a compact latent space, and a temporal module that learns task-adaptive
+dynamics within this latent space. The overall architecture is depicted in Figure 1.
+3.1.1
+PERCEPTUAL MODULE
+The perceptual module encodes each image observation ot
+k into a stochastic representation zt
+k using
+a categorical VAE. Each task Tk is assigned a specific encoder-decoder pair (qϕ,ik, pϕ,ik), where
+the index ik ∈[1, Nm] is determined by a gradient-based clustering procedure detailed in Sec-
+tion 3.6.To avoid an excessive number of hyperparameters, Nm is not only the number of VAEs,
+but also the number of distribution, reward, continuation predictors and critic networks mentioned
+later (all components with the subscript ik , as the predictors and VAEs are corresponding in task
+k). A learnable task embedding ek (with ||ek||2 = 1) conditions the encoding and decoding pro-
+cesses. The stochastic representation zt
+k is sampled from the categorical posterior distribution Zt
+k
+(comprises 32 categories, each with 32 classes) to serve as a compact representation of the original
+observation with the straight-through gradient trick (Bengio et al., 2013):
+Posterior:
+zt
+k ∼qϕ,ik(zt
+k | ot
+k, ek) = Zt
+k
+Reconstruction:
+ˆot
+k ∼pϕ,ik(ˆot
+k | zt
+k, ek).
+(1)
+3.1.2
+TEMPORAL MODULE
+The temporal module models the dynamics in the latent space, which takes the sequence of the
+stochastic representations and actions as input, and predicts the next latent state, reward, task index,
+and continuation flag. The module is composed of a mixture of expert Transformers and a shared
+Transformer, while the variables are also conditioned by the task embedding ek.
+Input Representation.
+The stochastic representation zt
+k and action at
+k are first concatenated
+via a multi-layer perceptron (MLP) mϕ,j to a unified token mt
+j,k for each expert j, where j =
+1, 2, · · · , Ne index the activated expert Transformers.
+m1:t
+j,k = mϕ,j(z1:t
+k , a1:t
+k , ek).
+(2)
+Expert Selection. We employ a task-level router function that takes the task embedding ek as the
+input, and produces a set of expert indices Jk with their corresponding weights Wk via a TopK
+operation applied to a softmax output of an MLP.
+Sk = Softmax (MLP(ek)) ,
+Wk, Jk = TopK (Sk, topk = nk) ,
+(3)
+where Sk denotes the task-to-expert affinity scores, TopK selects the nk largest scores,
+Jk
+=
+[j1
+k, j2
+k, · · · , jnk
+k ] denote the activated expert Transformer indices,
+and Wk
+=
+[0, · · · , w1
+k, · · · , w2
+k, · · · , wnk
+k , · · · , 0] is the normalized weight vector of activated experts, where
+the position of wk indicates the activation of the corresponding expert. The selection of ik is deter-
+mined during the warmup stage by clustering the gradient vectors and is fixed throughout training.
+In contrast, the expert indices Jk are dynamically determined by a TopK function conditioned on
+the current task embedding, and changes over time as the world model is trained in an end-to-end
+manner but remains fixed in a single training step.
+Expert and Shared Transformers. The tokens are processed by the activated expert Transformers
+fϕ,j for j ∈Jk. The outputs of the experts are concatenated to form a token l1:t
+k , which is then passed
+to the shared Transformer Fϕ to produce the hidden state ht
+k. The expert Transformers specialize in
+modeling task-specific dynamics, while the shared Transformer captures common knowledge across
+the entire domain.
+l1:t
+k
+= concat
+h
+fϕ,j1
+k(m1:t
+j1
+k,k), · · · , fϕ,j
+nk
+k (m1:t
+j
+nk
+k
+,k)
+i
+,
+h1:t
+k
+= Fϕ(l1:t
+k , ek).
+(4)
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+Prediction Heads. The hidden state ht
+k is used to predict the next latent state distribution, reward,
+and continuation flag. Additionally, an auxiliary task predictor head is used to encourage task-
+discriminative feature extraction:
+ˆZt+1
+k
+= gD
+ϕ,ik(ˆzt+1
+k
+| ht
+k, ek),
+ˆrt
+k = gR
+ϕ,ik(ht
+k, ek),
+ˆct
+k = gC
+ϕ,ik(ht
+k, ek),
+ˆk = gT
+ϕ (ht
+k).
+(5)
+An underlying intuition is that the expert selection should remain relatively stochastic in the early
+stages of training to facilitate balanced expert utilization. As training progresses and converges,
+the selection should gradually become more deterministic; otherwise, frequent switching of experts
+may destabilize the end-to-end optimization. To embody this intuition, we anneal the temperature
+coefficient in the softmax function progressively toward 1 during training to avoid excessively low
+temperatures that result in nearly one-hot distributions, which would hinder experts’ collaboration.
+3.2
+DESIGN RATIONALE FOR TASK-LEVEL ROUTING
+We adopt task-level routing instead of token-level routing, in other words, we use task embeddings
+ek rather than mixture tokens mt
+j,k to select experts, based on the following considerations. First,
+in conventional Transformer architectures, MoE is typically applied to the feed-forward networks
+rather than the self-attention layers. This design implies that the MoE module primarily models
+sparse transformations between data features, rather than capturing the temporal dependencies that
+self-attention layers focus on. To address this, we decouple the MoE mechanism from the Trans-
+former architecture and apply it externally, enabling MoW to learn task-specific dynamics across
+different tasks through the mixture of transformer backbones.
+Second, if expert Transformers are selected based on the mixed token, each token along the training
+trajectory may activate different experts, even within the same task. Such dynamic routing results in
+each expert observing only partial sequences, leading to the fragmented learning of task dynamics.
+As a consequence, the experts may fail to effectively model the full temporal structure of the task.
+In contrast, routing based on task embeddings ensures consistent expert activation within each task,
+allowing individual experts to capture more complete and coherent task dynamics.
+3.3
+WORLD MODEL LEARNING
+We train the MoW in an end-to-end manner using a self-supervised learning paradigm, leveraging
+data from all tasks jointly. For task Tk, the total loss is given by
+Lk(ϕ) =
+X
+t
+
+Lrec
+t,k(ϕ) + Lrew
+t,k (ϕ) + Lcon
+t,k (ϕ) + Ltask
+t,k (ϕ) + β1Ldyn
+t,k (ϕ) + β2Lrep
+t,k (ϕ)
+
+,
+(6)
+with hyperparameters β1 = 0.5 and β2 = 0.1 fixed, where Lrec
+t,k(ϕ) denotes the reconstruction loss
+of the original image, Lrew
+t,k (ϕ) the prediction loss of the reward, Lcon
+t,k (ϕ) the prediction loss of the
+continuation flag, and Ltask
+t,k (ϕ) represents the prediction loss of task Tk:
+Lrec
+t,k(ϕ) = ∥ˆot
+k −ot
+k∥2,
+Lrew
+t,k (ϕ) = SymlogCrossEnt(ˆrt
+k, rt
+k),
+Lcon
+t,k (ϕ) = BinaryCrossEnt(ˆct
+k, ct
+k),
+Ltask
+t,k (ϕ) = CrossEnt(ˆk, k).
+(7)
+Introducing auxiliary predictors and their associated losses has proven effective for shaping the
+representation of latent states (Burchi & Timofte, 2025). Therefore, we incorporate an additional
+task prediction loss Ltask
+t,k (ϕ) to explicitly guide the training of hidden states ht
+k toward being task-
+discriminative. This ensures that the hidden states contain sufficient information for task identifica-
+tion, thereby enhancing the accuracy of the imagination process.
+The losses Ldyn
+t,k (ϕ) and Lrep
+t,k (ϕ) train the dynamics predictor network to predict the next stochastic
+distributions from the hidden states by minimizing the Kullback–Leibler (KL) divergence between
+the predictor output distribution ˆZt+1
+k
+= gD
+ϕ,ik(ˆzt+1
+k
+|ht
+k) and the next encoder representation Zt
+k =
+qϕ,ik(zt
+k|ot
+k, ek):
+Ldyn
+t,k (ϕ) = max
+ 1, KL
+
+sg(Zt+1
+k
+)∥ˆZt+1
+k
+
+,
+Lrep
+t,k (ϕ) = max
+ 1, KL
+
+Zt+1
+k
+∥sg( ˆZt+1
+k
+)
+
+,
+(8)
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+Imagined by MoW
+Imagined by multi-task STORM
+Figure 2: The MoW enables precise modeling and reconstruction of task-specific dynamics through
+task clustering and expert routing. We present the reconstructed images decoded by the final imag-
+ination states of the 26 tasks in Atari 100K, where the horizon is set to 16 steps. Compared to the
+vanilla transformer employed in vanilla STORM framework, the MoW demonstrates improved task
+discrimination and more accurate imagination in multi-task settings.
+where the maximum operator is used to clip the loss below the value of 1 nat ≈1.44 bits (Chen
+et al., 2022) and sg(·) is the stop-gradient operator.
+To effectively alleviate the problem of gradient conflicts in multi-task learning and mitigate the scale
+disparities among loss terms, we employ harmonious loss weights to train the MoW.
+3.4
+HARMONIOUS AND BALANCED LOSS
+The central challenges in MTRL lie in two key aspects: i) The first is the presence of gradient
+conflicts across tasks, which drive the shared parameters in divergent directions. This issue is further
+exacerbated in the end-to-end training pipelines involving multiple components, often resulting in
+degraded representations and unstable training dynamics (Chen et al., 2018). While prior works have
+introduced techniques such as gradient projection and conflict-aware optimization to mitigate this
+problem, these approaches typically incur additional model complexity. ii) The second challenge
+concerns the sensitivity of performance to the relative weighting of task-specific losses. Manually
+tuning these weights is both non-trivial and resource-intensive, thereby limiting the practicality of
+MTRL in real-world scenarios (Kendall et al., 2018).
+To address these challenges, the MoW is trained end-to-end by incorporating the harmonious
+weights (Ma et al., 2024), which is applied on top of the individual task-specific losses (defined
+in Equation 9). This loss dynamically adjusts task weights to mitigate potential gradient conflicts
+during training, defined as follows
+LH(ϕ) =
+K
+X
+k=1
+1
+σk
+Lk(ϕ) + ln(1 + σk),
+(9)
+where LH(ϕ) is the harmonized loss and the rectified scale is equal to
+2
+1+√
+1+4/E[Lk] < 1 (derived
+in Appendix A.7). Finally, the balance loss is added to the rectified loss
+L(ϕ) = LH(ϕ) + 0.1Lbal(ϕ),
+(10)
+with Lbal(ϕ) = ∥PK
+k=1 Wk −KNk
+Ne 1Ne∥2
+2, where Wk is the normalized weight vector and 1Ne
+is a vector consisting of ones. Since the MoW does not explicitly apply experts’ weights but in-
+stead combine expert features via concatenation, the balance loss primarily serves to encourage the
+activation of all experts, rather than enforcing identical expert selection distributions across tasks.
+3.5
+AGENT LEARNING
+The agent learns entirely through the imagination trajectories enabled by the world model, making
+accurate reconstruction of the raw observations a critical factor for training efficient agents. As
+shown in Fig. 2, compared to the multi-task vanilla STORM, the MoW produces imagined trajec-
+tories that reconstruct the raw images more faithfully while avoiding confusion across tasks. We
+provide detailed reconstruction results of MoW across different tasks in Appendix A.6.
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+To initiate the imagination process, a short context trajectory is randomly sampled from the replay
+buffer to compute the initial posterior distribution Zt
+k. During inference, rather than drawing sam-
+ples from the posterior, the latent representation zt
+k is sampled from the prior distribution ˆZt
+k. To
+accelerate inference, we incorporate the key-value (KV) caching mechanism within the Transformer
+architecture (Chen, 2022), which allows for faster autoregressive rollout by reusing previously com-
+puted attention keys and values. The agent’s state is formed by concatenating zt
+k, ht
+k, and ek
+State:
+st
+k = [zt
+k, ht
+k, ek],
+Critic:
+Vψ,ik(st
+k) ≈Eπθ,k
+h ∞
+X
+τ=0
+γτ
+krt+τ
+k
+i
+,
+Actor:
+at
+k ∼πθ(at
+k | st
+k).
+(11)
+Other core training configurations follow the settings established in the STORM framework, for all
+tasks, the agent shares the actor network, while the number of critic networks matches the number of
+VAEs Nm. For task Tk, the corresponding critic network index is also determined through clustering
+the gradient vector during the warm-up stage. The complete loss of the actor-critic algorithm is
+described in Equation 12 and Equation 14, where ˆrt
+k corresponds to the predicted reward, and ˆct
+k
+represents the predicted continuation flag. The critic networks learn to approximate the distribution
+of the λ-return estimates Rλ
+t,k using the maximum likelihood loss
+L(ψ) =
+X
+k,t
+h
+Lsym
+ Vψ,ik(st
+k) −sg(Rλ
+t,k)
+
++ Lsym
+ Vψ,ik(st
+k) −sg(VψEMA,ik(st
+k))
+ i
+,
+(12)
+where Lsym represents the symlog two-hot loss and VψEMA is the exponential moving average of
+the critic network ψ for stabilizing training and preventing overfitting. The λ-return Rλ
+t,k (Sutton &
+Barto, 2018; Hafner et al., 2025) is recursively defined as follows
+Rλ
+t,k = rt
+k + λct
+k
+h
+(1 −λ)Vψ,i(st+1
+k
+) + λRλ
+t+1,k
+i
+,
+Rλ
+L,k = Vψ,i(sL
+k ).
+(13)
+The actor network is trained using the surrogate loss function
+L(θ) =
+X
+k,t
+
+−sg
+ 
+Rλ
+t,k −Vψ,i(st
+k)
+max(1, S)
+!
+ln πθ(at
+k|st
+k) −ηH(πθ(at
+k|st
+k))
+
+,
+(14)
+where H(·) denotes the entropy of the policy distribution, and the constant η represents the coeffi-
+cient for entropy loss. The normalization ratio S is defined in Equation 15, computed as the range
+between the 95 and 5 percentiles of the λ-return Rλ
+t,k across batch
+S = percentile(Rλ
+t,k, 95) −percentile(Rλ
+t,k, 5).
+(15)
+3.6
+WARMUPING MOW
+World model-based RL methods typically perform a number of interactions with the environment
+using random actions prior to the world model training stage, populating the replay buffer to enable
+a stable initialization phase. During the warmup stage of MoW, after collecting a sufficient amount
+of random interaction data, we fix the replay buffer and refrain from updating the agent. Instead,
+we perform a number of world model training steps to initialize the dynamics representation. In
+this process, the expert Transformer modules are trained following the same end-to-end manner as
+previously described in Equation 10. However, only a single set of VAE and its associated predictors
+participate in the warmup training stage. Upon completion of the warm-up stage, the parameters of
+these components are copied to the remaining modules with identical architectures, after which the
+standard iterative updates of the world model and agent, as classic world model-based RL. After the
+warmup stage, we extract the gradient vector associated with each task. These task-specific gradient
+vectors are then clustered to determine which tasks should share the i-th set of VAE, predictor
+and critic network. This task grouping strategy based on the gradient correspondence is similar to
+HarmoDT (Hu et al., 2024). In practice, due to the large number of trainable parameters in our
+mixture world model, we reduce the computational cost by averaging the gradient vectors from each
+neural network layer. For a more comprehensive understanding of training the mixture world model,
+we provide the pseudo-code implementation in Appendix A.12.
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+0
+50k
+100k
+Environment steps
+0.00
+0.25
+0.50
+0.75
+1.00
+Human normalized mean
+Human Score
+Atari 100k
+ Gamer Mean
+Agent
+World model
+0
+250
+500
+750
+1000
+1250
+1500
+1750
+2000
+Model size (MB)
+143.6
+339.0
+828.9
+1638.5
+Model Size 
+(26 tasks in Atari 100k)
+0
+150k
+300k
+Environment steps
+0%
+10%
+20%
+30%
+40%
+50%
+60%
+70%
+80%
+Average success rate
+Meta-World 
+50 tasks
+Mixture-of-World Models
+Single-task STORM
+Figure 3:
+Results of MoW on the Atari 100K benchmark (left) and the Meta-world benchmark
+(right). Compared to baseline STORM, MoW results a 50% reduction in model size (middle).
+Table 1: Results on MetaWorld MT50
+Algorithms
+Input
+Success Rate (Episode Length)
+Total Environment Steps
+MTSAC
+State
+49.3 ± 1.5 (150)
+20M
+CARE
+50.8 ± 1.0 (150)
+PaCo
+57.3 ± 1.3 (150)
+MOORE
+State
+72.9 ± 3.3 (150)
+100M
+MoW (ours)
+Image
+74.5 ± 1.1 (500)
+15M
+4
+EXPERIMENTS
+We evaluate the effectiveness of MoW in improving the sample efficiency of baseline MBRL meth-
+ods across two representative benchmarks: Meta-world with robotic manipulation tasks (continuous
+action spaces) and Atari 100K with video games with discrete action spaces. Experimental results
+are shown in Figure 3 and demonstrate that our architecture not only substantially enhances sample
+efficiency but also achieves competitive performance with significantly fewer parameters compared
+to baselines. In our experiments, we use a machine with NVIDIA 4090 graphics cards with 8 CPU
+cores and 24 GB RAM. We use distributed data parallel (DDP) in Pytorch to enable multi-GPU
+parallel multi-task training, and training MoW on each Atari game for 100K steps took roughly 3.5
+hours. Hyperparameters can be found in Appendix A.9.
+4.1
+ATARI 100K EXPERIMENTS
+The Atari 100K benchmark is a widely adopted testbed for RL agents. To determine the performance
+of a human player H, the player is allowed to become familiar with the game under the same sample
+constraint. The MoW achieves a human normalized score of 110.4% on the Atari 100K benchmark
+using a single unified model. To ensure the fairness and quality of our results, we also reproduced
+STORM results using the official code and configurations, which is a human normalized score of
+114.2%. Furthermore, compared to STORM, our primary baseline, which requires 1, 977.5 MB to
+support 26 tasks, the MoW achieves comparable performance with a significantly more compact
+model of only 972.5 MB. Here, MB refers to the storage size of the actual model checkpoint (.pth
+file), corresponding to a 50% reduction in model size. Details are provided in Appendix A.10.1.
+4.2
+META-WORLD EXPERIMENTS
+Meta-World is a benchmark of 50 robotic manipulation tasks with fine-grained observation details,
+such as small target objects. In all tasks, the episode length is 500 environment steps with no action
+repeat. In this benchmark, performance is primarily measured by the average success rate across all
+tasks, offering a holistic evaluation of the robot system’s adaptability and competence in varied task
+settings. We compare MoW with the official results of state-of-the-art MTRL methods based on state
+inputs. As stated in Table 1, although MoW makes decisions solely from the visual observations-a
+considerably more challenging setting than state-based decision-making, it still achieves a success
+rate of 74.5% within only 300K steps per task (15M steps in total). Notably, this surpasses the
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+performance of classic model-free baselines trained for 20M steps, highlighting MoW’s remarkable
+sample efficiency.
+4.3
+PARAMETER SCALABILITY
+398
+541
+685
+770
+829
+Model size (MB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Human normalized mean
+(3)
+(6)
+(9)
+(12)
+(3)
+(6)
+(9)
+(12)
+Human Score
+Parameter scalability on Atari 100k
+Scalability of clusters
+Scalability of experts
+Figure 4: By increasing the number of experts
+(blue) and clusters of VAEs (yellow), MoW ef-
+fectively unlocks the parameter scalability.
+Similar to the MoE architecture, MoW exhibits
+strong scalability to a large number of tasks,
+owing to its parameter-efficient design. Specif-
+ically, MoW enhances overall performance by
+increasing the number of expert modules, ef-
+fectively reducing the task load per expert. As
+illustrated in Figure 4, MoW achieves compet-
+itive results across 26 tasks in the Atari 100K
+benchmark with only 12 experts. Within a rea-
+sonable range, scaling up the model size leads
+to substantial performance gains.
+Notably,
+increasing the number of expert Transform-
+ers yields more pronounced improvements, as
+these modules directly facilitate task-specific
+dynamics modeling. While adding additional
+VAEs also influences performance by improv-
+ing reconstruction precision, their impact is
+comparatively modest when the number of ex-
+pert Transformers is held constant.
+5
+ABLATION STUDIES
+50k
+Environment steps
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Human normalized mean
+100k
+0
+Human Score
+Gamer Mean
+Mixture-of-World Models
+Multi-task STORM
+Multi-task STORM (12 VAEs)
+Figure 5: Ablation studies on muti-task STORM.
+To further investigate the advantages of MoW,
+we first extended the vanilla STORM frame-
+work to a multi-task setting by incorporating
+task embeddings. The resulting model failed
+to train effectively, indicating that the baseline
+is not readily adaptable to multi-task scenar-
+ios. To ensure this limitation was not due to
+the VAE, we introduced multiple VAEs into the
+vanilla STORM baseline. The results show that
+the vanilla Transformer configuration did not
+achieve performance comparable to our mix-
+ture architecture.
+As a result, the agent was
+unable to learn effectively within the latent
+space.
+In particular, it suffered from signifi-
+cantly higher dynamics modeling loss, suggest-
+ing that the imagination process was severely
+impaired (as shown in Figure 2).
+6
+CONCLUSION
+In this work, we introduced a MTRL approach based on the modular mixture-of-world models
+(MoW) architecture. By combining multiple categorical VAEs, parallel expert Transformers, and
+a shared Transformer, the MoW effectively captures diverse task dynamics while maintaining high
+sample efficiency. The use of task prediction and expert balance losses further enhances task dis-
+crimination and expert utilization, respectively. Additionally, the proposed warmup stage promotes
+efficient module sharing through gradient-based task clustering, substantially reducing model com-
+plexity. Substantial experiments on Atari 100K and Meta-World benchmarks demonstrate that the
+MoW not only surpasses prior world model baselines, but also achieves superior performance with
+significantly fewer parameters. These results underscore the potential of MoW as a scalable and
+efficient framework for general MTRL.
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+ACKNOWLEDGMENTS
+This work was supported in part by the National Natural Science Foundation of China under Grants
+62495095, 62495090, and U23B2059.
+REFERENCES
+Eloi Alonso, Adam Jelley, Vincent Micheli, Anssi Kanervisto, Amos Storkey, Tim Pearce, and
+Franc¸ois Fleuret. Diffusion for world modeling: Visual details matter in atari. arXiv:2405.12399,
+2024.
+Yoshua Bengio, Nicholas L´eonard, and Aaron Courville.
+Estimating or propagating gradients
+through stochastic neurons for conditional computation. arXiv:1308.3432, 2013.
+Maxime Burchi and Radu Timofte. Learning transformer-based world models with contrastive pre-
+dictive coding. arXiv:2503.04416, 2025.
+Carol
+Chen.
+Transformer
+inference
+arithmetic.
+https://kipp.ly/blog/
+transformer-inference-arithmetic/, 2022. Accessed: 2025-07-17.
+Chang Chen, Yi-Fu Wu, Jaesik Yoon, and Sungjin Ahn. Transdreamer: Reinforcement learning
+with transformer world models. arXiv:2202.09481, 2022.
+Zhao Chen, Vijay Badrinarayanan, Chen-Yu Lee, and Andrew Rabinovich. Gradnorm: Gradient
+normalization for adaptive loss balancing in deep multitask networks. In Proceedings of the 35th
+International Conference on Machine Learning, pp. 794–803, Stockholm, Sweden, 2018. PMLR.
+Rahul Dey and Fathi M Salem. Gate-variants of gated recurrent unit (GRU) neural networks. In
+International Midwest Symposium on Circuits and Systems, pp. 1597–1600. IEEE, 2017.
+William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion parameter
+models with simple and efficient sparsity. Journal of Machine Learning Research, 23(120):1–39,
+2022.
+Zhaohan Feng, Ruiqi Xue, Lei Yuan, Yang Yu, Ning Ding, Meiqin Liu, Bingzhao Gao, Jian Sun,
+Xinhu Zheng, and Gang Wang. Multi-agent embodied AI: Advances and future directions. Sci-
+ence China Information Sciences, 69(5):151202, 2026.
+David Ha and J¨urgen Schmidhuber. World models. arXiv:1803.10122, 2018.
+Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine. Soft actor-critic: Off-policy
+maximum entropy deep reinforcement learning with a stochastic actor. In International Confer-
+ence on Machine Learning, pp. 1861–1870. PMLR, 2018.
+Danijar Hafner, Timothy Lillicrap, Jimmy Ba, and Mohammad Norouzi. Dream to control: Learning
+behaviors by latent imagination. arXiv:1912.01603, 2019.
+Danijar Hafner, Jurgis Pasukonis, Jimmy Ba, and Timothy Lillicrap. Mastering diverse control tasks
+through world models. Nature, 640:647–653, 2025.
+Nicklas Hansen, Hao Su, and Xiaolong Wang. Td-mpc2: Scalable, robust world models for contin-
+uous control. In International Conference on Learning Representations, 2024.
+Jinmin He, Kai Li, Yifan Zang, Haobo Fu, Qiang Fu, Junliang Xing, and Jian Cheng. Not all
+tasks are equally difficult: Multi-task deep reinforcement learning with dynamic depth routing.
+In Proceedings of the AAAI Conference on Artificial Intelligence, volume 38, pp. 12376–12384,
+2024.
+Ahmed Hendawy, Jan Peters, and Carlo D’Eramo. Multi-task reinforcement learning with mixture
+of orthogonal experts. arXiv preprint arXiv:2311.11385, 2023.
+Shengchao Hu, Ziqing Fan, Li Shen, Ya Zhang, Yanfeng Wang, and Dacheng Tao.
+Harmodt:
+Harmony multi-task decision transformer for offline reinforcement learning. arXiv:2405.18080,
+2024.
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+Jincai Huang, Yongjun Xu, Qi Wang, Qi Cheems Wang, Xingxing Liang, Fei Wang, Zhao Zhang,
+Wei Wei, Boxuan Zhang, Libo Huang, et al. Foundation models and intelligent decision-making:
+Progress, challenges, and perspectives. The Innovation, 2025.
+Sergey Ioffe and Christian Szegedy. Batch normalization: Accelerating deep network training by
+reducing internal covariate shift. In International conference on machine learning, pp. 448–456.
+pmlr, 2015.
+Lukasz Kaiser, Mohammad Babaeizadeh, Piotr Milos, Blazej Osinski, Roy H Campbell, Konrad
+Czechowski, Dumitru Erhan, Chelsea Finn, Piotr Kozakowski, Sergey Levine, et al. Model-based
+reinforcement learning for atari. arXiv:1903.00374, 2019.
+Alex Kendall, Yarin Gal, and Roberto Cipolla. Multi-task learning using uncertainty to weigh losses
+for scene geometry and semantics. In Proceedings of the IEEE conference on computer vision
+and pattern recognition, pp. 7482–7491, 2018.
+Yilun Kong, Guozheng Ma, Qi Zhao, Haoyu Wang, Li Shen, Xueqian Wang, and Dacheng Tao.
+Mastering massive multi-task reinforcement learning via mixture-of-expert decision transformer.
+arXiv:2505.24378, 2025.
+Yann LeCun, Bernhard Boser, John S Denker, Donnie Henderson, Richard E Howard, Wayne Hub-
+bard, and Lawrence D Jackel. Backpropagation applied to handwritten zip code recognition.
+Neural computation, 1(4):541–551, 1989.
+Kuang-Huei Lee, Ofir Nachum, Mengjiao Sherry Yang, Lisa Lee, Daniel Freeman, Sergio Guadar-
+rama, Ian Fischer, Winnie Xu, Eric Jang, Henryk Michalewski, et al. Multi-game decision trans-
+formers. In Advances in neural information processing systems, volume 35, pp. 27921–27936,
+2022.
+Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang,
+Maxim Krikun, Noam Shazeer, and Zhifeng Chen. Gshard: Scaling giant models with conditional
+computation and automatic sharding. arXiv:2006.16668, 2020.
+Haoyu Ma, Jialong Wu, Ningya Feng, Chenjun Xiao, Dong Li, Jianye Hao, Jianmin Wang, and
+Mingsheng Long. Harmonydream: Task harmonization inside world models. In International
+Conference on Machine Learning, pp. 33983–34007. PMLR, 2024.
+Vincent Micheli, Eloi Alonso, and Franc¸ois Fleuret. Transformers are sample-efficient world mod-
+els. arXiv:2209.00588, 2022.
+Vincent Micheli, Eloi Alonso, and Franc¸ois Fleuret. Efficient world models with context-aware
+tokenization. arXiv:2406.19320, 2024.
+Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei A Rusu, Joel Veness, Marc G Belle-
+mare, Alex Graves, Martin Riedmiller, Andreas K Fidjeland, Georg Ostrovski, et al. Human-level
+control through deep reinforcement learning. Nature, 518(7540):529–533, 2015.
+Jan Robine, Marc H¨oftmann, Tobias Uelwer, and Stefan Harmeling. Transformer-based world mod-
+els are happy with 100k interactions. arXiv:2303.07109, 2023.
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy
+optimization algorithms. arXiv:1707.06347, 2017.
+Younggyo Seo, Danijar Hafner, Hao Liu, Fangchen Liu, Stephen James, Kimin Lee, and Pieter
+Abbeel. Masked world models for visual control. In Conference on Robot Learning, pp. 1332–
+1344. PMLR, 2023.
+David Silver, Aja Huang, Chris J Maddison, Arthur Guez, Laurent Sifre, George Van Den Driessche,
+Julian Schrittwieser, Ioannis Antonoglou, Veda Panneershelvam, Marc Lanctot, et al. Mastering
+the game of go with deep neural networks and tree search. Nature, 529(7587):484–489, 2016.
+Shagun Sodhani, Amy Zhang, and Joelle Pineau. Multi-task reinforcement learning with context-
+based representations. In International conference on machine learning, pp. 9767–9779. PMLR,
+2021a.
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+Shagun Sodhani, Amy Zhang, and Joelle Pineau. Multi-task reinforcement learning with context-
+based representations. In International Conference on Machine Learning, pp. 9767–9779. PMLR,
+2021b.
+Richard S Sutton and Andrew G Barto. Reinforcement learning: An introduction. MIT press, 2018.
+Aaron Van Den Oord, Oriol Vinyals, et al. Neural discrete representation learning. In Advances
+in Neural Information Processing Systems, volume 30, pp. 6309 – 6318. Curran Associates, Inc.,
+2017.
+A Vaswani. Attention is all you need. In Advances in Neural Information Processing Systems, pp.
+5998–6008. Curran Associates, Inc., 2017.
+Fei Xia, Amir R Zamir, Zhiyang He, Alexander Sax, Jitendra Malik, and Silvio Savarese. Gibson
+env: Real-world perception for embodied agents. In Proceedings of the IEEE conference on
+computer vision and pattern recognition, pp. 9068–9079, 2018.
+Jiaxu Xing, Ismail Geles, Yunlong Song, Elie Aljalbout, and Davide Scaramuzza. Multi-task re-
+inforcement learning for quadrotors. IEEE Robotics and Automation Letters, 10(3):2112–2119,
+2025.
+Zhiyuan Xu, Kun Wu, Zhengping Che, Jian Tang, and Jieping Ye. Knowledge transfer in multi-
+task deep reinforcement learning for continuous control.
+In Advances in Neural Information
+Processing Systems, volume 33, pp. 15146–15155, 2020.
+Ruihan Yang, Huazhe Xu, Yi Wu, and Xiaolong Wang. Multi-task reinforcement learning with soft
+modularization. In Advances in Neural Information Processing Systems, volume 33, pp. 4767–
+4777, 2020.
+Deheng Ye, Zhao Liu, Mingfei Sun, Bei Shi, Peilin Zhao, Hao Wu, Hongsheng Yu, Shaojie Yang,
+Xipeng Wu, Qingwei Guo, et al. Mastering complex control in moba games with deep reinforce-
+ment learning. In Proceedings of the AAAI conference on artificial intelligence, volume 34, pp.
+6672–6679, 2020.
+Tianhe Yu, Saurabh Kumar, Abhishek Gupta, Sergey Levine, Karol Hausman, and Chelsea Finn.
+Gradient surgery for multi-task learning. In Advances in Neural Information Processing Systems,
+volume 33, pp. 15534–15547. Curran Associates, Inc., 2020a.
+Tianhe Yu, Deirdre Quillen, Zhanpeng He, Ryan Julian, Karol Hausman, Chelsea Finn, and Sergey
+Levine. Meta-world: A benchmark and evaluation for multi-task and meta reinforcement learning.
+In Conference on robot learning, pp. 1094–1100. PMLR, 2020b.
+Matthew D Zeiler, Dilip Krishnan, Graham W Taylor, and Rob Fergus. Deconvolutional networks.
+In 2010 IEEE Computer Society Conference on computer vision and pattern recognition, pp.
+2528–2535. IEEE, 2010.
+Boxuan Zhang, Runqing Wang, Wei Xiao, Weipu Zhang, Jian Sun, Gao Huang, Jie Chen, and Gang
+Wang. Dymodreamer: World modeling with dynamic modulation. In Conference on Neural
+Information Processing Systems, 2025.
+Weipu Zhang, Gang Wang, Jian Sun, Yetian Yuan, and Gao Huang. Storm: Efficient stochastic
+transformer based world models for reinforcement learning. In Advances in Neural Information
+Processing Systems, volume 37. Curran Associates, Inc., 2023.
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+A
+APPENDIX
+A.1
+FURTHER ANALYSIS
+We highlight the distinctions between MoW and recent approaches in the world model and MTRL
+as follows:
+Table 2: Comparison between MoW and recent approaches.
+Attributes
+CARE
+MOORE
+DreamerV3
+STORM
+MoW (ours)
+MBRL/MFRL
+Model free
+Model free
+Model based
+Model based
+Model based
+Setting
+Multi-task
+Multi-task
+Single-task
+Single-task
+Multi-task
+World Model
+-
+-
+GRU
+Transformer
+Hybrid Transformer
+Input
+State
+State
+Image
+Image
+Image
+Agent training
+MTSAC
+MTSAC
+DreamerV3
+As DreamerV3
+Multi-task STORM
+• CARE (Sodhani et al., 2021a) and MOORE (Hendawy et al., 2023) are model-free multi-
+task RL methods that suffer from low sample efficiency, whereas DreamerV3 (Hafner et al.,
+2025) and STORM (Zhang et al., 2023) are world-model-based single-task reinforcement
+learning approaches that exhibit high sample efficiency but lack multi-task implementa-
+tions. In contrast, MoW is a world model-based MTRL method that combines high sample
+efficiency with strong multi-task performance.
+• In contrast to DreamerV3 (Hafner et al., 2025), which employs a GRU (Dey & Salem,
+2017), and STORM (Zhang et al., 2023), which adopts a vanilla Transformer as the se-
+quence model, MoW introduces a novel hybrid Transformer architecture that better cap-
+tures diverse task dynamics while preserving reconstruction fidelity.
+• CARE (Sodhani et al., 2021a) and MOORE (Hendawy et al., 2023) are state-based methods
+that build on the classical MTSAC algorithm for decision-making, with their primary focus
+on introducing MoE architectures for policy networks and task-specific training strategies.
+DreamerV3 (Hafner et al., 2025) and STORM (Zhang et al., 2023), in contrast, adopt ac-
+tor–critic methods to train the agent on imagined trajectories, with their main contributions
+centered on encoding and predicting more accurate image observations by the hidden rep-
+resentations. MoW extends the architecture of STORM by leveraging gradient-based clus-
+tering to allocate distinct critic networks to different tasks, while still employing a similar
+actor–critic training paradigm for the agent.
+A.2
+THE USE OF LARGE LANGUAGE MODELS (LLMS)
+LLMs are employed to assist in detecting and rectifying potential grammatical errors in the
+manuscript.
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+A.3
+GRADIENT-BASED CLUSTERING
+The warmup stage in MoW is a short offline world-model self-supervised training phase on a fixed
+replay buffer (as we shown in Algorithm 1). Before clustering, we first collect a sufficient amount of
+random interaction data for all tasks and then train a single VAE–predictor stack on this fixed dataset
+while keeping the agent frozen (Sec. 3.6). This stage corresponds to self-supervised learning of
+reconstruction, reward, continuation, dynamic and task prediction losses, rather than unstable online
+policy optimization. As we shown in the Figure 6, these losses converge within a few thousand
+optimization steps, indicating that the world model has already fitted the warmup dataset well. In our
+experiments, varying the warmup length within a reasonable range (e.g., 5000 steps) has only minor
+impact on final Atari and Meta-World performance, suggesting that MoW is not overly sensitive to
+the exact duration of warmup, as long as the losses have essentially stabilized.
+0
+1000
+2000
+3000
+4000
+5000
+Warm-up Steps
+0
+2000
+4000
+6000
+8000
+10000
+Gradient Norm of 26 Tasks
+0
+1000
+2000
+3000
+4000
+5000
+Warm-up Steps
+0
+1000
+2000
+3000
+4000
+5000
+6000
+Average Gradient Norm
+Gradient Norm Curves during the Warm-up Stage in Atari 100k
+Figure 6: The gradient norm curves in the warmup stage of MoW.
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+A.4
+CHALLENGES IN HIGH-DIMENSIONAL OBSERVATIONS
+Reinforcement learning in high-dimensional observation spaces, such as those encountered in vi-
+sual tasks, presents several challenges compared to state-based RL, where observations are typi-
+cally simpler and lower-dimensional. These challenges arise due to the complexities of learning
+and processing high-dimensional data, such as images or videos, and the need for efficient gener-
+alization across multiple tasks. In state-based RL, the observation space is often relatively small
+(e.g., a 39−dimension vector representing the agent’s position and velocity (Sodhani et al., 2021b)),
+and traditional MTRL algorithms can work effectively by directly modeling these state represen-
+tations. In contrast, high-dimensional observations, such as images, have large input spaces and
+complex structures that must be compressed into useful representations. In addition, state-based RL
+typically utilizes a single, simpler model, as state representations are usually more structured and
+lower-dimensional. However, high-dimensional visual inputs require specialized visual modules,
+and the online optimization of these modules during training imposes a significant burden on the
+convergence of reinforcement learning.
+To further illustrate the challenges of high-dimensional visual MTRL compared to state-based
+MTRL, we use official results from the classic multi-task method TDMPC2 (Hansen et al., 2024),
+and the results is shown in Figure 7. In the 12 tasks of Deepmind Control, the performance of
+TDMPC2 with visual pixels inputs (the orange lines) is worse and converges more slowly compared
+to the state-based inputs (the blue lines). It fails to converge after 2M steps of single-task interac-
+tion. To ensure fairness, the only difference between these two models is the addition of a shallow
+convolutional encoder in the visual input version, with all other parameters being identical.
+0
+1M
+2M
+Environment steps
+0
+100
+200
+300
+400
+500
+600
+700
+acrobot-swingup
+0
+1M
+2M
+Environment steps
+200
+0
+200
+400
+600
+800
+1000
+cartpole-swingup-sparse
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+1000
+cheetah-run
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+1000
+finger-spin
+0
+1M
+2M
+Environment steps
+200
+400
+600
+800
+1000
+finger-turn-easy
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+1000
+finger-turn-hard
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+1000
+quadruped-run
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+1000
+quadruped-walk
+0
+1M
+2M
+Environment steps
+200
+400
+600
+800
+1000
+reacher-easy
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+1000
+reacher-hard
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+walker-run
+0
+1M
+2M
+Environment steps
+0
+200
+400
+600
+800
+1000
+walker-walk
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+tdmpc2-states
+tdmpc2-pixels
+Figure 7: Results of pixels-input and states-input TDMPC2 on DMC suite.
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+A.5
+ADDITIONAL ABLATION STUDIES
+Due to the page limitations in the main text, we provide additional ablation on all of our design
+choices for MoW in this section, including the clusters of VAE-predictors, number of experts, cas-
+caded expert-shared transformers, task predictor head, balanced loss, and the gradient-based task
+clustering. The results are shown in Figure 8 and 9.
+Clusters of VAE-predictors. We ablate the number of clusters of VAE-predictors Nm from 12 to
+3 and observe a clear performance degradation as the clusters count decreases. With fewer clusters,
+each VAE-predictor must capture the visual characteristics of a larger set of tasks, which slows down
+convergence and leads to lower overall performance.
+Number of Expert Transformers. We ablate the number of expert Transformers Ne from 12 to 3
+(when Ne = 1, the model degenerates into a single shared Transformer) and observe a clear per-
+formance degradation as the experts count decreases. With fewer experts, it becomes more difficult
+to capture the diverse dynamics across tasks, which reduces the quality of imagined trajectories
+generated by the world model and ultimately makes policy learning more challenging.
+Expert and Shared Transformers. We ablate the shared Transformer and observe a modest perfor-
+mance drop, as tasks in Atari 100K share relatively little inter-task structure. In contrast, removing
+the expert Transformer leads to a much larger degradation, since the expert Transformer is respon-
+sible for capturing task-specific dynamics and generating accurate multi-task imagined trajectories.
+Task Prediction. We ablate the task predictor by removing both the prediction head and its asso-
+ciated loss. The task predictor plays an important role in maintaining task-discriminative structure
+in the learned latent space, which benefits both world-model learning and downstream RL perfor-
+mance. Consistent with this, removing the task predictor leads to a noticeable decline in overall
+performance.
+Harmonious Loss. We ablate the harmonious loss by removing the harmonious weight in Equation
+9. Without this operation, the world-model training faces the gradient conflicting problem, and the
+end-to-end loss is dominated by tasks with larger loss magnitudes, leading to unstable training and
+reduce the RL performance. This confirms that harmonizing the multi-task losses is important for
+stable and effective multi-task visual world-model learning.
+Balance Loss. To evaluate whether the expert-balance term is necessary to prevent overuse of a few
+experts, we remove the balance loss and observe that the training becomes sensitive to initialization.
+The balance loss is critical for ensuring all experts are utilized and prevents collapse into degenerate
+expert usage.
+Gradient-based Task Clustering. We use randomly partition tasks into the same number of clus-
+ters (Nm = 12) to ablate the gradient-based warmup clustering. The results show that the gradient-
+based clustering is necessary for allocating shared parameters meaningfully and avoiding interfer-
+ence across unrelated tasks.
+0.0
+0.4
+0.8
+1.2
+1.6
+Human normalized mean
+110.4%
+85.2%
+64.3%
+53.4%
+Clusters of VAE-predictors
+12 VAE-predictors
+9 VAE-predictors
+6 VAE-predictors
+3 VAE-predictors
+0.0
+0.4
+0.8
+1.2
+1.6
+110.4%
+83.5%
+52.3%
+13.2%
+Number of Experts
+12 Experts
+9 Experts
+6 Experts
+3 Experts
+0.0
+0.4
+0.8
+1.2
+1.6
+110.4%
+98.5%
+15.7%
+Expert and Shared Transformers
+MoW
+No Shared Transformer
+No Expert Transformer
+0.0
+0.4
+0.8
+1.2
+1.6
+110.4%
+76.3%
+Task Prediction
+MoW
+No Task Prediction
+0.0
+0.4
+0.8
+1.2
+1.6
+Human normalized mean
+110.4%
+69.9%
+Harmonious Loss
+MoW
+No Harmonious Loss
+0.0
+0.4
+0.8
+1.2
+1.6
+110.4%
+102.0%
+Balance Loss
+MoW
+No Balance Loss
+0.0
+0.4
+0.8
+1.2
+1.6
+110.4%
+99.1%
+Gradient-based Task Clustering
+MoW
+Randomly Task Clustering
+Figure 8: Results of additional ablation studies
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+0
+50k
+100k
+0.0
+0.4
+0.8
+1.2
+Human normalized mean
+Clusters of VAE-predictors
+12 VAE-predictors
+9 VAE-predictors
+6 VAE-predictors
+3 VAE-predictors
+0
+50k
+100k
+0.0
+0.4
+0.8
+1.2
+Number of Experts
+12 Experts
+9 Experts
+6 Experts
+3 Experts
+0
+50k
+100k
+0.0
+0.4
+0.8
+1.2
+Expert and Shared Transformers
+MoW
+No Shared Transformer
+No Expert Transformer
+0
+50k
+100k
+0.0
+0.4
+0.8
+1.2
+Task Prediction
+MoW
+No Task Prediction
+0
+50k
+100k
+0.0
+0.4
+0.8
+1.2
+Human normalized mean
+Harmonious Loss
+MoW
+No Harmonious Loss
+0
+50k
+100k
+0.0
+0.4
+0.8
+1.2
+Balance Loss
+MoW
+No Balance Loss
+0
+50k
+100k
+0.0
+0.4
+0.8
+1.2
+Gradient-based Task Clustering
+MoW
+Randomly Clustering
+Figure 9: Results of additional ablation studies
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+A.6
+RECONSTRUCTION BY IMAGINATION
+We provide Multi-step predictions on several environments in Atari games. MoW utilizes 8 observa-
+tions and actions as contextual input, enabling the imagination of future events in an auto-regressive
+manner.
+Figure 10: Multi-step predictions on several environments in Atari games.
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+Figure 11: Multi-step predictions on several environments in Atari games.
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+Figure 12: Multi-step predictions on several environments in Atari games.
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+A.7
+HARMONIOUS LOSS
+Adjusting the coefficients of different loss terms has the potential to significantly enhance the per-
+formance of world model-based reinforcement learning algorithms. The harmonious loss strategy
+dynamically adjusts the dominance between the observation and the reward modeling during world
+model training process. The harmonious loss is constructed as:
+LH(ϕ) =
+K
+X
+k=1
+1
+σk
+Lk(ϕ) + ln(1 + σk).
+(16)
+The reason why we use ln(1 + σk) as regularization terms is that σk is parameterized as σk =
+exp(σk) > 0 to optimize parameters σk free of sign constraint. Since a loss item with small val-
+ues, such as the reward loss, can lead to extremely large coefficient 1/σk ≈Lk −1 ≫1, which
+potentially hurt training stability. The derivation of the harmonious loss scale is as follows.
+To minimize E[LH(ϕ, σk)], we force the the partial derivative w.r.t. σk to 0:
+∇σE[LH(ϕ, σ)] = ∇σ
+ 1
+σk
+E[Lk] + ln(1 + σk)
+
+= −1
+σ2 E[Lk] +
+1
+1 + σk
+σ∗
+k = E[Lk] +
+p
+E[Lk]2 + 4E[Lk]
+2
+(17)
+Therefore the learnable loss weight, in the rectified harmonious loss, approximates the analytic loss
+weight:
+1
+σ∗
+k
+=
+2
+E[Lk] +
+p
+E[Lk]2 + 4E[Lk]
+(18)
+and equivalently, the harmonized loss scale is:
+E[Lk
+σ∗
+k
+] =
+2
+1 +
+q
+1 +
+4
+E[Lk]
+< 1,
+(19)
+and add the regularization term ln(1 + σk) results in the 4/E[Lk] in the
+p
+1 + 4/E[Lk] term, which
+prevents the loss weight from getting extremely large when faced with a small E[Lk].
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+A.8
+DETAILS OF MODEL STRUCTURE
+Table 3 and Table 4 show the structure of the image encoder and decoder. The sizes of the submod-
+ules are omitted as they can be directly inferred from the tensor shapes. ReLU denotes the rectified
+linear unit activation, and Linear corresponds to a fully connected layer. Flatten and Reshape oper-
+ations are applied solely to modify the indexing of tensors while preserving both the data and their
+original ordering. Conv refers to a CNN layer(LeCun et al., 1989), characterized by kernel = 4,
+stride = 2, and padding = 1. DeConv denotes a transpose CNN layer (Zeiler et al., 2010), also
+characterized by kernel = 4, stride = 2, and padding = 1. BN denotes the batch normalization layer
+(Ioffe & Szegedy, 2015). The variable E represents the dimension of task embedding ek.
+Table 3: Structure of the image encoder.
+Submodule
+Output tensor shape
+Input image (ot
+k)
+3 × 64 × 64
+Conv1 + BN1 + ReLU
+32 × 32 × 32
+Conv2 + BN2 + ReLU
+64 × 16 × 16
+Conv3 + BN3 + ReLU
+128 × 8 × 8
+Conv4 + BN4 + ReLU
+256 × 4 × 4
+Flatten
+4096
+Linear
+1024
+Table 4: Structure of the image decoder.
+Submodule
+Output tensor shape
+Random sample (zt
+k)
+32 × 32
+Flatten and task embedded
+1024 + E
+Linear+BN0+ReLU
+4096
+Reshape
+256 × 4 × 4
+DeConv1 + BN1 + ReLU
+128 × 8 × 8
+DeConv2 + BN2 + ReLU
+64 × 16 × 16
+DeConv3 + BN3 + ReLU
+32 × 32 × 32
+DeConv4 (produce ot
+k)
+3 × 64 × 64
+Table 5: Action mixer m1:t
+j,k = mϕ,j(z1:t
+k , a1:t
+k , ek). Concatenate denotes combining the last di-
+mension of tensors and merging them into one new tensor. The variable A represents the action
+dimension, which is 18 for Atari and 4 for Meta-world. D denotes the feature dimension of the
+Transformer. LN is an abbreviation for layer normalization
+Submodule
+Output tensor shape
+Random sample (zt
+k), action (at
+k), task embedding (ek)
+32 × 32, A, E
+Reshape and concatenate
+1024 + E + A
+Linear1+LN1+ReLU
+D
+Linear2+LN2+ReLU
+D
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+Table 6: Transformer block. Dropout (Vaswani, 2017) is used in each Transformer submodule to
+reduce overfitting. We also apply Dropout to attention weights in the MHSA module.
+Submodule
+Module alias
+Output tensor shape
+Input features (label as x1)
+32 × 32
+Multi-head self attention
+MHSA
+T × D
+Linear1 + Dropout
+Residual (add x1)
+LN1(label as x2)
+Linear2 + ReLU
+FFN
+T × 2D
+Linear3 + Dropout
+T × D
+Residual (add x2)
+T × D
+LN2
+T × D
+Table 7: Expert Transformer l1:t
+j,k = fϕ,j(m1:t
+j,k), where j is the index of the expert.
+Submodule
+Output tensor shape
+Input (m1:t
+j,k)
+T × D
+Transformer blocks ×M
+T × D
+Output (l1:t
+j,k)
+T × D
+Table 8: Shared Transformer h1:t
+k
+= Fϕ(l1:t
+k , ek).
+Submodule
+Output tensor shape
+Input (l1:t
+k , ek)
+T × (nk × D + E)
+Reshape
+T × D
+Transformer blocks ×M
+T × D
+Output (h1:t
+k )
+T × D
+Table 9: Pure MLP structures. A 1−layer MLP corresponds to a fully-connected layer, 255 is the
+size of the bucket of symlog two-hot loss, and K is the number of tasks.
+Submodule
+MLP layers
+Input/ MLP hidden/ Output dimension
+Task embedding (ek)
+1
+1/ −/96
+Dynamic predictor (gD
+ϕ,ik)
+1
+D + E/ −/1024
+Reward predictor (gR
+ϕ,ik)
+3
+D/D/255
+Continuation predictor (gC
+ϕ,ik)
+3
+D/D/1
+Task predictor (gT
+ϕ )
+1
+D/ −/K
+Policy network (Vψ,ik)
+3
+D/D/A
+Actor network (πθ(at
+k | st
+k))
+3
+D/D/255
+23
+
+--- Page 24 ---
+Published as a conference paper at ICLR 2026
+A.9
+HYPERPARAMETERS
+Table 10 detail hyperparameters of the optimization and environment, as well as hyperparameters
+shared by multiple components. Hyerparameters.
+Table 10: Hyperparameters
+Name
+Value
+World model training batch size
+16
+World model training batch length
+64
+Imagination batch size
+1024
+Imagination context length
+8
+Imagination horizon
+16
+Warmup steps
+5000
+Environment context length
+16(Atari100K) /32(Meta-world)
+Update world model every env step
+1
+Update agent model every env step
+1
+Number of experts
+12(Atari100K) /20(Meta-world)
+Number of activated experts
+3(Atari100K) /4(Meta-world)
+Number of VAE clusters
+12(Atari100K) /20(Meta-world)
+Learning rate
+10−4
+World model gradient clipping
+1000
+Adam epsilon
+10−8
+Optimizer
+Adam
+Expert Transformer layers
+2
+Shared Transformer layers
+2
+Expert Transformer heads
+8
+Shared Transformer heads
+8
+Dropout
+0.1
+Discount horizon
+333
+Return lambda
+0.95
+Critic EMA decay
+0.98
+Critic EMA regularizer
+1
+Actor entropy scale
+3 × 10−4
+Learning rate
+3 × 10−5
+Actor-critic gradient clipping
+100
+24
+
+--- Page 25 ---
+Published as a conference paper at ICLR 2026
+A.10
+EXPERIMENTAL DETAILS
+A.10.1
+ATARI 100K CURVES AND AGGREGATE SCORES
+We evaluate agent performance over 100 episodes using the final model checkpoint, saved every
+2500 steps.
+0
+50k
+100k
+0
+400
+800
+1200
+alien
+0
+50k
+100k
+0
+60
+120
+180
+amidar
+0
+50k
+100k
+400
+800
+1200
+assault
+0
+50k
+100k
+400
+800
+1200
+asterix
+0
+50k
+100k
+0
+500
+1000
+1500
+bank heist
+0
+50k
+100k
+0
+5000
+10000
+15000
+battle zone
+0
+50k
+100k
+0
+40
+80
+boxing
+0
+50k
+100k
+0
+20
+40
+60
+breakout
+0
+50k
+100k
+600
+1200
+1800
+2400
+chopper command
+0
+50k
+100k
+0
+30000
+60000
+90000
+crazy climber
+0
+50k
+100k
+0
+150
+300
+450
+demon attack
+0
+50k
+100k
+0.03
+0.00
+0.03
+freeway
+0
+50k
+100k
+0
+600
+1200
+1800
+frostbite
+0
+50k
+100k
+0
+3000
+6000
+9000
+gopher
+0
+50k
+100k
+0
+6000
+12000
+18000
+hero
+0
+50k
+100k
+0
+200
+400
+600
+james bond
+0
+50k
+100k
+0
+1500
+3000
+kangaroo
+0
+50k
+100k
+0
+2500
+5000
+7500
+krull
+0
+50k
+100k
+0
+15000
+30000
+kung fu master
+0
+50k
+100k
+1000
+2000
+3000
+ms pacman
+0
+50k
+100k
+15
+0
+15
+pong
+0
+50k
+100k
+600
+300
+0
+300
+private eye
+0
+50k
+100k
+0
+1500
+3000
+4500
+qbert
+0
+50k
+100k
+0
+6000
+12000
+18000
+road runner
+0
+50k
+100k
+0
+200
+400
+600
+seaquest
+0
+50k
+100k
+0
+5000
+10000
+15000
+up n down
+0
+50k
+100k
+0.00
+0.25
+0.50
+0.75
+1.00
+Gamer Mean
+0
+50k
+100k
+0.00
+0.15
+0.30
+0.45
+Gamer Median
+Mixture-of-World Models
+Single-task STORM
+Figure 13:
+Evaluation curves of MoW and single-task STORM on the Atari100K benchmark for
+individual games (400K environment steps). The solid lines represent the average scores over 5
+seeds, and the filled areas indicate the standard deviation across these 5 seeds.
+Table 11 summarizes the aggregate scores of MoW and some Transformer-based world model base-
+lines (Robine et al., 2023; Micheli et al., 2022).
+A.10.2
+META-WORLD
+The Meta-World benchmark encompasses a diverse array of 50 distinct manipulation tasks, unified
+by shared dynamics. These tasks involve a Sawyer robot engaging with a variety of objects, each
+distinguished by unique shapes, joints, and connective properties. The complexity of this bench-
+mark lies in the heterogeneity of the observation spaces and reward functions across tasks, as the
+robot is required to manipulate different objects towards varying objectives. The robot operates
+with a 4-dimensional fine-grained action input at each timestep, which controls the 3D positional
+movements of its end effector and modulates the gripper’s openness. In order to use a single cam-
+era viewpoint consistently over all 50 tasks, we use the modified corner2 camera viewpoint for all
+tasks. Specifically, we adjusted the camera position with env.model.cam pos[2][:]=[0.75, 0.075,
+0.7], which enables us to solve non-zero success rate on all tasks. Maximum episode length for
+25
+
+--- Page 26 ---
+Published as a conference paper at ICLR 2026
+Table 11:
+Game scores and overall human-normalized performance on the 26 games in the Atari
+100K benchmark.
+Game
+Random
+Human
+STORM
+STORM
+MoW
+TWM
+IRIS
+EfficientZero
+BBF
+EfficientZeroV2
+(original)
+(reproduced)
+(ours)
+Setting
+Single-task
+Single-task
+Multi-task
+Single-task
+Single-task
+Single-task
+Single-task
+Single-task
+Alien
+228
+7128
+984
+748
+811
+675
+420
+809
+1173
+1558
+Amidar
+6
+1720
+205
+144
+182
+122
+143
+149
+245
+185
+Assault
+222
+742
+801
+1377
+808
+683
+1524
+1263
+2099
+1758
+Asterix
+210
+8503
+1028
+1318
+1319
+1116
+854
+25558
+3946
+61810
+Bank Heist
+14
+753
+641
+990
+517
+467
+53
+351
+733
+1317
+Battle Zone
+2360
+37188
+13540
+5830
+9460
+5068
+13871
+13871
+24460
+14433
+Boxing
+0
+12
+80
+81
+79
+78
+70
+53
+86
+75
+Breakout
+2
+30
+16
+41
+14
+20
+84
+414
+371
+400
+Chopper Command
+811
+7388
+1888
+1644
+1504
+1697
+1565
+1117
+7549
+1197
+Crazy Climber
+10780
+35829
+66776
+79196
+64554
+71820
+59234
+83940
+58432
+112363
+Demon Attack
+152
+1971
+165
+324
+173
+350
+2034
+13004
+13341
+22773
+Freeway
+0
+30
+0
+0
+0
+24
+31
+22
+26
+0
+Frostbite
+65
+4335
+1316
+366
+859
+1476
+259
+296
+2385
+1136
+Gopher
+258
+2413
+8240
+5307
+6742
+1675
+2236
+3260
+1331
+3869
+Hero
+1027
+30826
+11044
+11434
+10339
+7254
+7037
+9316
+7819
+9705
+James Bond
+29
+303
+509
+408
+480
+362
+463
+517
+1130
+468
+Kangaroo
+52
+3035
+4208
+3512
+2014
+1240
+838
+724
+6615
+1887
+Krull
+1598
+2666
+8413
+6522
+7841
+6349
+6616
+5663
+8223
+9080
+Kung Fu Master
+256
+22736
+26182
+20046
+26598
+24555
+21760
+30945
+18992
+28883
+Ms Pacman
+307
+6952
+2673
+1490
+2492
+1588
+999
+1281
+2008
+2251
+Pong
+-21
+15
+11
+18
+13
+19
+15
+20
+17
+21
+Private Eye
+25
+69571
+7781
+100
+92
+87
+100
+97
+41
+100
+Qbert
+164
+13455
+4522
+2910
+3641
+3331
+746
+13782
+4447
+16058
+Road Runner
+12
+7845
+17564
+14841
+17169
+9109
+9615
+17751
+33427
+27516
+Seaquest
+68
+42055
+525
+557
+431
+774
+661
+1100
+1233
+1974
+Up N Down
+533
+11693
+7985
+6128
+6943
+15982
+3546
+17264
+12102
+15224
+Human Mean
+0%
+100%
+126.7%
+114.3%
+110.4%
+96%
+105%
+194.5%
+224.7%
+242.8%
+Human Median
+0%
+100%
+58.4%
+42.5%
+37.7%
+51%
+29%
+109.0%
+91.7%
+128.6%
+Meta-world tasks is 500. We follow the environment setup of Meta-World as specified in Masked
+World Model (MWM) (Seo et al., 2023), with the exception of using a different action repeat setting
+(2 in MWM but 1 in MoW). All curves are shown in Figure 14.
+26
+
+--- Page 27 ---
+Published as a conference paper at ICLR 2026
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+assembly
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+basketball
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+bin-picking
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+box-close
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+button-press
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+button-press-topdown
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+button-press-topdown-wall
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+button-press-wall
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+coffee-button
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+coffee-pull
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+coffee-push
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+dial-turn
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+disassemble
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+door-close
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+door-lock
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+door-open
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+door-unlock
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+drawer-close
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+drawer-open
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+faucet-close
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+faucet-open
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+hammer
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+hand-insert
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+handle-press
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+handle-press-side
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+handle-pull
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+handle-pull-side
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+lever-pull
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+peg-insert-side
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+peg-unplug-side
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+pick-out-of-hole
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+pick-place
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+pick-place-wall
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+plate-slide
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+plate-slide-back
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+plate-slide-back-side
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+plate-slide-side
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+push
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+push-back
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+push-wall
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+reach
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+reach-wall
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+shelf-place
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+soccer
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+stick-pull
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+stick-push
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+sweep
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+sweep-into
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+window-close
+0
+100k
+200k
+300k
+0.0
+0.3
+0.6
+0.9
+window-open
+Mixture-of-World Models
+Single-task STORM
+Figure 14: Evaluation curves of MoW on the Meta-World benchmark.
+27
+
+--- Page 28 ---
+Published as a conference paper at ICLR 2026
+A.11
+BENCHMARKING TD-MPC2
+We compare the performance of MoW with TD-MPC2 on the Meta-World benchmark. In the official
+implementation of TD-MPC2, the multi-task learning setup is based on large offline datasets (545M
+transitions), where the model is trained on the fixed state-based data rather than learning directly
+from online interactions. Moreover, TD-MPC2 is designed for state-based inputs, unlike MoW,
+which is tailored to handle high-dimensional visual inputs. To make a fair comparison in the context
+of visual reinforcement learning (RL), we adapted the official state-based implementation of TD-
+MPC2 by incorporating a shallow convolutional network to handle visual inputs (this operation is
+same to the visual RL experiments in TD-MPC2). We then tested this modified version of TD-MPC2
+against MoW in the same Meta-World tasks. This modification allowed us to assess the performance
+of TD-MPC2 in a visual setting, providing insights into its capability to scale to visual RL tasks
+compared to MoW’s more native approach to handling visual inputs and multi-task learning.
+TDMPC-2 achieves 25.3%success rate in the same environment as MoW. The results shown in
+Figure 15 demonstrate that while TD-MPC2 excels in continuous control tasks, MoW offers a more
+scalable and parameter-efficient approach for multi-task reinforcement learning that can effectively
+handle both continuous and discrete action spaces, especially when high-dimensional visual inputs
+are involved.
+TD-MPC2 and its Challenge with Discrete Actions: The core of TD-MPC2’s methodology re-
+lies on Model Predictive Path Integral (MPPI) control, which involves optimizing over continuous
+action sequences to maximize expected returns. The key advantage of this approach is its ability to
+perform local trajectory optimization in a learned world model, where actions are treated as contin-
+uous values. The model predicts continuous action trajectories over a short planning horizon and
+uses these predictions to guide policy execution. The trajectory optimization process inherently as-
+sumes continuous actions, as it involves sampling action sequences from a multivariate Gaussian
+distribution and updating their mean and variance iteratively. The Gaussian distribution allows the
+model to effectively explore action space by adjusting the mean and variance of actions, and this
+is inherently designed for continuous action dimensions. In discrete action spaces, however, unlike
+the continuous action spaces where actions are represented as continuous variables that can be ad-
+justed smoothly, discrete actions are limited to a finite set of predefined choices. This discrete nature
+doesn’t align well with the sampling mechanism in MPC, which relies on continuous action adjust-
+ments. Efficient Monte Carlo Tree Search (MCTS) or other searching methods used in the discrete
+action settings would require specific adjustments for handling discrete action sets, and standard
+MPC planning would not scale properly without a discrete action search space method.
+0
+150k
+300k
+Environment steps
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Average Success Rate
+Mixture-of-World Models
+TD-MPC2
+Figure 15: Comparison of MoW and TD-MPC2 on the Meta-World benchmark.
+28
+
+--- Page 29 ---
+Published as a conference paper at ICLR 2026
+A.12
+PSEUDOCODE
+For a more comprehensive understanding of training the mixture world model, we provide the pseu-
+docode implementation in Algorithm 1.
+Algorithm 1 Mixture World Model-based Reinforcement Learning
+Input: Task set T = {T1, T2, · · · , TK},
+replay buffer B = {B1, B2, · · · , BK},
+warm-up steps TW
+total number of environment steps Ttotal.
+Initialize: Trained mixture world model parameters ϕ,
+actor–critic parameters θ and ψ,
+actor–critic policy πθ,
+replay buffer B = ∅,
+number of environment steps t = 0
+number of warmup steps tw = 0
+// Warmup stage
+Repeat:
+// 1. Collect data from environment
+Bk
+t = {ot
+k, rt
+k, at
+k, ct
+k}
+t+ = 1
+Until Each Bk has sufficient data for warmup training.
+Repeat:
+// 2. Offline training of the mixture world model
+Dk = sample-trajectory(Bk)
+ϕ = update-world-model(Dk)
+tw+ = 1
+Until tw = TW .
+// Training stage
+Repeat:
+// 3. Collect data from environment
+Bk
+t = {ot
+k, rt
+k, at
+k, ct
+k}
+// 4. Update mixture world model
+Dk = sample-trajectory(Bk)
+ϕ = update-world-model(Dk)
+// 5. Sample observation for imagination
+O1
+k = sample-obs(Bk)
+τk = world-model-imagine(O1
+k, πθ)
+// 6. Learning in the imagination
+θ, ψ = update-policy(τk, θ, ψ)
+t+ = 1
+Until t = Ttotal.
+29

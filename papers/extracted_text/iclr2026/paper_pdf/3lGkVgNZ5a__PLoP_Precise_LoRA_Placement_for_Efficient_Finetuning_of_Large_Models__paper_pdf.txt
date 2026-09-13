@@ -1,0 +1,3119 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+PLOP: PRECISE LORA PLACEMENT FOR EFFICIENT
+FINETUNING OF LARGE MODELS
+Soufiane Hayou∗
+Simons Institute
+UC Berkeley
+Nikhil Ghosh
+Flatiron Institute
+Bin Yu
+Dept of Statistics
+UC Berkeley
+ABSTRACT
+Low-Rank Adaptation is a widely used finetuning method for large models. Its
+small memory footprint allows practitioners to adapt large models to specific tasks
+at a fraction of the cost of full finetuning. Different modifications have been
+proposed to enhance its efficiency by, for example, setting the learning rate, the
+rank, and the initialization. Another improvement axis is adapter placement strat-
+egy: when using LoRA, practitioners usually pick module types to adapt with
+LoRA, such as Query and Key modules. Few works have studied the problem of
+adapter placement, with nonconclusive results: original LoRA paper suggested
+placing adapters in attention modules, while other works suggested placing them
+in the MLP modules. Through an intuitive theoretical analysis, we introduce
+PLoP (Precise LoRA Placement), a lightweight method that allows automatic
+identification of module types where LoRA adapters should be placed, given a
+pretrained model and a finetuning task. We demonstrate that PLoP consistently
+outperforms, and in the worst case competes, with commonly used placement
+strategies through comprehensive experiments on supervised finetuning and rein-
+forcement learning for reasoning.
+1
+INTRODUCTION
+Low-Rank Adaptation (LoRA, Hu et al. (2022)) is a widely used parameter-efficient fine-tuning
+(PEFT) methods for large language and vision models. LoRA significantly reduces the computational
+and memory requirements of finetuning by freezing the pretrained model weights and inserting
+low-rank matrices into the model. This approach has enabled the adaptation of production-scale
+models on limited hardware resources while achieving performance comparable to full finetuning.
+LoRA improvements.
+Several works have considered improving LoRA performance by e.g. using
+different learning rates for LoRA modules (Hayou et al., 2024a), using normalized updates (Liu
+et al., 2024), setting adaptive LoRA rank (Kim et al., 2024; Lu et al., 2025), improving initialization
+(Hayou et al., 2024b), and many other variants, e.g. (Zhang et al., 2023a; Dettmers et al., 2023;
+Kopiczko et al., 2024; Zhang et al., 2023b; Tian et al., 2024; Jiang et al., 2024). A critical aspect
+of LoRA is module selection - deciding which specific components of the model should receive the
+low-rank adaptation. In practice, instead of selecting individual modules, one selects module types
+such as “q_proj” (Query modules), “v_proj” (Value modules), etc. In Hu et al. (2022), the authors
+suggested that inserting LoRA in attention modules (Query, Key, and Value) generally yields the best
+performance among other possible placements. However, in a recent note (Fomenko et al., 2024), the
+same authors further explained the difficulty encountered in LoRA adapter placement, and mentioned
+that optimal placement depends on pretrained model and the finetuning task. Another work He et al.
+(2021) found that for some models, placing LoRA adapters in MLP modules gives better performance.
+Faced with this confusion, practitioners generally follow one of these guidelines or insert LoRA
+adapters in all modules which comes at a higher finetuning cost. Therefore, it is natural to ask:
+Given a model and a task, how can we select target module types for LoRA at a reasonable cost?
+∗Work partially done at Johns Hopkins University. Corresponding author: hayou@jhu.edu
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+Inputs
+1) Model & module types 
+ 
+2) Subset from Task
+Calculate  
+  - 
+: input to module 
+  - 
+: random with 
+  
+The ratio measures module-task alignment
+Q
+K
+V
+U
+G
+D
+O
+Rank & Insert  
+Insert Adapters in Low Scores
+(U,G in this case)
+Q
+K
+V
+O
+U
+G
+D
+Figure 1: Mechanism of PLoP. For each module W in the model, we calculate alignment scores called NFN
+(Normalized Feature Norms), rank them, and pick module types with the lowest alignment scores for LoRA
+insertion. The NFN scores are defined by the ratio between actual activation norms ∥Wzin∥and a random
+baseline ∥W ˜zin∥, where ˜zin is a randomly generated vector with the same euclidean norm as zin.
+Memory footprint of LoRA.
+In practice, LoRA is used to finetune large models with relatively
+low cost. Consider Llama3.2-3B (Llama-Team, 2024), processing sequences of 2048 tokens with a
+batch size of 8. With full finetuning, the memory requirements are substantial. The model parameters
+require 12GB in float32, while the Adam optimizer states add another 24GB. The activations for
+a single forward pass consume approximately 48GB of memory. This brings the total memory
+requirement to approximately 84GB necessitating high-end GPUs. This becomes more problematic
+with larger, production-scale models. With LoRA, the computational cost changes dramatically.
+Using rank-16 adapters on query and value modules introduces only 10 million trainable parameters
+(0.33% of the model). Notably, since gradients are only computed for the adapter weights, the
+memory overhead for gradient computation is reduced by over 99%. This enables finetuning on a
+single 24GB GPU with the same batch size and sequence length. These low memory footprint is
+what makes LoRA attractive for finetuning.
+Anatomy of a practical module selection method for LoRA finetuning.
+Based on the com-
+putational constraints outlined above, any practical module selection method for LoRA adapter
+placement must operate within these resource limitations. We identify three main pillars of a practical
+method: (i) the method cannot require computing gradients with respect to the full model parame-
+ters, as this would defeat the primary purpose of using LoRA, (ii) the selection process should not
+necessitate multiple forward passes through different model configurations, as this would multiply
+the already significant activation memory requirements by the number of candidate configurations
+being evaluated, (iii) the method must avoid storing large intermediate computations or maintaining
+extensive state across different module evaluations, which would further strain memory resources.
+Only methods satisfying these stringent requirements can truly serve practitioners operating in the
+resource-constrained environments where LoRA provides its greatest value.
+In this paper, we introduce PLoP (Precise LoRA Placement), a lightweight module placement
+method for LoRA based on a specific measure of module-data alignment that can be calculated
+with few forward passes (no gradients, no extensive forward passes, and no storage of intermediate
+calculations), and therefore, it checks all the three points above (see the compute cost paragraph
+in Section 3 for more details). The mechanism of PLoP is described in Fig. 1. Specifically, our
+contributions are as follows:
+1. We develop a theoretical framework to study module-data alignment in large neural networks,
+the core concept behind PLoP.
+2. Based on our theoretical analysis of module-data alignment, we develop PLoP, which
+identifies which module types should be used for LoRA finetuning.
+3. We validate our results with extensive experiments showing the benefits of PLoP with
+LoRA in three post-training scenarios: supervised finetuning for classification, supervised
+finetuning for text generation, and reinforcement learning for mathematical reasoning.
+The paper is structured as follows: In Section 2, we introduce the main theoretical intuition behind
+our method. In Section 3, we present our method PLoP and provide a quantitative and qualitative
+analysis of our method. In Section 4, we report empirical results showing the benefit of PLoP in two
+post-training scenarios: supervised finetuning and reinforcement learning.
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+1.1
+RELATED WORK
+The effectiveness of LoRA critically depends on the placement of adapter modules. Initially, Hu
+et al. (2022) studied the placement of adapters in attention modules, observing strong performance in
+various NLP tasks. He et al. (2021) showed that adapters placed in MLP modules can sometimes
+outperform attention-based placements. Fomenko et al. (2024) mentioned that optimal adapter
+placement varies significantly depending on the pretrained model architecture and the downstream
+task. The authors recommended the following general strategy for adapter placement: start with
+attention layers, then embeddings, then MLP blocks, and if further capacity is required, raise the
+LoRA rank. In machine translation, Gheini et al. (2021) found that tuning exclusively cross-attention
+parameters could achieve performance comparable to full-model tuning.
+More adaptive approaches include sensitivity-based parameter selection methods. Zhang et al. (2024)
+proposed a gradient-based scoring approach that ranks parameters according to their importance to the
+task, tuning only the highest scoring subset. Similarly, He et al. (2023) developed a sensitivity-aware
+fine-tuning technique for vision models that dynamically assigns tunable parameters to layers based
+on local responsiveness. However, such methods require calculating and storing gradients of the full
+model which is suboptimal for LoRA finetuning (see discussion above). Another variant of LoRA
+Zhang et al. (2023a) introduces modifications to the adapter structure to adaptively distribute capacity
+between modules. However, our focus in this paper is on module type selection for LoRA. In our
+experiments, we compare with two baselines: Insertion in attention modules as recommended by Hu
+et al. (2022), and Insertion in MLP modules as recommended by He et al. (2021).
+Finally, our method is based on a module-data alignment score. Several alignment scores exist in the
+literature. For instance, Baratin et al. (2021) introduced the centered tangent kernel alignment as a
+measure of how well aligned each layer is with the task, and Lou et al. (2022) provided a theoretical
+analysis of such alignment. He et al. (2024) studied the emergence of large feature norms in the
+network as a result of different training configurations. Our work introduces a new alignment metric
+based on feature norms.
+2
+FEATURE NORMS CAPTURE MODULE-DATA ALIGNMENT
+We provide an intuitive theoretical analysis that shows how feature norms capture information about
+module-data alignment. Consider a general neural network of the form
+⎧⎪⎪⎪⎪⎨⎪⎪⎪⎪⎩
+Yin(x) = Winx,
+Yl(x) = Fl(Wl,Yl−1(x)), l ∈[L],
+Yout(x) = WoutYL(x),
+(1)
+where x ∈Rd is the input, L ≥1 is the network depth, (Fl)l∈[L] are mappings that define the layers,
+Wl ∈Rn×n are the hidden weights, where n is the network width, and Win,Wout are input and output
+embedding weights.
+Module-Data Alignment.
+Fix a training sample x. To understand how modules align with the the
+training sample x, we track how hidden features change as we train the model on the singleton {x}.
+For the sake of simplification, we consider the case where only a single module W is trained and
+other modules are frozen. The trainable module has the form
+zout = Wzin,
+where zin ∈Rn is the input, and zout ∈Rn is the output that we call feature, both evaluated at the
+training sample x.1 For Transformer models, the module can be for instance a single Query head, a
+Projection module in some MLP, etc. The gradient of the loss with respect to the weight matrix W is
+given by dW = dzout ⊗zin, where dzout = ∇zoutℓ, the gradient of the loss ℓwith respect to feature
+zout, evaluated for the sample x. The weights are updated with Adam (Kingma and Ba, 2017), which
+1Here we consider that zin and zout have the same dimension n. However, our analysis can be extended to
+the case where they have different dimensions.
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+normalizes gradients. Considering the momentum-less version of Adam,2 updates are given by
+Wt+1zin = Wtzin −α × S(dzt
+out ⊗zin)zin
+= Wtzin −α × ∥zin∥1 S(dzt
+out),
+(2)
+where the superscript in zt
+out = Wtzin refers to update step t,3, and S refers to the sign function (+1
+for positive, −1 for negative). In Eq. (5), we used the fact that sign function S(.) can be expanded
+across outer product. This is one of the main observations behind the development of µP (Yang and
+Hu, 2022), which sets scaling exponents for initialization and learning rate with respect to model
+width n. We follow µP parametrization of the learning rate and set α = ηn−1 for some constant η > 0
+(see Appendix B for more details about the mechanisms of µP). This yields
+n−1∥Wt+1zin∥2
+2 = n−1∥Wtzin∥2
+2 + η2n−2∥zin∥2
+1 −2ηn−1∥zin∥1 × n−1⟨Wtzin,S(dzt
+out)⟩.
+The term n−1⟨Wtzin,S(dzt
+out)⟩measures the alignment between the features zt
+out = Wtzin and
+the “signed” gradients S(dzout). When these two terms are uncorrelated (e.g. at the initial training
+stages), we have
+⟨Wtzin,S(dzout)⟩≈O(n1/2),
+(3)
+which yields
+n−1∥Wt+1zin∥2
+2 ≈n−1∥Wtzin∥2
+2 + α2n−2∥zin∥2
+1 + O(n−1/2).
+Since α2n−2∥zin∥2
+1 is positive and does not vanish asymptotically (because ∥zin∥1 is of size n),
+then the feature norm n−1∥Wtzin∥2
+2 increase as training progresses. An in-depth analysis of this
+phenomenon is provided in Appendix A.
+0
+100
+200
+300
+1
+2
+3
+n
+1 W zin 2
+Layer  = 0
+Layer  = 1
+Layer  = 2
+0
+100
+200
+300
+Steps
+0.0
+0.5
+Train Loss
+Figure 2: Evolution of feature
+norms during training for the
+linear network described in Ap-
+pendix A.1. We train the model
+for 300 steps with Adam. Feature
+norms for different layers exhibit
+differential growth patterns as we
+train the model. We shifted the
+curves corresponding to different
+layers for better visualization.
+The increase in feature norms indicate increased alignment be-
+tween W and zin. To verify this phenomenon in a controlled set-
+ting, we consider a three layers linear neural network given by
+f(x) = W2W1W0x, where x ∈Rd, W0 ∈Rn×d, W1 ∈Rn×n, and
+W2 ∈R1×n. The training data consist of N = 1000 datapoints
+of dimension d generated from a linear model y = ω⊺x + ε with
+ε ∼N(0,0.025), ωi ∼d−1N(0,1), and x are generated randomly
+as standard Gaussian random variables. We use n = d = 100 in our
+experiments and train the model with Adam. See Appendix D for
+more details and results.
+Figure 2 shows the increasing alignment pattern as measured by
+feature norms for the three layers as we train the model. We include
+a baseline with no alignment (dashed lines) which shows the norms
+∥W ˜zin∥where ˜zin is a random Gaussian vector with iid coordinates,
+normalized such that ∥˜zin∥= ∥zin∥. The baseline does not show
+any significant growth over the course of the training which further
+confirms that feature norms grow as a result of increasing alignment
+between module weights and module inputs.
+Different alignment levels for different modules.
+Although we
+use the same learning rate for all modules, feature norms in the
+second layer (n−1∥W2zin2∥2) grow much more significantly than
+those in the input layer (n−1∥W0zin0∥2). This indicates different
+alignment levels for each module. Such varying alignment patterns between layers has been discussed
+in Nam et al. (2024) for a different alignment metric.
+Different alignment levels for different inputs/tasks.
+In Fig. 2, we report feature norms during
+training for the actual training inputs ∥Wzin∥. When evaluating feature norms ∥Wz′
+in∥for an out-of-
+distribution input x′, the resulting alignment depends on how similar is x′ to the training samples.
+The extreme case where x′ is very different from the training samples should result in low to no
+2Also known as SignSGD Bernstein et al. (2018). See Appendix for more details.
+3Note that we do not use such superscript for zin since it does not change when we update W.
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+Layer Index
+attn.k_proj
+attn.o_proj
+attn.q_proj
+attn.v_proj
+mlp.down
+mlp.gate
+mlp.up
+Module Type
+3.51
+3.18
+2.49
+3.31
+3.04
+2.51
+2.69
+2.28
+2.32
+2.57
+2.22
+2.50
+2.25
+2.12
+2.32
+2.65
+1.51
+1.13
+1.13
+1.01
+0.83
+0.85
+0.74
+0.71
+0.77
+0.73
+0.75
+0.85
+0.83
+0.81
+0.95
+0.82
+4.04
+3.31
+2.75
+3.23
+2.94
+2.44
+2.66
+2.26
+2.06
+2.44
+2.07
+2.10
+2.12
+2.02
+2.25
+2.56
+0.82
+0.94
+0.90
+0.95
+1.02
+1.13
+0.99
+1.09
+0.99
+0.93
+1.02
+0.89
+0.90
+0.88
+0.96
+1.10
+1.24
+1.00
+1.15
+1.06
+1.06
+1.06
+1.09
+1.06
+1.01
+1.03
+1.02
+1.00
+0.96
+0.97
+0.96
+1.09
+1.24
+1.31
+1.24
+1.40
+1.47
+1.50
+1.51
+1.57
+1.54
+1.52
+1.41
+1.30
+1.22
+1.20
+1.30
+1.66
+1.14
+0.99
+1.01
+1.03
+1.07
+1.07
+1.09
+1.13
+1.06
+1.06
+1.05
+1.05
+1.05
+1.07
+1.19
+1.73
+NFN-Map for Llama-3.2-1B-Instruct (Math)
+1
+2
+3
+4
+Figure 3: NFN-map for LLama-3.2-1B-Instruct on Math dataset (GSM8K). See Appendix D for NFN-maps of
+other models.
+alignment, as in the random baseline ∥W ˜zin∥. We provide a more in-depth analysis of this behavior
+in Appendix B.
+This analysis suggest that feature norms can be used to measure module-data alignment in LLMs. In
+the next section, we refine this notion of alignment and use it to create a method for module type
+selection for LoRA finetuning.
+3
+PLOP: FINETUNING MODULE TYPES WITH THE LOWEST ALIGNMENT
+Given a pretrained model and a finetuning dataset D, we compute feature norms for all modules on
+the task D by averaging across a subset of D. This captures module-data alignment as detailed in the
+previous section. Our methodology in based on the following intuition: The modules with the lowest
+alignment levels have more potential for adaptation, and therefore should be prioritized in finetuning.
+To obtain a scale-free alignment score, we need to normalize with some baseline. Specifically, as
+shown in Fig. 2, if we consider a random vector ˜zin with the same norm as zin, the feature norm
+∥W ˜zin∥does not exhibit any significant change throughout training, which is expected due the to
+lack of correlation between W and ˜zin. This random baseline can act as a natural normalizer for the
+actual feature norms, which leads to the following intuitive definition of our alignment metric.
+Definition 1 (Normalized Feature Norm (NFN)). Given a pretrained model, a module with weight
+W in this model, and an input x, we define the Normalized Feature Norm as
+NFN(W,x) = ∥Wzin(x)∥
+∥W ˜zin(x)∥,
+where ˜zin(x) is a vector of the same dimension and norm of zin(x), with i.i.d coordinates distributed
+as centered Gaussian random variables.
+By incorporating the random baseline ∥W ˜zin(x)∥, in the definition of NFN scores, we expect to
+see scores NFN> 1 when W is well aligned with zin, while the NFN score should be ≈1 when
+alignment is not significant. Under some assumptions on W and zin, we can prove that when the
+width is large enough, the NFN score can be approximated by NFN(W,x) ≈∥
+W zin(x)
+∥W ∥F ∥zin(x)∥∥where
+∥W∥F =
+√
+∑ij W 2
+ij is the Frobenius norm of W. This approximation shows that dividing by ∥W ˜zin∥
+essentially normalizes W and zin. While both forms are cheap to compute, we prefer the expression
+in Definition 1 as it provides an intuitive interpretation of what NFN scores are representing.
+From this analysis and the intuition above, we introduce PLoP, a method that leverages NFN scores
+to identify which modules should be prioritized for LoRA finetuning. Our method is described below.
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+(a) Llama3.2-1B-Instruct
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+(b) Gemma3-1B-Instruct
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+(c) Llama3.2-3B-Instruct
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+(d) Qwen3-1.7B-Instruct
+Figure 4: NFN scores aggregated by module type for different models. The scores are for different datasets
+(math, code, history, and logic).
+PLoP – Module Type Selection
+Inputs: Model M, Finetuning dataset D.
+Step1 (Scores): For each model type T ∈{Query, Key, Value, OutProj, GateProj, UpProj, DownProj},
+compute average NFN score across W ∈T and x ∈D.
+Step2 (Insertion): Insert LoRA in module types with the lowest NFN scores.
+As stated above, PLoP is based on the hypothesis that modules with the lowest alignment have higher
+potential for adaptation, and thus should be targeted in finetuning.
+For ablation analysis, we also experiment with the reverse PLoP method where instead of choosing
+module types with the lowest scores, we choose the ones with the highest scores. We call this method
+PLoP−1 and we evaluate its performance in Section 4.
+Figure 3 and Fig. 4 show NFN scores for for different models and 4 tasks: math (GSM8K, Cobbe
+et al. (2021)), code (HumanEval, Chen et al. (2021)), history (MMLU high school european history,
+Hendrycks et al. (2021)), and logic (MMLU logical fallacies). The NFN-map in Fig. 3 provides the
+most granular level of scoring and shows the NFN scores by module. We can see that key and query
+attention modules are most aligned with the task in this case, while MLP modules are less aligned,
+suggesting the need for adaptation in those modules. To see this by module type, we aggregate by
+averaging over all modules of the same type (step 2 in PLoP) and show the results in the Fig. 4 for
+different models. We observe significant variability of NFN scores across models, module types,
+and datasets. For Llama3.2-1B, module types with the highest scores (Query, Key) average around
+2-3X the baseline (≈1), and the lowest scores (Value, Gate, Down, Up) hovering around the baseline
+score of 1. In this case, PLoP indicates that adaptation should be focused on the (value, gate, down,
+up) modules rather than the attention query and key matrices. Note that this coincides with the
+recommendation of empirical work by He et al. (2021) for Llama models but is contradictory to the
+recommendations of Hu et al. (2022) to finetune mainly attention modules.
+Qwen3-1.7B shows high alignment in Query, Key, and Gate modules, with lower alignment for other
+MLP modules, and a low alignment for the Value module (≈0.75). This indicates the Value modules
+in Qwen3-1.7 are “negatively” aligned with all datasets, suggesting that inputs to the Value modules
+are aligned with the smallest singular directions of the Value weight matrices. The same pattern can
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.5
+1.0
+1.5
+Alignment Ratio (NFN)
+Alignment by Module Type for Math (GSM8K)
+Qwen2.5-1.5B
+Qwen2.5-Math-1.5B
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.5
+1.0
+1.5
+Alignment Ratio (NFN)
+Alignment by Module Type for Code (HumanEval)
+Qwen2.5-1.5B
+Qwen2.5-Coder-1.5B
+Figure 5: Module types NFN scores for general and specialized Qwen2.5 models. Specialized models (math,
+code) are finetuned on task-specific data. Scores are higher with the specialized models.
+be observed in Gemma3-1B, and we currently do not have an explanation for this phenomenon. In
+Appendix D, we provide additional NFN scores for Qwen, Gemma, and Llama models.
+NFN scores are task-sensitive.
+The alignment scores differ between tasks. For instance, model
+weights show larger alignment with history compared to math, suggesting that their training data
+consisted more of sequences similar to general natural language than math related tokens, which
+is expected. However, note that all tasks share some “base” alignment level given by the general
+magnitude of the NFN score for each module type. This is a more fundamental phenomenon that
+is independent of the task, and is related to some basic level of feature learning that is required for
+token processing. 4
+NFN scores consistent across different model sizes.
+In Fig. 4 (a) and (c), we show NFN scores
+for two model sizes of Llama3.2, 1B and 3B. The ranking of module types based on NFN scores
+is roughly the same for both models, suggesting consistency of NFN scores across different model
+sizes. Intuitively, having similar NFN score patterns suggests similar pretraining and post-training
+processes for these models, which is expected for models of the same family (Llama3.2 in this case).
+Specialized models show higher NFN scores.
+In Fig. 5, we compare NFN scores for instruction-
+tuned and more specialized version of the same model Qwen2.5-1.5B for math/code tasks. As
+expected, the specialized models show higher NFN scores overall which further confirms that NFN
+scores, while cheap to calculate, can be a reliable metric for module-data alignment. The increased
+NFN score confirm our theoretical analysis in Section 2 and shows that training on domain-specific
+data increases module-data alignment, captured by the NFN scores.
+23
+24
+25
+26
+27
+28
+29 210
+Selection batch size m
+0.4
+0.6
+0.8
+1.0
+Kendall 
+Llama-3.2 1B
+Qwen-3 1.7B
+Qwen-2.5 7B
+Figure 6:
+Sensitivity analysis of
+PLoP in GSM8K dataset.
+Compute cost of PLoP.
+To obtain the results in Fig. 3, we
+used a single forward pass with batch size 200, with a maximum
+sequence length of 256. The cost of PLoP is approximately the
+same as performing standard batched prefill over 200 inputs,
+which can be merged with the first step of LoRA finetuning,
+i.e. roughly zero additional cost. Note that PLoP does not re-
+quire gradient computation at any stage, making it substantially
+cheaper than any gradient-based selection strategy.
+Sensitivity of PLoP to selection subset size.
+As mentioned
+above, the experiments in Fig. 3, Fig. 4, and Fig. 5 were con-
+ducted with a forward propagation batch size of m = 200. To
+understand the sensitivity of PLoP to the choice of m, we run
+the following experiment: for varying batch size m ∈{2k,k = 3,...,10}, we divide GSM8K train
+set (7k+ samples) into pairs of batches of size m (the pair has 2m samples in total) and compute
+the Kendall τ correlation coefficient between the module types selected by PLoPfor each pair. We
+do this for (dataset size/2m) pairs, and show the distribution of Kendall τ in Fig. 6 as a function of
+4The mechanisms of feature learning in deep neural networks are still largely misunderstood. Quantitative
+approaches such as Nam et al. (2024) offer some insights, but are far from being comprehensive.
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+m. Across different model sizes, we observe that correlation is close to 1 for batch size m ≥64,
+indicating that PLoP is also sample efficient. We conduct a similar study for sequence length, which
+we report in Appendix D.6.
+4
+EXPERIMENTS
+We consider three post-training scenarios: Supervised Finetuning for sentence classification, Super-
+vised Finetuning for text generation, and Reinforcement Learning (GRPO, Shao et al. (2024)), all
+with LoRA adapters. We report results with Llama (Llama-Team, 2024), Qwen (Qwen Team, 2025),
+and Gemma (Team, 2025) models across different sizes. Our experiments are as follows:
+1. SFT for classification: we finetune classifers on ANLI (Nie et al., 2020).
+2. SFT for text generation: we consider three experiments: 1) Train on MetaMathQA (Yu et al.,
+2023) and evaluate the results on GSM8K (Cobbe et al., 2021), 2) Finetune on language
+datasets from AYA (Singh et al., 2024) and evaluate train/test NLL, and 3) Finetune on
+CommonsenseQA (Talmor et al., 2019) and evaluate accuracy.
+3. RL: we RL-tune on MetaMathQA using GRPO and evaluate on GSM8K.
+1000
+2000
+3000
+4000
+5000
+Step
+0.4
+0.5
+Test Acc
+Qwen2.5-0.5B
+PLoP
+MLP
+Attn
+0.525
+0.550
+Zoom
+1000
+2000
+3000
+4000
+5000
+Step
+0.4
+0.5
+0.6
+Test Acc
+LLama-3.2-1B
+PLoP
+MLP
+Attn
+0.58
+0.60
+0.62
+Zoom
+1000
+2000
+3000
+4000
+5000
+Step
+0.4
+0.6
+Test Acc
+Qwen3-Embedding-8B
+PLoP
+MLP
+Attn
+0.70
+0.75
+Zoom
+Figure 7: LoRA finetuning on ANLI
+for different models. We use LoRA
+rank r = 8 for MLP strategy and
+adapt r for PLoP and Attn to match
+number of parameters for fair com-
+parison. All curves are smoothened
+with EMA(α = 0.8) for better visual-
+ization. See Appendix D.3 for more
+details about the experimental setup.
+We investigate the effect of different module placement strategies:
+our method PLoP(placing LoRA in module types with the lowest
+NFN scores), Attn (inserting LoRA only in attention modules,
+as suggested in Hu et al. (2022)), MLP (inserting LoRA only in
+MLP modules, as suggested in He et al. (2021)), ALL (inserting
+LoRA in all module types), Random (inserting LoRA in randomly
+picked module types and average over 4 runs), and as a sanity-
+check PLoP−1 (the inverse of our method, i.e. placing LoRA
+modules types with the highest NFN scores) to demonstrate that
+PLoP is capturing meaningful signal.
+Hereafter, we use the following letters to denote specific mod-
+ules: Q (Query), K (Key), V (Value), O (Out projection), U (Up
+projection), G (Gate projection), and D (Down projection). All
+module type NFN scores and experimental details are provided
+in Appendix D.
+4.1
+SUPERVISED FINETUNING FOR CLASSIFICATION
+The Adversarial Natural Language Inference (ANLI) is a lan-
+guage classification task that is more challenging compared to
+similar tasks (e.g. MNLI). Using LoRA with different placement
+strategies, we finetune pretrained models on ANLI and report
+results in Fig. 7. For Qwen2.5-0.5B and Qwen3-Embedding-
+8B, we observe a significant difference in performance between
+PLoP and other strategies. For Llama3.2-1B, PLoP and MLP
+yield roughly the same performance, while Attn is significantly
+worse. Note that for the Llama model, the MLP modules have
+small NFN scores, comparable to scores of modules selected by
+PLoP(V-O-D, see Fig. 4), which could explain why we obtain
+similar performance with both methods.
+4.2
+SUPERVISED FINETUNING FOR TEXT GENERATION
+SFT on MetaMathQA.
+For challenging tasks such as mathematical reasoning, SFT is often used to
+“prime” the model for subsequent RL-based finetuning. We perform SFT on the MetaMathQA dataset
+Yu et al. (2023). To evaluate the performance we measure the accuracy on the GSM8k benchmark
+Cobbe et al. (2021). All experimental details are provided in Appendix D.3.
+We finetune Qwen3 0.6B and 1.7B models. The results are shown in Tables 1 and 2 respectively. In
+both cases, the placement of adapters in only the attention layers is clearly suboptimal, demonstrating
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+Table 1: Qwen3-0.6B
+Module Types
+#Params
+(M)
+Train
+Loss
+Eval Acc
+No FT
+-
+-
+48.1%
+PLoP(D–U–V) (r = 76)
+21.8
+0.118
+63.8%
+PLoP(D–U–V) (r = 64)
+18.4
+0.116
+62.0%
+PLoP−1(G–K–Q) (r = 64)
+16.5
+0.119
+60.6%
+MLP(D–G–U) (r = 64)
+22.0
+0.119
+63.3%
+Attn(K–Q–V) (r = 64)
+12.8
+0.130
+58.6%
+all (r = 64)
+40.4
+0.113
+62.4%
+Random (r = 64)
+–
+0.117
+59.1%
+Table 2: Qwen3-1.7B
+Module Types
+#Params
+(M)
+Train
+Loss
+Eval Acc
+No FT
+-
+-
+64.7%
+PLoP(D–O–V) (r = 102)
+43.9
+0.109
+75.4%
+PLoP(D–O–V) (r = 64)
+27.5
+0.111
+75.2%
+PLoP−1(G–K–Q) (r = 64)
+27.5
+0.113
+74.6%
+MLP(D–G–U) (r = 64)
+44.0
+0.108
+75.0%
+Attn(K–Q–V) (r = 64)
+18.4
+0.119
+69.5%
+all (r = 64)
+69.7
+0.105
+73.9%
+Random (r = 64)
+–
+0.112
+70.1%
+Table 3: Train/Test NLL on languages from AYA
+dataset. All methods have comparable trainable param-
+eter count which is fixed by setting r = 16 for the MLP
+method.
+Portuguese
+Japanese
+Arabic
+Train
+Test
+Train
+Test
+Train
+Test
+No FT
+–
+7.74
+–
+5.06
+–
+6.82
+Random
+0.475
+0.491
+1.81
+1.95
+2.13
+2.33
+Attn
+0.482
+0.507
+1.68
+1.76
+2.21
+2.50
+MLP
+0.447
+0.479
+1.56
+1.70
+0.991
+1.05
+PLoP−1
+0.512
+0.612
+1.73
+1.91
+1.79
+2.33
+Llama-3.2 1B
+PLoP
+0.414
+0.451
+1.57
+1.71
+0.923
+0.952
+No FT
+–
+7.26
+–
+5.93
+–
+8.72
+Random
+0.356
+0.421
+1.44
+1.50
+1.59
+1.87
+Attn
+0.383
+0.451
+1.57
+1.69
+1.98
+2.05
+MLP
+0.292
+0.418
+1.25
+1.50
+0.917
+0.955
+PLoP−1
+0.356
+0.431
+1.61
+1.79
+2.01
+2.13
+Llama-3.2 3B
+PLoP
+0.241
+0.381
+1.20
+1.41
+0.791
+0.843
+that for challenging tasks such as mathematics,
+adapting only the attention layers has limited ef-
+fect. We see that the most competitive placements
+for both model sizes is to place adapters according
+to PLoP or in the MLP layers, even outperform-
+ing the placement of adapters in all layers which
+requires between 1.5-1.8× the number of trainable
+parameters. When adjusting for an equal number
+of trainable parameters, PLoP produces the best
+results with a slight edge over the MLP placement.
+For the 1.7B parameter model PLoP has a small
+edge over the MLP placement even with about
+60% the number of parameters.
+SFT on Language datasets.
+We finetune
+Llama-3.2 1B and 3B models on languages
+datasets from the AYA dataset (Singh et al., 2024)
+with different adapter placement strategies, while
+matching trainable parameters count. All experi-
+mental details are deferred to Appendix D.3. The
+results are reported in Table 3. On language datasets, PLoP(V-O-D) consistently outperforms other
+methods, with the second best ranking method is consistently MLP. PLoP−1(Q-K-G) shows signifi-
+cant gap in performance, which suggests that picking the modules with the highest NFN scores is
+suboptimal, and that PLoP is picking meaningful signal. The Attn baseline and Random baseline
+(average over 4 random selections) rank lower than MLP, confirming previous empirical findings by
+He et al. (2021), and significantly lower than PLoP.
+Table 4:
+Train NLL/Test Acc
+on CommonsenseQA. All methods
+have comparable trainable parame-
+ter count which is fixed by setting
+r = 8 for the MLP baseline.
+Train NLL
+Test Acc
+No FT
+–
+82.8%
+Random
+0.258
+86.2%
+Attn
+0.263
+86.0%
+MLP
+0.247
+87.3%
+PLoP−1
+0.264
+86.7%
+Qwen-2.5 7B
+PLoP
+0.235
+88.6%
+No FT
+–
+88.2%
+Random
+0.082
+91.2%
+Attn
+0.081
+91.5%
+MLP
+0.075
+91.9%
+PLoP−1
+0.080
+91.0%
+Qwen-2.5 32B
+PLoP
+0.072
+92.6%
+SFT on CommonsenseQA.
+We finetune Qwen-2.5 7B and 32B
+models on CommonsenseQA (Talmor et al., 2019), a dataset con-
+sisting of common sense question answering, and evaluate the
+train NLL and test accuracy. Similar to SFT on language datasets,
+we consider different adapter placement strategies and match the
+trainable parameter count for fair comparison. All experimental
+details are deferred to Appendix D.3. The results are reported in
+Table 4. The results show that PLoP, which selects V-O-U mod-
+ules for both model sizes, consistently outperforms other strategies.
+PLoP−1, which selects Q-K-G modules for both module sizes, un-
+derperforms other methods indicating that high NFN scores are
+associated with lower performance.
+4.3
+RLVR FOR MATHEMATICAL REASONING
+Reinforcement Learning has emerged as a promising approach
+for test-time scaling. Algorithms such as GRPO incentivize the
+model to follow a pattern of “thinking” before providing the final
+answer. This implicit approach to reasoning (versus the more
+explicit approaches such as MCTs (Xie et al., 2024)) showed very
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+promising results, especially with the impressive performance of
+DeepSeek-R1 (DeepSeek-AI, 2025). In this section, we experimented with “GRPO on a budget”
+using LoRA adapters (instead of training the full weights) to enhance mathematical reasoning. We
+select 3 module types for LoRA adapter placement using the strategies stated above. We compare both
+RL rewards (columns Rwd/Format and Rwd/Answer) and Evals (GSM8K 8shots prompting Pass@1).
+Note that because LoRA is a lightweight finetuning method, it would not be sufficient to induce
+reasoning in base models with GRPO, especially with a small rank r. For this purpose, we apply
+GRPO with LoRA to instruction-tuned models instead of base models. For more implementation
+details, see Appendix D.
+Table 5: GRPO results for Qwen3-1.7B trained on MetaMathQA.
+Module Types
+#Params (M)
+Rwd/Format
+Rwd/Answer
+Eval/GSM8K
+No GRPO
+–
+–
+–
+65.50%
+Attn(Q-K-V) (r = 16)
+4.58
+1.89
+0.91
+71.49%
+Attn(Q-K-V) (r = 25)
+7.17
+1.97
+0.98
+72.13%
+MLP(U-G-D) (r = 16)
+11.01
+2.57
+1.28
+73.61%
+PLoP−1(Q-K-G) (r = 16)
+6.88
+1.71
+0.86
+71.41%
+PLoP(V-O-D) (r = 16)
+6.88
+2.67
+1.32
+74.52%
+PLoP(V-O-D) (r = 25)
+10.75
+2.75
+1.32
+75.03%
+With GRPO, we define the think-then-answer pattern in similar way to DeepSeek-R1. The model is
+rewarded for placing the thinking process in between <think> and </think>, and then giving
+the answer in between <solution> and </solution>. This is encoded in the format reward
+function (Rwd/Format). The correctness of the solution is rewarded as well (Rwd/Answer). We track
+this reward as we train the model with GRPO and show the final results (at convergence).
+Table 5 shows the results of GRPO with the Qwen3-1.7B trained on MetaMathQA. PLoP yields
+better performance overall both in training rewards and evaluation (GSM8K). Compared to Attn,
+PLoP performs better even when matching the number of trainable parameters (Attn(r = 25) vs
+PLoP(r = 16)). Interestingly, PLoP performs better than MLP placement strategy even when using
+the same rank r = 16, in which case we have 6.88M trainable parameters with PLoP and 11.01M
+parameters with MLP. For the same number of parameters, the performance is further improved with
+PLoP(r = 25).
+We experimented with Gemma3-1B as well, and found that PLoP outperforms other alternatives,
+although the score on GSM8K is low due the inherent limitations of Gemma3-1B in mathematical
+reasoning. See Appendix D for more details.
+5
+DISCUSSION AND LIMITATIONS
+We introduced PLoP, an intuitive module type selection method, designed specifically for LoRA
+fine-tuning and based on NFN scores – a notion of module-data alignment supported by an intuitive
+theoretical analysis. PLoP meets the computational criteria needed for efficient LoRA finetuning as
+articulated in the introduction: PLoP’s lightweight nature makes it particularly valuable in resource-
+constrained environments where LoRA is most beneficial. PLoP is based on the NFN-map, which
+enables more granular selection beyond module types. However, we deliberately focused on module
+type selection as it represents the most widely adopted aggregation approach among practitioners,
+avoiding the additional implementation complexities of more fine-grained selection. While we
+explored using PLoP for layer-level selection by inserting LoRA into target layers with low NFN
+scores, we encountered inconsistent results and have reserved this question for future research.
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+6
+ACKNOWLEDGMENT
+This work used GPU servers at Delta AI (NCSA) through allocation #CIS250193 from the Advanced
+Cyberinfrastructure Coordination Ecosystem: Services & Support (ACCESS) program (Boerner
+et al., 2023), which is supported by U.S. National Science Foundation grants #2138259, #2138286,
+#2138307, #2137603, and #2138296.
+REFERENCES
+Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+Weizhu Chen, et al. Lora: Low-rank adaptation of large language models. ICLR, 1(2):3, 2022.
+Soufiane Hayou, Nikhil Ghosh, and Bin Yu.
+LoRA+: Efficient low rank adaptation of large
+models. In Forty-first International Conference on Machine Learning, 2024a. URL https:
+//openreview.net/forum?id=NEv8YqBROO.
+Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-
+Ting Cheng, and Min-Hung Chen. Dora: Weight-decomposed low-rank adaptation. In ICML,
+2024. URL https://openreview.net/forum?id=3d5CIRG1n2.
+Minsoo Kim, Sihwa Lee, Wonyong Sung, and Jungwook Choi. RA-LoRA: Rank-adaptive parameter-
+efficient fine-tuning for accurate 2-bit quantized large language models. In Lun-Wei Ku, Andre
+Martins, and Vivek Srikumar, editors, Findings of the Association for Computational Linguistics:
+ACL 2024, pages 15773–15786, Bangkok, Thailand, August 2024. Association for Computational
+Linguistics. doi: 10.18653/v1/2024.findings-acl.933. URL https://aclanthology.org/
+2024.findings-acl.933/.
+Haodong Lu, Chongyang Zhao, Jason Xue, Lina Yao, Kristen Moore, and Dong Gong. Adaptive
+rank, reduced forgetting: Knowledge retention in continual learning vision-language models with
+dynamic rank-selective lora, 2025. URL https://arxiv.org/abs/2412.01004.
+Soufiane Hayou, Nikhil Ghosh, and Bin Yu.
+The impact of initialization on lora fine-
+tuning dynamics.
+In A. Globerson, L. Mackey, D. Belgrave, A. Fan, U. Paquet,
+J. Tomczak, and C. Zhang, editors, Advances in Neural Information Processing Sys-
+tems,
+volume 37,
+pages 117015–117040. Curran Associates,
+Inc.,
+2024b.
+URL
+https://proceedings.neurips.cc/paper_files/paper/2024/file/
+d4387c37b3b06e55f86eccdb8cd1f829-Paper-Conference.pdf.
+Qingru Zhang, Minshuo Chen, Alexander Bukharin, Nikos Karampatziakis, Pengcheng He, Yu Cheng,
+Weizhu Chen, and Tuo Zhao. Adalora: Adaptive budget allocation for parameter-efficient fine-
+tuning, 2023a. URL https://arxiv.org/abs/2303.10512.
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient finetuning
+of quantized llms. Advances in neural information processing systems, 36:10088–10115, 2023.
+Dawid J. Kopiczko, Tijmen Blankevoort, and Yuki M. Asano. Vera: Vector-based random matrix
+adaptation, 2024. URL https://arxiv.org/abs/2310.11454.
+Longteng Zhang, Lin Zhang, Shaohuai Shi, Xiaowen Chu, and Bo Li. Lora-fa: Memory-efficient
+low-rank adaptation for large language models fine-tuning, 2023b. URL https://arxiv.
+org/abs/2308.03303.
+Chunlin Tian, Zhan Shi, Zhijiang Guo, Li Li, and Chengzhong Xu. Hydralora: An asymmetric lora
+architecture for efficient fine-tuning, 2024. URL https://arxiv.org/abs/2404.19245.
+Ting Jiang, Shaohan Huang, Shengyue Luo, Zihan Zhang, Haizhen Huang, Furu Wei, Weiwei
+Deng, Feng Sun, Qi Zhang, Deqing Wang, and Fuzhen Zhuang. Mora: High-rank updating for
+parameter-efficient fine-tuning, 2024. URL https://arxiv.org/abs/2405.12130.
+Vlad Fomenko, Han Yu, Jongho Lee, Stanley Hsieh, and Weizhu Chen. A note on lora. arXiv preprint
+arXiv:2404.05086, 2024.
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+Junxian He, Chunting Zhou, Xuezhe Ma, Taylor Berg-Kirkpatrick, and Graham Neubig. Towards a
+unified view of parameter-efficient transfer learning. arXiv preprint arXiv:2110.04366, 2021.
+Llama-Team. The llama 3 herd of models, 2024. URL https://arxiv.org/abs/2407.
+21783.
+Mozhdeh Gheini, Xiang Ren, and Jonathan May. Cross-attention is all you need: Adapting pretrained
+transformers for machine translation. arXiv preprint arXiv:2104.08771, 2021.
+Zhi Zhang, Qizhe Zhang, Zijun Gao, Renrui Zhang, Ekaterina Shutova, Shiji Zhou, and Shanghang
+Zhang.
+Gradient-based parameter selection for efficient fine-tuning.
+In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 28566–28577, 2024.
+Haoyu He, Jianfei Cai, Jing Zhang, Dacheng Tao, and Bohan Zhuang. Sensitivity-aware visual
+parameter-efficient fine-tuning. In Proceedings of the IEEE/CVF International Conference on
+Computer Vision, pages 11825–11835, 2023.
+Aristide Baratin, Thomas George, César Laurent, R Devon Hjelm, Guillaume Lajoie, Pascal Vincent,
+and Simon Lacoste-Julien. Implicit regularization via neural feature alignment, 2021. URL
+https://arxiv.org/abs/2008.00938.
+Yizhang Lou, Chris E Mingard, and Soufiane Hayou. Feature learning and signal propagation in deep
+neural networks. In Kamalika Chaudhuri, Stefanie Jegelka, Le Song, Csaba Szepesvari, Gang Niu,
+and Sivan Sabato, editors, Proceedings of the 39th International Conference on Machine Learning,
+volume 162 of Proceedings of Machine Learning Research, pages 14248–14282. PMLR, 17–23
+Jul 2022. URL https://proceedings.mlr.press/v162/lou22a.html.
+Bobby He, Lorenzo Noci, Daniele Paliotta, Imanol Schlag, and Thomas Hofmann. Understanding
+and minimising outlier features in neural network training, 2024. URL https://arxiv.org/
+abs/2405.19279.
+Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization, 2017. URL
+https://arxiv.org/abs/1412.6980.
+Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Anima Anandkumar. signsgd:
+Compressed optimisation for non-convex problems, 2018. URL https://arxiv.org/abs/
+1802.04434.
+Greg Yang and Edward J. Hu. Feature learning in infinite-width neural networks, 2022. URL
+https://arxiv.org/abs/2011.14522.
+Yoonsoo Nam, Chris Mingard, Seok Hyeong Lee, Soufiane Hayou, and Ard Louis. Visualising
+feature learning in deep neural networks by diagonalizing the forward feature map, 2024. URL
+https://arxiv.org/abs/2410.04264.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John
+Schulman. Training verifiers to solve math word problems. arXiv preprint arXiv:2110.14168,
+2021.
+Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde De Oliveira Pinto, Jared
+Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large
+language models trained on code. arXiv preprint arXiv:2107.03374, 2021.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob
+Steinhardt. Measuring massive multitask language understanding, 2021. URL https://arxiv.
+org/abs/2009.03300.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, Y. K. Li, Y. Wu, and Daya Guo. Deepseekmath: Pushing the limits of
+mathematical reasoning in open language models, 2024. URL https://arxiv.org/abs/
+2402.03300.
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+Qwen Team. Qwen3 technical report, April 2025. URL https://github.com/QwenLM/
+Qwen3/blob/main/Qwen3_Technical_Report.pdf. Released April 29, 2025.
+Gemma Team. Gemma 3 technical report, 2025. URL https://arxiv.org/abs/2503.
+19786.
+Yixin Nie, Adina Williams, Emily Dinan, Mohit Bansal, Jason Weston, and Douwe Kiela. Ad-
+versarial nli: A new benchmark for natural language understanding. In Proceedings of the 58th
+Annual Meeting of the Association for Computational Linguistics. Association for Computational
+Linguistics, 2020.
+Longhui Yu, Weisen Jiang, Han Shi, Jincheng Yu, Zhengying Liu, Yu Zhang, James T Kwok, Zhenguo
+Li, Adrian Weller, and Weiyang Liu. Metamath: Bootstrap your own mathematical questions for
+large language models. arXiv preprint arXiv:2309.12284, 2023.
+Shivalika Singh, Freddie Vargus, Daniel Dsouza, Börje F. Karlsson, Abinaya Mahendiran, Wei-
+Yin Ko, Herumb Shandilya, Jay Patel, Deividas Mataciunas, Laura OMahony, Mike Zhang,
+Ramith Hettiarachchi, Joseph Wilson, Marina Machado, Luisa Souza Moura, Dominik Krzemi´nski,
+Hakimeh Fadaei, Irem Ergün, Ifeoma Okoh, Aisha Alaagib, Oshan Mudannayake, Zaid Alyafeai,
+Vu Minh Chien, Sebastian Ruder, Surya Guthikonda, Emad A. Alghamdi, Sebastian Gehrmann,
+Niklas Muennighoff, Max Bartolo, Julia Kreutzer, Ahmet Üstün, Marzieh Fadaee, and Sara
+Hooker. Aya dataset: An open-access collection for multilingual instruction tuning, 2024. URL
+https://arxiv.org/abs/2402.06619.
+Alon Talmor, Jonathan Herzig, Nicholas Lourie, and Jonathan Berant. Commonsenseqa: A question
+answering challenge targeting commonsense knowledge, 2019. URL https://arxiv.org/
+abs/1811.00937.
+Yuxi Xie, Anirudh Goyal, Wenyue Zheng, Min-Yen Kan, Timothy P. Lillicrap, Kenji Kawaguchi, and
+Michael Shieh. Monte carlo tree search boosts reasoning via iterative preference learning, 2024.
+URL https://arxiv.org/abs/2405.00451.
+DeepSeek-AI. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning,
+2025. URL https://arxiv.org/abs/2501.12948.
+Timothy J. Boerner, Stephen Deems, Thomas R. Furlani, Shelley L. Knuth, and John Towns. Access:
+Advancing innovation: Nsf’s advanced cyberinfrastructure coordination ecosystem: Services
+& support. In Practice and Experience in Advanced Research Computing 2023: Computing
+for the Common Good, PEARC ’23, page 173–176, New York, NY, USA, 2023. Association
+for Computing Machinery.
+ISBN 9781450399852.
+doi: 10.1145/3569951.3597559.
+URL
+https://doi.org/10.1145/3569951.3597559.
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, Tom
+Hennigan, Eric Noland, Katie Millican, George van den Driessche, Bogdan Damoc, Aurelia Guy,
+Simon Osindero, Karen Simonyan, Erich Elsen, Jack W. Rae, Oriol Vinyals, and Laurent Sifre.
+Training compute-optimal large language models, 2022.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Delving deep into rectifiers: Surpassing
+human-level performance on imagenet classification, 2015. URL https://arxiv.org/abs/
+1502.01852.
+Soufiane Hayou, Arnaud Doucet, and Judith Rousseau. On the impact of the activation function
+on deep neural networks training. In Kamalika Chaudhuri and Ruslan Salakhutdinov, editors,
+Proceedings of the 36th International Conference on Machine Learning, volume 97 of Proceedings
+of Machine Learning Research, pages 2672–2680. PMLR, 09–15 Jun 2019.
+URL https:
+//proceedings.mlr.press/v97/hayou19a.html.
+G. Yang. Scaling limits of wide neural networks with weight sharing: Gaussian process behavior,
+gradient independence, and neural tangent kernel derivation. arXiv preprint arXiv:1902.04760,
+2019.
+Mandar Joshi, Eunsol Choi, Daniel Weld, and Luke Zettlemoyer. triviaqa: A Large Scale Distantly
+Supervised Challenge Dataset for Reading Comprehension. arXiv e-prints, art. arXiv:1705.03551,
+2017.
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+A
+THEORETICAL ANALYSIS OF MODULE-DATA ALIGNMENT
+Given a pretrained model and a finetuning task, our goal is to strategically place LoRA adapters
+in modules that would contribute most significantly to performance. In practice, we usually select
+module types instead of single weight matrices. For instance, for Llama3 models, we might choose
+to insert LoRA in Query (“q_proj") and Key (“k_proj") modules.
+As we discussed in Section 1, for such a method to be useful, it should first be a lightweight
+method that operates efficiently in resource-constrained environments and ideally rely on existing
+computation pipelines. Ideally, the method should rely exclusively on standard forward propagation,
+as this computational pipeline is already necessary for inference and adds no significant overhead to
+the existing workflow.
+This section provide a more in-depth theoretical analysis, complementing that of Section 2.
+0
+100
+200
+300
+0.5
+1.0
+Feature Norm
+Feature Norm
+Feature Norm at Init
+0
+100
+200
+300
+Steps
+0.0
+0.5
+Train Loss
+Figure 8:
+Illustration of fea-
+ture norm growth during train-
+ing. This shows the feature norms
+n−1∥Wzin∥2 for a module W in
+the model (W ∈Rn×n). See Ap-
+pendix A.1 for details about the
+model and training.
+Mechanisms behind the growth in feature norms.
+The reason
+behind the growth in feature norms for certain modules is non-trivial.
+The naive explanation to this phenomenon is that with training,
+weight norms grow for some modules and remain constant constant
+or decrease for others. However, as we will see in the next analysis,
+the mechanisms behind this phenomenon are more subtle, and the
+most important factor is a form of alignment that occurs between
+module weight and its input.
+Specifically, we show that this growth in feature norms in some
+modules appears primarily as a result of two factors: 1) large-width
+in neural networks (large embedding dimension), a condition that
+is generally satisfied in practice, 5 and 2) progressive alignment of
+modules weights with their respective inputs.
+Consider a general neural network of the form
+Yin(x) = Winx,
+Yl(x) = Fl(Wl,Yl−1(x)), l ∈[L],
+Yout(x) = WoutYL(x),
+(4)
+where x ∈Rd is the input, L ≥1 is the network depth, (Fl)l∈[L] are mappings that define the layers,
+Wl ∈Rn×n are the hidden weights, where n is the network width, and Win,Wout are input and output
+embedding weights.
+Model (4) is pretrained on some data mixture D to minimize some loss function ℓ– the next-token
+prediction loss in the case of language models. We introduce some notation that will facilitate the
+presentation of our analysis.
+Notation.
+Hereafter, n will always denote model width. As n grows, given sequences cn ∈R and
+dn ∈R+, we write cn = O(dn) to refer to cn < κdn for some constant κ > 0. We write cn = Θ(dn) if
+we have κ1dn ≤cn ≤κ2dn for some κ1,κ2 > 0. For vector sequences cn = (ci
+n)1≤i≤k ∈Rk (for some
+k > 0), we write cn = O(dn) when ci
+n = O(di
+n) for all i ∈[k], and same holds for other asymptotic
+notation. Finally, when the sequence cn is a vector of random variables, asymptotics are defined in
+the sense of the second moment (L2 norm). For a vector z ∈Rn, we will use the following norms:
+∥z∥= (∑n
+i=1 z2
+i )
+1/2 (euclidean norm), and ∥z∥1 = ∑n
+i=1 ∣zi∣(ℓ1 norm).
+Intuitive theoretical analysis.
+For the sake of tractability, we consider the case where a single
+weight matrix (module) in the model is trained and other modules are frozen. 6 We further simplify
+5From the literature on infinite-width theory, when we take the width to infinity, the training dynamics
+converge with a rate of roughly O(n−1/2) (Yang and Hu, 2022). In practice, a width of n ⪆103 is generally
+considered large enough for the theoretical predictions to be a good approximation of practice.
+6While this is unrealistic, it provides the right intuition behind our methodology, and makes the analysis
+more tractable.
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+the analysis by assuming that the model is trained in a single datapoint x. We later discuss the impact
+of batch training. The trainable module has the form
+zout = Wzin,
+where zin ∈Rn is the input, and zout ∈Rn is the output that we call feature, both evaluated at the
+training datapoint x.7 For Transformer models, the module can be for instance a single Query head, a
+Projection module in some MLP, etc.
+The gradient of the loss with respect to the weight matrix W is given by
+dW = dzout ⊗zin,
+where dzout = ∇zoutℓ, the gradient of the loss with respect to feature zout.
+In general, modern LLMs are trained with Adam (Kingma and Ba, 2017), which normalizes gradients.
+In its momentum-less form, Adam becomes SignSGD (Bernstein et al., 2018), which is defined by
+S(dWij) = +1 if dWij ≥0, otherwise −1. SignSGD is a nice simplification of Adam: it captures the
+property of normalization and allows tractable the theoretical analysis as we will see below. With
+SignSGD, feature updates8 are given by
+Wt+1zin = Wtzin −α × S(dzout ⊗zin)zin
+= Wtzin −α × ∥zin∥1 S(dzt
+out),
+(5)
+where the superscript in zt
+out = Wtzin refers to update step t. Note that we do not use such superscript
+for zin since it does not change when we update W.
+The key trick used in Eq. (5) is that the sign function S(.) can be expanded across outer product.
+This is one of the main observations behind the development of µP (Yang and Hu, 2022), which sets
+scaling exponents for initialization and learning rate with respect to model width n. Under µP, all
+weights in the model are initialized to have roughly 1/√n magnitude (or more precisely 1/√fan_in),
+which implies that features zout and their inputs zin to have Θn(1) norm at initialization (i.e.
+n−1∥zin∥1 = Θn(1)).
+Eq. (5) describes the evolution of features zout as we update weights W. Ideally, we want both
+stability (Wtzin does not grow in magnitude with n) and non-triviality (Wtzin does not converge to
+0 with n). These conditions are both satisfied when Wt+1zin −Wtzin = Θn(1) element-wise, which
+implies that the learning rate should scale as α = ηn−1 for some constant η > 0, to compensate the
+growth in ∥zin∥1, which is exactly the µP scaling rule for the learning rate. See Appendix B below
+for more details about the mechanisms of µP. With this parametrization of the learning rate, we obtain
+∥Wt+1zin∥2
+2 = ∥Wtzin∥2
+2 + η2n−1∥zin∥2
+1 −2ηn−1∥zin∥1 × ⟨Wtzin,S(dzt
+out)⟩.
+We can normalize by n so terms on both sides have Θn(1) magnitude in width n,
+n−1∥Wt+1zin∥2
+2 = n−1∥Wtzin∥2
+2 + η2n−2∥zin∥2
+1 −2ηn−1∥zin∥1 × n−1⟨Wtzin,S(dzt
+out)⟩.
+The term n−1⟨Wtzin,S(dzt
+out)⟩measures the alignment between the features zt
+out = Wtzin and the
+“signed” gradients S(dzout). Intuitively, at the initial training stages, these two terms are roughly
+independent (as random variables) because of the randomness from the initialization weights. As a
+result, in those initial training stages, we have
+⟨Wtzin,S(dzout)⟩≈O(n1/2),
+(6)
+which yields
+n−1∥Wt+1zin∥2
+2 ≈n−1∥Wtzin∥2
+2 + α2n−2∥zin∥2
+1 + O(n−1/2)
+7Here we consider that zin and zout have the same dimension n. However, our analysis can be extended to
+the case where they have different dimensions.
+8Feature update is the change of the features zout after taking one training step.
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+Since α2n−2∥zin∥2
+1 = Θn(1) is positive and asymptotically non-zero, if the width n is large enough,
+we should expect the (normalized) feature norm n−1∥Wtzin∥2
+2 to grow initially during training. The
+next results provides a rigorous description of this phenomenon for linear networks.
+Theorem 1 (Feature Norm Growth in Linear Networks (Informal)). Assume that the neural network is
+a linear MLP (see Appendix B for more details). Then, for any δ ∈(0,1/2), under some assumptions
+stated in Appendix C, there exists a universal constant λ > 0 such that for any T and η satisfying
+T ≤λη−1, the following holds with probability at least 1 −2n−1+2δ
+sup
+1≤t≤T
+∣n−1∥Wtzin∥2 −Γt∣≤Cn−δ,
+(7)
+where Γt = Γ0 + β2(1 + t(t −1)), β = η n−1 ∥zin∥1, and Γ0 = n−1∥W0zin∥2. In other words, when
+the width n is large enough, n−1∥Wtzin∥2 exhibits quasi-quadratic growth at initial training stages.
+Theorem 1 characterizes the growth in feature norms n−1∥Wtzin∥2 as training progresses. The proof
+is provided in Appendix C. In this case, n−1∥Wtzin∥2 grows in a quasi-quadratic pattern, which
+becomes perfectly quadratic when n →∞. This is the most important takeway from this result:
+this phenomenon is associated with large width. With more realistic models, we expect the growth
+property to hold, but not necessarily with the quadratic form. See next section for empirical results.
+A.1
+EVOLUTION OF FEATURE NORMS
+0
+100
+200
+300
+1
+2
+3
+n
+1 W zin 2
+Layer  = 0
+Layer  = 1
+Layer  = 2
+0
+100
+200
+300
+Steps
+0.0
+0.5
+Train Loss
+Figure 9: Evolution of feature
+norms during training for the
+linear network described in Ap-
+pendix A.1. We train the model
+for 300 steps with Adam. Feature
+norms for different layers exhibit
+differential growth patterns as we
+train the model. We shifted the
+curves corresponding to different
+layers for better visualization.
+Consider a three layers linear neural network given by f(x) =
+W2W1W0x, where x ∈Rd, W0 ∈Rn×d, W1 ∈Rn×n, and W2 ∈
+R1×n. The training data consist of N = 1000 datapoints of dimension
+d generated from a linear model y = ω⊺x + ε with ε ∼N(0,0.025),
+ωi ∼d−1N(0,1), and x are generated randomly as standard Gaus-
+sian random variables. We use n = d = 100 in our experiments
+and train the model with Adam. See Appendix D for results with
+SignSGD and more details about the experimental setup.
+Figure 9 shows the growth in feature norms for the three modules
+(corresponding to the three layers in this case) as we train the model.
+We include a baseline (dashed lines) which shows the norms ∥W ˜zin∥
+where ˜zin is a random Gaussian vector with iid coordinates, nor-
+malized such that ∥˜zin∥= ∥zin∥(see next section for an intuitive
+explanation of this baseline). The baseline does not show any signif-
+icant growth over the course of the training which further confirms
+that feature norms grow as a result of increasing alignment between
+module weights and module inputs, and not simply as a result of an
+increase in weight norms.
+Most of the growth occurs early in training.
+Interestingly, most
+of the growth in feature norms occurs in the first T = 200 steps,
+which also correlates with the most significant drop in training loss.
+After T = 200, feature norms remain roughly stable until conver-
+gence. This suggest that the norm growth is associated with an initial
+phase where significant feature learning occurs, and remains roughly
+unchanged after that initial growth phase. Intuitively, as we train the network, the dot product between
+zout and S(dzout) (Eq. (6)) grows from O(n1/2) to roughly Θ1(n) (in absolute value) and therefore
+the argument behind the feature norm growth as explained in the discussion above no longer holds
+later in training. As a result, the growth plateaus after some number of steps T.
+Different growth levels for different modules.
+Although we use the same learning rate for all
+modules, the norm growth in the input layer (n−1∥W0zin0∥2) is much less significant than that
+observed in the second layer (n−1∥W2zin2∥2). To understand this difference, we should take into
+account that when training all modules (layers in this case), the inputs to W1 and W2 change with
+training. The update in feature are given by
+Wt+1zt+1
+in = Wtzt
+in −η n−1 × ∥zt
+in∥1 S(dzt
+out) + Wt+1∆zt+1
+in ,
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+where ∆zt+1
+in = zt+1
+in −zt
+in is the input change after one step. Under µP scaling rule for the learning rate
+(η n−1), the magnitude of ∥zt
+in∥1 remains Θn(1) for all t, however the constant in Θn(1) naturally
+depends on the layer. Additionally, the term Wt+1∆zt+1
+in introduces more complex update dynamics,
+and contribute in a non-trivial way to the change in the feature norms. See Nam et al. (2024) for a
+more detailed discussion on how feature learning changes from one layer to another. Both of these
+aspects lead to uneven growth in the feature norms for different layers.
+Different growth levels for different inputs/tasks.
+In the setup of Theorem 1, we consid-
+ered a batch size of 1, which results in feature updates of the form Wt+1zin = Wtzin −η ×
+n−1∥zin∥1 S(dzout), and we saw that with 1/√n initialization, we have n−1∥zin∥1 = Θn(1). In the
+realistic setting of batch training, feature updates for an input x′ ∈Rd are given by
+Wt+1zin(x′) = Wtzin(x′) −η n−1 × S ( 1
+∣B∣∑
+x∈B
+dzout(x) ⊗zin(x))zin(x′),
+Therefore, we can no longer directly expand the sign function and obtain the ∥zin∥1 term that leads to
+the Θn(1) term. In this case, we need a strong correlation between S ( 1
+∣B∣∑x∈B dzout(x) ⊗zin(x))
+and zin(x′) to obtain the same effect. This translates to whether the datapoint x′ has some similarity
+with the batch used for the update. As a result, we should expect to see higher scores for datapoints
+that are similar to the training dataset, and lower scores for significantly different datapoints.
+B
+ADDITIONAL THEORETICAL DETAILS
+B.1
+INFINITE-WIDTH ANALYSIS AND µP
+Scaling remains the main paradigm to improve performance of language model (see e.g. Hoffmann
+et al. (2022)). This includes model capacity which can be increased via width (embedding dimension)
+or depth (number of layers) or both, training data, number of training steps etc. In our theoretical
+analysis in Section 2, we mentioned the infinite-width n →∞and how our results hold in this limit.
+This is motivated by the fact that most state-of-the-art language and vision models have large width.
+As the width n grows, most hyperparameters in the model such as the initialization and the learning
+should be adapted to avoid numerical instabilities and ensure efficient learning. For instance, the
+initialization variance should scale as 1/n to prevent arbitrarily large pre-activations as we increase
+model width n (e.g. He init He et al. (2015)). To derive such scaling rules, a principled approach
+consist of analyzing statistical properties of key quantities in the model (e.g. pre-activations) as
+n grows and then adjust the initialization, the learning rate, and the architecture itself to achieve
+desirable properties in the limit n →∞Hayou et al. (2019); Yang (2019).
+In this context, Yang and Hu (2022) introduces the Maximal Update Parameterization (or µP), a
+set of scaling rules for the initialization scheme, the learning rate, and the network architecture
+that ensure stability and maximal feature learning in the infinite width limit. Stability is defined by
+Y i
+l = Θ(1) for all l and i where the asymptotic notation ‘Θ(.)’ is with respect to width n (see next
+paragraph for a formal definition), and feature learning is defined by ∆Yl = Θ(1), where ∆refers to
+the feature update after taking a gradient step. µP guarantees that these two conditions are satisfied at
+any training step t. Roughly speaking, µP specifies that hidden weights should be initialized with
+Θ(n−1/2) random weights, and weight updates should be of order Θ(n−1). Input weights should be
+initialized Θ(1) and the weights update should be Θ(1) as well. While the output weights should be
+initialized Θ(n−1) and updated with Θ(n−1). These rules ensure both stability and feature learning
+in the infinite-width limit, in contrast to standard parameterization (exploding features if the learning
+rate is well tuned), and kernel parameterizations (e.g. Neural Tangent Kernel parameterization where
+∆Yl = Θ(n−1/2), i.e. no feature learning in the limit).
+C
+PROOF OF THEOREM 1
+In this section, we provide the full proof for Theorem 1. Forst, we prove a result on the sign of the
+derivative of the loss function with respect to zout, then proceed with the full proof.
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+C.1
+CONSTANT LOSS DERIVATIVE SIGN IN THE INITIAL TRAINING STAGE
+Consider a linear network of the form
+f(x) = WLWL−1 ...W0x,
+x ∈Rd,
+(8)
+where L ≥1 is the network depth, Wℓ∈Rn×n for all ℓ∈{1,2,...,L−1} are hidden layers parameters,
+WL ∈R1×n is the projection layer weight, and W0 ∈Rn×d is the input layer weight.
+The network is trained with the setup described in Section 2, namely:
+• Dataset: a single datapoint (ˆx, ˆy) × Rd × R.
+• Training algorithm: SignSGD with learning rate ηn−1.
+• Single layer: only a single hidden layer that we denote W ∈{Wℓ,ℓ= 1,2,...,L −1} is
+trained, and other layers weights are fixed to their values at initialization. Without loss of
+generality, assume that the trainable layer is ℓ0, i.e. W = Wℓ0.
+• Training loss: quadratic loss given by L(W) = 2−1(fW (ˆx) −ˆy)2.
+In this setting, the linear network training dynamics become tractable and we can obtain closed-form
+expressions in steps t and width n. Let us use the same notation as in Section 2 and denote the
+input and output of the trainable layer zout = Wzin. More precisely, in this case, we can express the
+network output as fW (x) = V ⊺zout = V ⊺Wzin, where zin = Mx, with M = Wℓ0−1 ...W0 ∈Rn×d
+and V ⊺= WL ...Wℓ0+1 ∈R1×n are both non-trainable random matrices. In this case, the gradient of
+the loss with respect to zout is given by
+dzout = (V ⊺Wzin −y)V.
+From now on, we will abuse the notation and use the subscript to denote the training step as well for
+the matrix W = Wℓ0. When we use the notation Wt, it should interpreted as Wℓ0,t. Taking one step
+with SignSGD yields
+Wt+1 = Wt −η n−1∥zin∥1χtS(V ),
+where S(.) = sign(.) and χt = S(V ⊺Wtzin −ˆy).
+Next, we prove a result that will be useful in the proof of Theorem 1. More precisely, we show that
+under mild assumptions, there exists a first initial training phase in which the sign of the loss function
+on the training datapoint does not change. The number of steps in this phase is bounded by η−1 up to
+some constant factor. Naturally, since we initialize with random variables, it should be expected that
+such result could only hold with high probability.
+Theorem 2 (Constant loss derivative sign in the initial training phase). We assume that the weights
+W0,W1,...,WL are initialized such that the following holds:
+• ∣zi
+in∣∈[¯Z, ¯Z] for all i ∈[1 ∶n], where ¯Z, ¯Z > 0 are constants independent of n.
+• Mean-field Init: E[Vi] = 0 and Var(Vi) = n−2 (e.g. uniform distribution on [−n−1,n−1]).
+Further assume that y ∈[¯Z, ¯Z]. 9
+Then, for any δ ∈(0,1), and T ≤η−1 (n−δ +
+¯
+Z
+¯Z2 ), we have with probability at least 1 −n−1+δ,
+∀t ≤T,χt = χ0.
+The assumption on the weight initialization is mild and is satisfied by some standard initialized
+schemes, such as uniform init with n−1 variance for the hidden weights, d−1 variance for the input
+weights, and n−2 variance for the projection weights. The proof of Theorem 2 relies on standard
+concentration results.
+9This can satisfied with a simple adjustment of the constants ¯Z, ¯Z.
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+Proof. Recall the definition of χt
+χt = S(V ⊺Wtzin −ˆy).
+We have the following from above,
+Wtzin = Wt−1zin −ηn−1∥zin∥1χt−1 S(V ),
+and therefore,
+V ⊺Wtzin = V ⊺Wt−1zin −ηn−1∥zin∥1∥V ∥1χt−1
+which implies that
+V ⊺Wtzin = V ⊺W0zin −ηn−1∥zin∥1∥V ∥1
+⎡⎢⎢⎢⎣
+t−1
+∑
+j=0
+χj
+⎤⎥⎥⎥⎦
+.
+Bounding V ⊺W0zin:
+With Chebyshev’s inequality we have:
+P(∣V ⊺W0zin∣≥¯Zn−δ) < Var(V ⊺W0zin)
+( ¯Zn−δ)2
+where
+Var(V ⊺W0zin) = 1
+nVar(W i
+0
+⊺zin) = 1
+n ⋅∥zin∥2
+n
+≤n−1 ¯Z2
+As a result, we obtain:
+P(∣V ⊺W0zin∣≥¯Zn−δ) < n−1+2δ
+If V ⊺W0zin −ˆy < 0, we have
+V ⊺Wtzin −ˆy ≤V ⊺W0zin −ˆy + ηn−1∥zin∥1T
+≤V ⊺W0zin −ˆy + η ¯ZT
+With probability at least 1 −n−1+2δ, we have
+V ⊺Wtzin −ˆy ≤¯Zn−δ −ˆy + η ¯ZT
+Therefore, we have
+T ≤η−1 ( ˆy
+¯Z −n−δ) ⇒∀t ≤T,
+χt = χ0 = −1.
+If V ⊺W0zin −ˆy > 0, asymptotically this implies that −ˆy > 0 (assuming ∣ˆy∣= Θn(1)). Similarly, we
+obtain with probability at least 1 −n−1+2δ,
+V ⊺Wtzin −ˆy ≥V ⊺W0zin −ˆy −η ¯ZT,
+≥−¯Zn−δ −ˆy −η ¯ZT,
+and therefore, we have that
+T ≤η−1 (−ˆy
+¯Z −n−δ) ⇒∀t ≤T,
+χt = χ0 = 1.
+In summary, we have the following: Let δ ∈(0,1). Then, with T ≤η−1 ( ∣ˆy∣
+¯
+Z −n−δ), we have for all
+t ≤T, χt = χ0.
+The assumptions in Theorem 2 can be alleviated to include more generalization initialization schemes,
+such as non-clipped Gaussian initialization. However, this will require additional control on the
+asymptotics of ∥zin∥, ∥zin∥1, and V . The result remains the same however.
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+C.2
+PROOF OF THEOREM 1
+Theorem 1 .[Feature Norm Growth in Linear Networks]
+Assume that the neural network is linear. Then, for any δ ∈(0,1/2), under the assumptions on the
+initialization stated in Theorem 2, there exists a universal constant λ > 0 such that for any T and η
+such that T ≤λη−1, the following holds with probability at least 1 −2n−1+2δ
+sup
+1≤t≤T
+∣n−1∥Wtzin∥2 −Γt∣≤Cn−δ,
+(9)
+where Γt = Γ0 + β2(1 + t(t −1)), β = η n−1 ∥zin∥1, and Γ0 = n−1∥W0zin∥2. In other words,
+n−1∥Wtzin∥2 exhibits quasi-quadratic growth at early training phase, when the width is sufficiently
+large.
+Proof. Recall the update with SignSGD
+Wt+1 = Wt −η n−1χt S(V ) ⊗zin,
+where S(.) = sign(.) and χt = S(V ⊺Wtzin −ˆy).
+Denoting αt = ⟨Wtzin,S(V )⟩, we obtain
+αt+1 = αt −βχt × n = α0 −β n
+t
+∑
+j=0
+χt.
+Therefore,
+∥Wt+1zin∥2
+2 = ∥Wtzin∥2
+2 + η2n−2∥zin∥2
+1 × n −2ηn−1∥zin∥1χt × αt
+= ∥Wtzin∥2
+2 + β2 × n −2βχt × αt.
+Let δ ∈(0,1/2). From Theorem 2, it is straightforward that there exists a constant λ > 0 such that for
+any T > 1 and η such that T ≤λη−1, with probability at least 1−n−1+δ, we have for all t ≤T,χt = χ0.
+In this case, for t ≤T, we have χt × αt = χt × α0 −βn∑t−1
+j=0 χt × χj = χt × α0 −βn × t.
+Therefore,
+n−1∥Wt+1zin∥2 = n−1∥Wtzin∥2 + β2 + 2β2t −2βχtn−1α0.
+Using Chebyshev’s inequality, we can easily show that for any δ ∈(0,1), with probability at least
+1 −n−1+2δ, we have
+∣χtn−1α0∣≤¯Zn−δ,
+which yields that with at least the same probability we have
+∣n−1∥Wtzin∥2 −Γt∣≤∣n−1∥Wt−1zin∥2 −Γt−1∣+ 2β ¯Zn−δ,
+where we define the sequence Γt+1 = Γt + β2(1 + 2t), with Γ0 = n−1∥W0zin∥2. Then, it is straight-
+forward that for all t ≤T
+∣n−1∥Wtzin∥2 −Γt∣≤2β ¯ZTn−δ.
+With union bound, this occurs with probability at least 1 −2n−1+δ.
+Note that the probability bound can be significantly improved by considering sub-gaussian concentra-
+tion bounds instead of Chebyshev’s inequality. Since our aim in this paper is mainly methodological,
+we do not include it here.
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+D
+ADDITIONAL EXPERIMENTAL DETAILS
+D.1
+EXPERIMENTAL SETUP FOR THE LINEAR NETWORK
+The linear network is given by
+f(x) = W2W1W0x,
+where x ∈Rd, W0 ∈Rn×d, W1 ∈Rn×n, and W2 ∈R1,n.
+Dimensions.
+We use d = n = 100 in our experiments.
+Training Data.
+We generate a random vector w ∈Rd with iid coordinates wi ∼d−1/2N(0,1) and
+fix it for the next step. Then, we generate N = 1000 samples from the following distribution:
+• x ∼Rd random vector with iid coordinates xi ∼N(0,1)
+• y = w⊺x + ϵ, where ϵ ∼N(0,0.025)
+Training.
+We use Adam algorithm for training, and train the model for T = 300 steps with full
+batch.
+D.2
+EXPERIMENTAL SETUP FOR SFT (CLASSIFICATION)
+For ANLI experiments, we use the following training configuration
+• Training datasets: ANLI
+• Training algorithm: AdamW, no warmup, linear schedule, dropout (0.1).
+• Max sequence length 256.
+• LoRA α = 2r
+• Precision: bf16.
+We use r = 8 for MLP placement stratgy, and adapt r to match param count for other placement
+strategies. Specifically:
+• Qwen3.5-0.5B: MLP (r = 8), Attn (r = 36), PLoP(r = 17)
+• Llama3.2-1B: MLP (r = 8), Attn (r = 27), PLoP(r = 15)
+D.3
+EXPERIMENTAL SETUP FOR SFT (TEXT GENERATION)
+MetaMathQA.
+For the SFT experiments on MetaMathQA we use the following training configura-
+tion
+• Training dataset: MetaMathQA
+• Training algorithm: Adam
+– epochs: 2
+– warmup: 0.1 fraction
+– schedule: cosine
+– no dropout
+– For each adapter placement we sweep over the learning rate in {1,2,3,4,5} × 10−4.
+• Max sequence length 1024.
+• LoRA α = 2r
+• Precision: bf16.
+For evaluation on GSM8k we use the script evaluate_chat_gsm8k.py in the official QwenLM
+repo. We evaluate with 8-shot examples using the Qwen chat template. We apply a strict match for
+evaluating the accuracy and allow 512 generation tokens.
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+SFT on Languages.
+For the SFT experiments on multilingual language modeling (AYA dataset)
+we use the following training configuration:
+• Training dataset: Aya multilingual dataset (Portuguese, Japanese, Arabic)
+• Models: Llama-3.2-1B-Instruct and Llama-3.2-3B-Instruct
+• Training samples: 4,500 per language
+• Training algorithm: AdamW
+– epochs: 50
+– warmup: 0.1 fraction (10%)
+– schedule: linear decay
+– learning rate: sweep over {1,2,3,4,5} × 10−5
+– weight decay: 0.01
+• Batch size: 128
+• Max sequence length: 128
+• LoRA configuration:
+– rank r = 16 for MLP (adjusted for other methods to match param count)
+– α = 2r = 32
+– No dropout
+• Precision: fp16
+• Evaluation metric: Negative log-likelihood (NLL) on held-out test set
+CommonsenseQA Experiments.
+For the SFT experiments on CommonsenseQA we use the
+following training configuration:
+• Training dataset: CommonsenseQA
+• Models: Qwen2.5-7B-Instruct, Qwen2.5-32B-Instruct
+• Training samples: 9,500
+• Training algorithm: AdamW
+– epochs: 50
+– warmup: 0.1 fraction (5%)
+– schedule: linear decay
+– learning rate: sweep over {1,2,3,4,5} × 10−5
+– weight decay: 0.01
+• Batch size: 32 with gradient accumulation steps of 8 (effective batch size: 64)
+• Max sequence length: 256
+• LoRA configuration:
+– rank r = 8 for MLP (adjusted for other methods to match param count)
+– α = 2r = 16
+– dropout: 0.05
+• Precision: fp16
+• Evaluation metrics: Negative log-likelihood (NLL) and multiple-choice accuracy on held-out
+test set (500 samples)
+D.4
+GRPO EXPERIMENTS
+For the GRPO experiments on MetaMathQA we use the following training configuration:
+• Training dataset: MetaMathQA (50,000 samples)
+• Training algorithm: AdamW
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+– learning rate: 4 × 10−6 (fixed, not swept due to computational constraints)
+– warmup: 0.1 fraction (10%)
+– schedule: cosine decay
+– weight decay: 0.01
+• Batch size: 64 (16 per device with 4 gradient accumulation steps)
+• Number of generations per prompt: 8
+• Maximum generation length: 512
+• Precision: bf16
+• Reward functions: Combination of correctness and format rewards
+• Evaluation: Custom GSM8K evaluation script using model-specific chat templates
+Note: Unlike the SFT experiments, we could not perform learning rate sweeps for GRPO due to
+limited computational resources and the high cost of GRPO training runs. We expect that learning
+rate tuning could further improve the results.
+D.5
+ADDITIONAL EMPIRICAL RESULTS
+D.6
+SENSITIVITY ANALYSIS W.R.T SEQUENCE LENGTH
+23
+24
+25
+26
+27
+28
+29 210
+Sequence length
+0.4
+0.6
+0.8
+1.0
+Kendall 
+Llama-3.2 1B
+Qwen-3 1.7B
+Qwen-2.5 7B
+Figure 10: Sensitivity of the PLoP-picked module types as a function of sequence length.
+Sensitivity of PLoP to selection sequence length.
+To understand the impact of sequence length
+on PLoP-selected module types, we run the following experiment: we randomly select 2 batches of
+size 128 from TriviaQA (Joshi et al., 2017), trim the sequence length to a given value and compute
+the Kendall τ correlation coefficient between the module types selected by PLoPfor each pair. We
+do this for 200 pairs of batches, and show the distribution of Kendall τ in Fig. 10 as a function of
+sequence length. Across different model sizes, we observe that correlation is close to 1 for sequene
+length m ≥128, indicating that PLoP can be used relatively small sequence length.
+D.7
+EVOLUTION OF NFN SCORE DURING LORA FINETUNING
+In Fig. 11, we show the evolution of the NFN scores as we finetuning a Llama3.2-1B model on
+Portuguese language dataset (see experimental setup below) for the three PLoP-selected module type:
+Value, Out_proj, and Down_proj. There are roughly 1750 fientuning steps, but we limit the curve to
+1000 steps for better visualization. NFN scores increase with finetuning, which is in agreement with
+our theoretical predictions in Section 2.
+23
+
+--- Page 24 ---
+Published as a conference paper at ICLR 2026
+0
+250
+500
+750
+1000
+Finetuning step
+0.9
+1.0
+1.1
+NFN score
+V_proj
+Out_proj
+Down_proj
+Figure 11: NFN evolution during finetuning.
+D.8
+GRPO RESULTS FOR GEMMA3
+Table 6: GRPO results for Gemma3-1B trained on MetamathQA (Yu et al., 2023).
+Module Types
+Rwd/Format
+Rwd/Answer
+Eval/GSM8K
+No RL
+–
+–
+29.10%
+Attn (Q-K-V) (r = 16)
+2.16
+0.89
+30.05%
+MLP (U-D-G) (r = 16)
+2.11
+0.88
+29.81%
+PLoP−1 (O-G-D) (r = 16)
+1.91
+0.86
+28.05%
+PLoP(K-V-U) (r = 16)
+2.36
+0.92
+30.52%
+Interestingly, for Gemma3 1B, we found that most of the RL rewards was accumulated in forms of
+format reward (placing the thinking process between <think> and </think> and the solution
+between <answer> and </answer>). This is reflected in Table 6. However, for eval on GSM8K,
+we found that accuracy after GRPO didn’t change significantly which is probably due the fact that
+Gemma3-1B is weak on such tasks. In such cases, LoRA is probably not suitable, and full finetuning
+is needed to enhance reasoning capabilities.
+D.9
+ADDITIONAL NFN-MAPS
+D.9.1
+QWEN3-1.7B-INSTRUCT
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+Layer Index
+attn.k_proj
+attn.o_proj
+attn.q_proj
+attn.v_proj
+mlp.down
+mlp.gate
+mlp.up
+Module Type
+1.51
+2.16
+1.70
+1.28
+1.44
+1.43
+1.38
+1.43
+1.53
+1.34
+1.42
+1.30
+1.41
+1.42
+1.37
+1.22
+1.17
+1.27
+1.15
+1.26
+1.16
+1.08
+1.07
+1.17
+1.25
+1.24
+1.17
+1.41
+1.34
+1.12
+1.26
+1.11
+0.88
+1.01
+1.08
+0.94
+0.93
+0.88
+0.86
+0.89
+0.77
+0.72
+0.81
+0.84
+0.79
+0.71
+0.98
+0.88
+1.07
+0.90
+0.88
+0.93
+1.09
+1.18
+1.06
+1.11
+1.59
+1.65
+1.59
+1.73
+1.45
+1.44
+1.62
+1.45
+1.59
+1.53
+1.41
+1.40
+1.35
+1.31
+1.20
+1.26
+1.19
+1.19
+1.20
+1.26
+1.23
+1.13
+1.12
+1.19
+1.30
+1.31
+1.11
+1.36
+0.97
+0.79
+0.78
+0.87
+0.89
+0.82
+0.88
+0.88
+1.06
+0.81
+0.87
+0.77
+0.98
+0.87
+0.85
+0.71
+0.67
+0.58
+0.64
+0.67
+0.64
+0.63
+0.64
+0.63
+0.66
+0.66
+0.68
+0.70
+1.19
+1.12
+0.96
+0.87
+0.98
+1.01
+0.97
+0.96
+0.95
+0.94
+1.08
+0.96
+0.90
+0.91
+0.90
+0.88
+0.97
+0.90
+0.93
+0.89
+0.91
+0.96
+0.97
+1.00
+0.98
+1.04
+0.89
+0.93
+1.87
+3.05
+2.51
+2.29
+2.33
+1.55
+1.81
+1.76
+1.69
+1.58
+1.46
+1.38
+1.39
+1.34
+1.33
+1.34
+1.36
+1.33
+1.42
+1.49
+1.52
+1.63
+1.65
+1.67
+1.55
+1.43
+1.27
+1.43
+1.05
+0.58
+0.55
+0.65
+0.78
+0.89
+0.91
+0.91
+0.94
+1.01
+1.05
+1.02
+1.00
+1.02
+1.04
+1.06
+1.11
+1.13
+1.19
+1.26
+1.19
+1.09
+1.00
+0.98
+0.96
+0.99
+1.04
+1.33
+NFN-Map for Qwen3-1.7B-Instruct (Math)
+1
+2
+3
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+Figure 12: NFN scores for Qwen3-1.7B
+24
+
+--- Page 25 ---
+Published as a conference paper at ICLR 2026
+D.9.2
+QWEN2.5-3B-INSTRUCT
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+Layer Index
+attn.k_proj
+attn.o_proj
+attn.q_proj
+attn.v_proj
+mlp.down
+mlp.gate
+mlp.up
+Module Type
+1.03 2.21 2.11 1.65 1.80 1.46 1.55 1.65 1.44 1.35 1.37 1.42 1.44 1.22 1.43 1.38 1.50 1.27 1.51 1.26 1.24 1.31 1.34 1.19 1.36 1.34 1.28 1.34 1.30 1.20 1.25 1.21 1.23 1.17 1.49 1.38
+1.40 1.43 1.19 0.91 1.08 1.06 0.99 1.00 1.04 0.99 0.93 0.87 0.87 0.88 0.86 0.88 0.93 0.98 0.99 0.94 0.79 1.16 0.95 0.92 1.01 0.93 0.95 1.14 1.07 1.00 0.89 1.01 0.85 0.80 0.89 0.82
+1.54 1.90 1.75 1.35 1.27 1.15 1.16 1.26 1.28 1.29 1.33 1.26 1.28 1.13 1.20 1.18 1.25 1.11 1.24 1.15 1.11 1.13 1.10 1.08 1.20 1.09 1.13 1.78 1.10 1.06 1.00 0.95 0.89 1.02 1.25 1.27
+0.96 1.10 1.03 1.24 0.94 0.80 0.93 0.96 0.79 0.74 0.78 0.87 0.89 0.97 0.95 1.09 0.89 0.98 1.06 1.13 1.16 0.95 0.89 1.01 0.90 0.94 0.97 0.88 0.84 0.84 0.91 1.06 1.44 1.41 0.81 1.02
+1.22 3.61 2.42 1.63 1.47 0.85 0.97 1.11 0.97 1.02 1.02 1.07 1.09 1.08 1.08 1.12 1.14 1.18 1.18 1.09 1.19 1.13 1.09 1.05 1.04 1.05 1.10 1.03 1.05 1.02 1.07 1.14 1.13 1.02 0.97 1.49
+1.88 2.67 6.24 5.65 5.42 3.39 3.09 3.38 2.79 2.71 2.49 1.94 2.08 1.43 1.46 1.47 1.47 1.35 1.50 1.33 1.46 1.40 1.36 1.32 1.31 1.30 1.31 1.29 1.35 1.39 1.38 1.46 1.34 1.25 1.30 1.78
+1.20 4.26 1.54 1.06 0.91 0.57 0.62 0.74 0.70 0.70 0.68 0.83 0.86 0.94 0.95 0.99 0.99 1.04 1.04 1.03 1.02 0.98 0.96 0.98 0.98 0.98 0.97 0.96 0.96 0.97 0.98 1.02 0.98 0.98 1.06 1.20
+NFN-Map for Qwen2.5-3B-Instruct (Math)
+2
+4
+6
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+Figure 13: NFN scores for Qwen2.5-3B
+D.9.3
+QWEN2.5-1.5B-INSTRUCT
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+Layer Index
+attn.k_proj
+attn.o_proj
+attn.q_proj
+attn.v_proj
+mlp.down
+mlp.gate
+mlp.up
+Module Type
+0.97
+1.67
+1.43
+1.47
+1.29
+1.38
+1.31
+1.45
+1.36
+1.29
+1.38
+1.32
+1.19
+1.35
+1.08
+1.28
+1.32
+1.37
+1.27
+1.27
+1.38
+1.28
+1.31
+1.20
+1.21
+1.25
+1.12
+1.17
+1.11
+0.92
+1.00
+1.03
+1.00
+0.95
+0.95
+0.92
+0.89
+0.90
+0.86
+1.07
+0.90
+0.97
+0.82
+1.00
+1.06
+0.85
+0.88
+0.94
+1.11
+0.95
+0.93
+0.88
+0.84
+0.72
+0.87
+0.84
+3.09
+1.67
+1.32
+1.43
+1.25
+1.36
+1.45
+1.32
+1.23
+1.17
+1.26
+1.24
+1.14
+1.26
+1.05
+2.04
+1.13
+1.23
+1.19
+1.13
+1.11
+1.15
+1.09
+0.98
+1.06
+0.85
+0.96
+1.01
+0.79
+1.00
+0.90
+0.71
+0.69
+0.76
+0.79
+0.92
+0.90
+0.95
+1.01
+0.92
+1.04
+1.02
+0.99
+0.94
+0.92
+0.92
+0.95
+0.93
+0.80
+0.75
+0.86
+0.85
+0.94
+1.33
+1.17
+1.24
+1.13
+0.86
+0.93
+0.86
+1.02
+1.05
+1.09
+1.09
+1.10
+1.09
+1.11
+1.10
+1.10
+1.09
+1.13
+1.14
+1.08
+1.06
+1.03
+1.07
+1.05
+1.02
+1.16
+1.06
+1.05
+0.98
+0.97
+1.58
+1.89
+2.41
+2.39
+2.49
+2.16
+2.31
+1.54
+1.38
+1.39
+1.32
+1.37
+1.47
+1.43
+1.34
+1.33
+1.35
+1.36
+1.35
+1.27
+1.34
+1.33
+1.56
+1.53
+1.45
+1.37
+1.27
+1.24
+1.55
+1.00
+1.04
+0.61
+0.60
+0.72
+0.70
+0.84
+0.89
+0.89
+0.93
+0.94
+0.98
+1.00
+1.01
+1.00
+1.00
+0.98
+0.96
+0.98
+0.97
+0.95
+0.98
+0.97
+0.94
+0.94
+0.95
+1.00
+1.19
+NFN-Map for Qwen2.5-1.5B-Instruct (Math)
+1
+2
+3
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+Figure 14: NFN scores for Qwen2.5-1.5B
+25
+
+--- Page 26 ---
+Published as a conference paper at ICLR 2026
+D.9.4
+QWEN2.5-1.5B-CODER-INSTRUCT
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+Layer Index
+attn.k_proj
+attn.o_proj
+attn.q_proj
+attn.v_proj
+mlp.down
+mlp.gate
+mlp.up
+Module Type
+1.03
+2.00
+1.68
+1.70
+1.49
+1.54
+1.46
+1.62
+1.74
+1.63
+1.76
+1.67
+1.48
+1.61
+1.34
+1.49
+1.54
+1.56
+1.49
+1.56
+1.58
+1.46
+1.53
+1.50
+1.46
+1.45
+1.29
+1.25
+1.26
+1.08
+1.03
+1.04
+1.00
+0.94
+0.99
+0.97
+0.87
+0.89
+0.78
+0.93
+0.80
+0.89
+0.74
+0.88
+0.80
+0.77
+0.77
+0.93
+0.87
+1.01
+0.94
+0.96
+1.00
+0.95
+1.02
+0.97
+2.72
+2.23
+1.59
+1.62
+1.39
+1.50
+1.68
+1.51
+1.36
+1.38
+1.36
+1.41
+1.24
+1.40
+1.24
+2.71
+1.14
+1.27
+1.30
+1.25
+1.13
+1.15
+1.16
+1.04
+1.07
+0.89
+0.95
+0.87
+0.81
+1.05
+0.96
+0.79
+0.74
+0.75
+0.72
+0.89
+0.89
+0.91
+0.92
+0.91
+0.98
+1.07
+0.98
+0.91
+1.00
+0.96
+0.98
+0.91
+0.79
+0.76
+0.92
+0.94
+1.03
+1.50
+1.23
+1.28
+1.22
+1.05
+0.97
+0.94
+1.03
+1.02
+1.09
+1.11
+1.11
+1.10
+1.09
+1.09
+1.10
+1.10
+1.10
+1.10
+1.08
+1.09
+1.02
+1.06
+1.05
+1.02
+1.06
+1.05
+1.05
+1.01
+0.94
+1.00
+1.94
+2.24
+2.64
+2.73
+2.58
+2.81
+1.54
+1.42
+1.48
+1.46
+1.47
+1.64
+1.55
+1.44
+1.46
+1.44
+1.49
+1.55
+1.43
+1.46
+1.39
+1.59
+1.51
+1.44
+1.34
+1.30
+1.41
+2.10
+1.09
+0.76
+0.66
+0.62
+0.74
+0.72
+0.90
+0.95
+0.94
+0.97
+0.98
+1.02
+1.03
+1.05
+1.04
+1.06
+1.04
+1.01
+1.03
+1.02
+1.01
+1.03
+1.02
+0.98
+0.99
+1.01
+1.11
+1.32
+NFN-Map for Qwen2.5-Coder-1.5B-Instruct (Code)
+0.5
+1.0
+1.5
+2.0
+2.5
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+Figure 15: NFN scores for Qwen2.5-1.5B-Coder
+D.9.5
+GEMMA3-1B-INSTRUCT
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+Layer Index
+attn.k_proj
+attn.o_proj
+attn.q_proj
+attn.v_proj
+mlp.down
+mlp.gate
+mlp.up
+Module Type
+1.17
+1.13
+1.04
+1.18
+1.62
+1.06
+1.41
+0.93
+1.02
+1.21
+1.01
+1.01
+1.12
+1.14
+1.05
+1.03
+1.03
+0.85
+1.08
+1.06
+1.11
+1.13
+1.36
+0.81
+1.15
+1.39
+1.76
+1.61
+1.74
+2.23
+1.39
+2.03
+1.35
+1.31
+1.02
+0.96
+1.21
+1.90
+1.09
+2.01
+1.12
+1.08
+1.27
+2.31
+1.38
+2.08
+1.72
+2.32
+2.28
+1.59
+1.85
+1.93
+1.60
+1.60
+1.17
+1.36
+1.58
+1.13
+1.40
+1.29
+1.56
+1.32
+1.02
+1.77
+1.33
+1.29
+1.19
+1.19
+1.11
+1.09
+1.10
+1.14
+1.21
+1.22
+1.30
+1.18
+1.26
+1.20
+0.81
+0.80
+0.67
+0.88
+0.92
+0.61
+0.82
+0.68
+0.81
+0.75
+0.72
+0.81
+0.68
+0.60
+0.65
+0.56
+0.60
+0.73
+0.66
+0.61
+0.63
+0.61
+0.63
+0.46
+0.59
+0.69
+1.34
+1.84
+1.65
+1.58
+1.40
+1.28
+1.28
+1.27
+1.17
+1.13
+1.09
+1.22
+1.24
+1.40
+1.37
+1.33
+1.38
+1.53
+1.64
+1.66
+1.60
+1.75
+1.36
+1.38
+1.95
+1.30
+1.21
+1.44
+1.54
+1.31
+1.53
+1.48
+1.40
+1.37
+1.33
+1.32
+1.20
+1.32
+1.33
+1.33
+1.30
+1.35
+1.48
+1.42
+1.41
+1.34
+1.29
+1.29
+1.35
+1.30
+1.33
+1.25
+0.78
+0.83
+0.74
+0.83
+0.91
+0.90
+0.85
+0.90
+0.94
+0.91
+0.91
+0.92
+0.91
+0.91
+0.89
+0.88
+0.83
+0.91
+0.93
+0.94
+0.94
+0.95
+0.99
+1.00
+1.04
+0.98
+NFN-Map for Gemma-3-1B-Instruct (Math)
+0.5
+1.0
+1.5
+2.0
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+down_proj
+up_proj
+0.0
+0.5
+1.0
+1.5
+2.0
+Alignment Ratio (NFN)
+Alignement by Module Type
+random
+math
+logic
+history
+code
+Figure 16: NFN scores for Gemma3-1B-Instruct
+26

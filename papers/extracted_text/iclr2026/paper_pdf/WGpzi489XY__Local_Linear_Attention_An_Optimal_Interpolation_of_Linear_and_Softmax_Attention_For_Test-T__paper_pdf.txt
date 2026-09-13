@@ -1,0 +1,3113 @@
+--- Page 1 ---
+Published as a conference paper at ICLR 2026
+LOCAL LINEAR ATTENTION: AN OPTIMAL INTERPO-
+LATION OF LINEAR AND SOFTMAX ATTENTION FOR
+TEST-TIME REGRESSION
+Yifei Zuo
+Northwestern University
+Evanston, IL 60208, USA
+yifeizuo2029@u.northwestern.edu
+Yutong Yin
+Northwestern University
+Evanston, IL 60208, USA
+yutongyin2028@u.northwestern.edu
+Zhicheng Zeng
+University of Washington
+Seattle, WA 98195, USA
+zczeng@uw.edu
+Ang Li
+University of Washington
+Seattle, WA 98195, USA
+angliz@uw.edu
+Banghua Zhu
+University of Washington
+Seattle, WA 98195, USA
+banghua@uw.edu
+Zhaoran Wang
+Northwestern University
+Evanston, IL 60208, USA
+zhaoranwang@gmail.com
+ABSTRACT
+Transformer architectures have achieved remarkable success in various domains.
+While efficient alternatives to Softmax Attention have been widely studied, the
+search for more expressive mechanisms grounded in theoretical insight—even
+at greater computational cost—has been relatively underexplored. In this work,
+we bridge this gap by proposing Local Linear Attention (LLA), a novel attention
+mechanism derived from nonparametric statistics through the lens of test-time re-
+gression. First, we show that LLA offers theoretical advantages over Linear and
+Softmax Attention for associative memory via a bias-variance trade-off analysis.
+Next, we address its computational challenges and propose two memory-efficient
+primitives to tackle the Θ(n2d) and Θ(nd2) complexity. We then introduce Flash-
+LLA, a hardware-efficient, blockwise algorithm that enables scalable and paral-
+lel computation on modern accelerators. In addition, we implement and profile a
+customized inference kernel that significantly reduces memory overheads. Finally,
+we empirically validate the advantages and limitations of LLA on test-time regres-
+sion, in-context regression, associative recall and state tracking tasks. Experiment
+results demonstrate that LLA effectively adapts to non-stationarity, outperform-
+ing strong baselines in test-time training and in-context learning, and exhibiting
+promising evidence for its scalability and applicability in large-scale models.
+1
+INTRODUCTION
+Transformer-based architectures have dominated modern AI systems and powered breakthroughs
+across various fields. The core computation primitive–Softmax Attention (Vaswani et al., 2017),
+adaptively processes and aggregates contextual information. Recent research on architecture inno-
+vation has proposed numerous variants of attention mechanism such as Linear Attention (LA) (Yang
+et al., 2024b; 2025; Siems et al., 2025; Sun et al., 2023; Ma et al., 2024; Liu et al., 2024; Katharopou-
+los et al., 2020; Yang et al., 2024a) and state space models (SSMs) (Gu et al., 2022a;b; Gu & Dao,
+2024; Dao & Gu, 2024; Poli et al., 2023). While these methods offer remarkable efficiency improve-
+ments on long sequences, they often incur a performance penalty compared to Softmax Attention
+(Bick et al., 2025; Katharopoulos et al., 2020). Meanwhile, many of the design choices such as
+gating and forgetting factor (Yang et al., 2024a; 2025; Lin et al., 2025; Gers et al., 2000) are often
+1
+
+--- Page 2 ---
+Published as a conference paper at ICLR 2026
+guided by heuristics or empirical results, lacking a principled understanding. Conversely, the search
+for more expressive attention mechanisms, even at an additional computational cost, has been rela-
+tively under-explored. Recently, test-time regression (Wang et al., 2025) unifies the design choices
+of different attention variants, indicating that the attention mechanism can be viewed as a test-time
+optimizer for layer-specific regression problems. A natural question arises: can we systematically
+improve the Softmax Attention mechanism from the perspective of test-time regression?
+In this work, we propose local linear attention (LLA), an upgrade to Softmax Attention derived from
+local linear regression. Our contributions are summarized as follows:
+• We systematically analyze the design space of attention mechanisms within the test-time
+regression framework and propose LLA. We provide theoretical comparison of LLA with
+Softmax Attention and LA family from the perspectives of bias-variance trade-off and
+demonstrate its provable advantage in associative recall capability.
+• We provide a detailed discussion on the computation of LLA and overcome the Θ(n2d)
+and Θ(nd2) memory complexity with two optimizations, where n is the sequence length
+and d is the dimension. We then introduce FlashLLA, a blockwise and hardware-efficient
+algorithm to parallelize the computation on modern accelerators. In addition, we implement
+and profile a customized inference kernel with significant memory reduction.
+• We conduct extensive experiments on synthetic tasks including test-time regression, in-
+context regression, associative recall and state tracking to validate the advantages and lim-
+itations of LLA compared to strong baselines.
+1.1
+RELATED WORKS.
+Linear Attention and State Space Models.
+Due to the quadratic computational cost and linear
+memory consumption of the softmax attention mechanism for autoregressive sequence modeling,
+efficient attention mechanisms such as LA (Yang et al., 2024b; 2025; Siems et al., 2025; Sun et al.,
+2023; Ma et al., 2024; Liu et al., 2024; Yang et al., 2024a) and SSMs (Gu et al., 2022a; Gu &
+Dao, 2024; Dao & Gu, 2024; Poli et al., 2023) were proposed in search of more efficient alterna-
+tives for long-context sequence generation. These methods maintain a constant sized hidden state
+(Katharopoulos et al., 2020) during decoding and update it like a linear RNN. This state update
+behavior is also referred as fast-weight programming (Schmidhuber, 1992; Schlag et al., 2021). Es-
+sentially, MesaNet (von Oswald et al., 2025) is a LA variant that preconditions the hidden state and
+achieves optimal regression objectives among linear models.
+In-Context Learning by Optimization.
+A growing body of work suggests that attention mecha-
+nism implicitly performs optimization algorithms to achieve in-context learning (Garg et al., 2022;
+Aky¨urek et al., 2023; von Oswald et al., 2023; Kirsch et al., 2024; Zhang et al., 2024; Mahankali
+et al., 2024; Ahn et al., 2023; Dai et al., 2023). For example, Mesa optimization (von Oswald
+et al., 2023) suggested that the attention layer inherently performs or approximates optimization
+steps during the forward pass. This behavior is particularly evident in LA and SSMs, as the hidden
+state update can be interpreted as performing gradient descent to solve a linear regression objective
+(Wang et al., 2025; Liu et al., 2024). MesaNet (von Oswald et al., 2025) is a one-step convergent
+algorithm for such a problem as the objective accepts a closed-form solution.
+Hardware Efficient Attention.
+Prior works have focused on efficient attention implementation
+on modern hardwares to alleviate memory and computation overheads. FlashAttention (Dao et al.,
+2022; Dao, 2024) performs a block-wise online softmax to reduce I/O latency. Several other ap-
+proaches, including NSA (Yuan et al., 2025), SeerAttention (Gao et al., 2024), MoBA (Lu et al.,
+2025), and Block Sparse Attention (Xiao, 2025), leverage sparsity to lower the effective computa-
+tional cost while preserving GPU utilization. Flash Linear Attention (Yang et al., 2024a) provides a
+hardware-friendly formulation of linear attention through chunk-wise computation.
+1.2
+NOTATION.
+We use upper-case letters to denote matrices and lower-case letters to denote vectors. For a matrix X,
+we denote its Frobenius norm as ∥X∥F and the Hadamard product as ⊙. For a vector x, we denote its
+2
+
+--- Page 3 ---
+Published as a conference paper at ICLR 2026
+Euclidean norm as ∥x∥2. Furthermore, define rsum(X) = X1 for matrix X and bcast(x) = x1⊤
+for vector x, where 1 is a vector of ones. We use the abbreviation brsum(x) = bcast(rsum(x)).
+2
+BEYOND LOCAL CONSTANT ESTIMATE
+In this section, we first revisit the test-time regression interpretation for the attention mechanism
+(Wang et al., 2025). Then, we analyze the associative recall capacity and show the inherent limita-
+tions of LA and Softmax Attention. Lastly, we introduce the formulation for LLA.
+2.1
+ATTENTION AS TEST-TIME REGRESSION
+In test-time regression framework, the attention mechanism is interpreted as a layer-specific re-
+gression solver. The goal is to approximate an unknown regression function f : Rd 7→Rd using
+historical key-value pairs. To be specific, given a hypothesis space F and a position 1 ≤i ≤n, an
+estimator ˆfi ∈F is fitted on the dataset Di = {(kj, vj) ∈Rd ×Rd}i
+j=1, where the attention keys kj
+serve as the features and attention values vj as the labels. The prediction is made at a query qi ∈Rd,
+which is treated as a test data point.
+Linear Attention as Parametric Regression.
+Parametric model constrains the function class F
+to a set of functions defined by a finite-dimensional parameter θ ∈Θ. The most fundamental
+instantiation is the linear regression, which sets F = {fθ(x) = Wx + b | θ = (W, b), W ∈
+Rd×d, b ∈Rd}. We omit the intercept b for simplicity. At each position i, the parameter Wi is
+estimated by solving the following least square problem on the training dataset Di,
+min
+W L(W; Di) = 1
+2
+i
+X
+j=1
+γij∥vj −Wkj∥2
+2 + λ∥W∥2
+F ,
+(1)
+where γij ∈R is a weighting factor and λ ≥0 is the ridge regularization penalty. For appropriate
+regularization, objective equation 1 admits a closed-form optimal solution. MesaNet (von Oswald
+et al., 2025; 2024) hardcodes this solution for the case γij = 1, where the prediction is given by,
+ˆfMesa(qi) = ˆW Mesa
+i
+qi =
+
+i
+X
+j=1
+vjk⊤
+j
+|
+{z
+}
+Si
+
+i
+X
+j=1
+kjk⊤
+j + λI
+|
+{z
+}
+Hi
+−1
+qi.
+(2)
+Across different position i, the weight W Mesa
+i
+can be updated recurrently by maintaining two statis-
+tics Si and Hi with Θ(d2) memory. This allows MesaNet to be interpreted as a linear RNN with
+two recurrent states. To avoid the expensive matrix inversion, vanilla LA brutally approximates
+the precondition matrix Hi ≈I in equation 2, leading to a suboptimal solution of the least square
+problem. It can also be shown that LA variants and SSMs such as GLA (Yang et al., 2024a), RetNet
+(Sun et al., 2023), RWKV (Peng et al., 2024; 2025) and Mamba (Gu & Dao, 2024; Dao & Gu, 2024)
+can be derived by the approximation Hi ≈I with different weighting schemes γij. Besides exact
+solutions, vanilla LA and variants such as DeltaNet (Yang et al., 2024b) and Gated DeltaNet (Yang
+et al., 2025) can be interpreted as performing one step of first order stochastic gradient descent on
+weight W. We refer readers to (Wang et al., 2025) and tables in (Peng et al., 2025; Yang et al., 2025)
+for detailed derivations and how each model is implemented.
+Softmax Attention is Non-Parametric.
+Non-parametric regression makes minimal structural as-
+sumptions on the function class F. A canonical example is the kernel regression, where the estima-
+tor ˆf is defined directly from the data in a way that depends on the query point. Specifically, for a
+query vector qi, let F(qi) denote the local function class around qi. The local regression objective
+is defined as:
+min
+f∈F(qi) L(f; Di) = 1
+2
+i
+X
+j=1
+wij∥vj −f(kj)∥2
+2,
+(3)
+3
+
+--- Page 4 ---
+Published as a conference paper at ICLR 2026
+where wij = Kh(qi, kj) ∈R is a query-dependent weight that measures the locality of the training
+point kj to the query qi. The simplest instantiation is the constant model, where F(qi) = {fθ(x) =
+θ ∈Rd, ∀x ∈Rd}. Solving objective equation 3 with this function class yields:
+ˆf(qi) =
+i
+X
+j=1
+sijvj,
+sij =
+wij
+Pi
+j′=1 wij′
+(4)
+Consider an RBF kernel wij = exp(−∥kj −qi∥2/h) with bandwidth h = 2
+√
+d, the estimator
+equation 4 exactly recovers the softmax attention when QK normalization (Dehghani et al., 2023;
+Wortsman et al., 2023; Team, 2024) is applied, since in this case wij ∝exp(q⊤
+i kj/
+√
+d) and the
+common constant factor cancels in the division. It is also known as the Nadaraya-Watson (NW)
+kernel regression (Nadaraya, 1964; Watson, 1964; Bierens, 1988) in statistics literature. We note that
+QK normalization is not strictly necessary to represent practical Softmax Attention as the additional
+term can naturally serve as positional encoding (Press et al., 2022), and the scale effectively tunes
+the bandwidth h in a data-dependent manner.
+2.2
+LEARNING BEHAVIOR OF ASSOCIATIVE RECALL
+Attention mechanisms are often evaluated by the associative memory capacity (Zhong et al., 2025;
+Behrouz et al., 2026; Ramsauer et al., 2021). Specifically, given a training set of key-value pairs
+{(kj, vj)}i
+j=1, the model is expected to retrieve the value vj associated with kj when queried at
+q = kj. This objective can be exactly captured by the Mean Square Error (MSE). For example, the
+retrieval error in vanilla LA is given by,
+MSELA
+i
+= 1
+i
+i
+X
+j=1
+∥Sikj −vj∥2 = 1
+i
+i
+X
+j=1
+∥(k⊤
+j kj −1)vj +
+X
+j′̸=j
+vj′k⊤
+j′kj∥2,
+(5)
+The first term in the summation is the signal bias and can be avoid by QK normalization. The second
+term is the interference from other key-value pairs. Deltaformer (Zhong et al., 2025) quantitatively
+analyze this error by the inverse of signal-to-noise ratio SNR−1, which is essentially a normalized
+version of MSE. In classic literature, MSE decomposition allows us to analyze the approximation
+and generalization error of the model and the corresponding bias-variance trade-off.
+Irreducible Approximation Error of Global Linear Model.
+Recall that global linear models
+correspond to solving a least square problem equation 1 over the hypothesis space F = {fθ(x) =
+Wx+b}. When the ground truth function f is not global linear, any estimator ˆf ∈F will suffer from
+a non-vanishing approximation error due to model misspecification. In contrast, the local constant
+model is a nonparametric estimator that does not impose structural assumptions on the function class
+except for smoothness or regularity. Consequently, the approximation error vanishes asymptotically
+with proper assumptions. In fact, we have the following separation result between global linear (GL)
+and local constant (NW) estimators:
+Proposition 2.1. Let (Xi, Yi)n
+i=1 be i.i.d., Xi ∈Rd supported on a bounded set D ⊂Rd, and
+Yi = f(Xi) + εi ∈Rdy with E[εi | Xi] = 0 and E[ε2
+i | Xi] = σ2(Xi). Let bfGL denote a global-
+linear estimator and bfNW the local-constant (NW) estimator with optimal bandwidth. Under mild
+assumptions, if f is not globally linear, then
+E
+Z
+D
+|| bfGL(x) −f(x)||2dx = Ω(1) , E
+Z
+D
+|| bfNW(x) −f(x)||2dx = O(n−3/(d+3)).
+Irreducible Boundary Bias of Local Constant Model.
+Despite the appealing convergent prop-
+erty of local constant model, it suffers when predicting near the boundary of the data support, par-
+ticularly with symmetric kernels like RBF. This phenomenon becomes more pronounced in high-
+dimension and likely to occur more frequently in autoregressive prediction. Local polynomial re-
+gression is a standard remedy in nonparametric statistics to address this issue. In Section 2.3, we
+will introduce LLA as a natural adaptation of local linear regression. In fact, we have the following
+separation result between local constant (NW) and local linear (LL) estimators:
+4
+
+--- Page 5 ---
+Published as a conference paper at ICLR 2026
+Proposition 2.2. Under the setting of Proposition 2.1, let bfNW and bfLL denote local-constant and
+local-linear estimators with their respective optimal bandwidths. Under mild assumptions, if f has
+sufficiently large normal gradient along the boundary of D, then
+E
+Z
+D
+|| bfNW(x) −f(x)||2dx = Ω(n−3/(d+3)) , E
+Z
+D
+|| bfLL(x) −f(x)||2dx = O(n−4/(d+4)).
+The proof of proposition 2.1 and 2.2 are provided in Appendix A and B respectively.
+2.3
+LOCAL LINEAR ATTENTION
+Formulation.
+For a query qi, instantiate the local function class F(qi) = {fθ(x) = b + W(x −
+qi) | θ = (W, b), W ∈Rd×d, b ∈Rd}. The regularized local linear regression objective is,
+min
+f∈F(qi) L(f; Di) = 1
+2
+i
+X
+j=1
+wij∥vj −b −W(kj −qi)∥2 + λ∥W∥2
+F ,
+(6)
+where wij are query-dependent kernel weights and λ ≥0 is a ridge penalty. This objective also
+admits a closed-form solution for the intercept b and weight W. Importantly, at test time, the predic-
+tion is only made at ˆf(qi) = ˆbi. Thus it suffices to derive the formulation for the intercept. Define
+zij = kj −qi and the following query-specific statistics,
+ωi =
+i
+X
+j=1
+wij ∈R,
+µi =
+i
+X
+j=1
+wijzij ∈Rd,
+Σi =
+i
+X
+j=1
+wijzijz⊤
+ij + λI ∈Rd×d.
+(7)
+Also denote ρi = Σ−1
+i µi ∈Rd. The optimal intercept can be computed as follows,
+ˆf(qi) = ˆbi =
+i
+X
+j=1
+sijvj,
+sij = wij
+1 −z⊤
+ijρi
+ωi −µ⊤
+i ρi
+.
+(8)
+Similar to maintaining Hi in MesaNet, LLA requires capturing the precondition matrix Σi. How-
+ever, a key difference is that Hi is built on global statistics that are independent of the query, whereas
+Σi is constructed from features centered around the specific query qi for each position 1 ≤i ≤n.
+Consequently, LLA requires a KV cache of size Θ(nd) similar to Softmax Attention, rather than
+constant-size recurrent states as in the LA family.
+LLA Interpolates Linear and Softmax Attention.
+A more interpretable form of equation 8 can
+be obtained by decomposing the prediction into two components. Suppose that the weight matrix
+ˆWi is given prior to solving equation 6, then the optimal intercept can be expressed as,
+ˆbi =
+i
+X
+j=1
+sij(vj −ˆWikj) + ˆWiqi,
+sij =
+wij
+Pi
+j′=1 wij′
+.
+(9)
+The first term is a local constant regression to predict the residuals vj −ˆWikj, while the second term
+is a linear prediction based on ˆWi. The formulation recovers LLA if ˆWi is obtained by optimally
+solving equation 6. However, by allowing suboptimal estimation, one can construct ˆWi as a recurrent
+state similar to LA. This decomposition reveals how LLA interpolates between Linear and Softmax
+Attention and provides a template for designing new algorithms.
+3
+PRACTICAL ALGORITHM
+In this section, we provide a detailed discussion of the computation involved in LLA. We high-
+light two major challenges in na¨ıve implementations and develop a practical block-wise algorithm
+FlashLLA that scales efficiently on modern accelerators such as GPUs.
+5
+
+--- Page 6 ---
+Published as a conference paper at ICLR 2026
+3.1
+MEMORY EFFICIENT PRIMITIVES
+Avoid Pairwise Materialization.
+The first bottleneck is the evaluation of vectors zij = kj −qi
+for every 1 ≤j ≤i ≤n, which requires Θ(n2d) memory to materialize. This pairwise difference
+is later used in the formulation of µi and Σi defined in equation 7 as well as the inner product
+z⊤
+ijρi in equation 8. For both cases, explicit materialization of zij can be avoid by algebraically
+separating the contributions of kj and qi to the final result. Specifically, the statistics µi and Σi can
+be reformulated in terms of intermediate quantities that are independent of the query and can then
+be transformed to recover the original centered statistics:
+˜µi =
+i
+X
+j=1
+wijkj ∈Rd,
+˜Σi =
+i
+X
+j=1
+wijkjk⊤
+j + λI ∈Rd×d
+(10)
+µi = ˜µi −ωiqi,
+Σi = ˜Σi −˜µiq⊤
+i −qi˜µ⊤
+i + ωiqiq⊤
+i
+(11)
+The computation in equation 10 and equation 11 only requires vectors kj and qi individually, reduc-
+ing the memory cost to Θ(nd). The same principle applies to computing inner products of the form
+z⊤
+ijxi = k⊤
+j xi −qixi for any vector xi ∈Rd. The matrix operator relative matrix multiplication
+(relmm) for this optimization as follows,
+relmm(X, Q, K) := XK⊤−brsum(X ⊙Q).
+(12)
+This operator is invoked once in the forward computation with xi = ρi, but appears multiple times
+in the backward with other variables. Further details on the backward are provided in Appendix D.
+Matrix-Free Inversion via Conjugate Gradients.
+The second bottleneck arises in solving linear
+systems of the form Σ−1
+i xi for some vector xi ∈Rd. Directly inverting Σi for every 1 ≤i ≤n
+incurs a prohibitive Θ(nd2) memory. Following the approach in MesaNet (von Oswald et al., 2025),
+we exploit the sum-of-rank-one structure of Σi and solve the linear system iteratively using the
+conjugate gradient (CG) method (Hestenes & Stiefel, 1952). The key insight is that CG only evaluate
+the matrix-vector product Σip for a search direction p ∈Rd without explicit matrix materialization:
+Σip =
+i
+X
+j=1
+wij(k⊤
+j p)kj −(q⊤
+i p)˜µi −(˜µ⊤
+i p)qi + (ωiq⊤
+i p)qi + λp.
+(13)
+Each term only involves inner products or weighted sums over keys and the query, both of which
+can be computed efficiently using batched matrix multiplication with Θ(nd) memory. This CG
+operation of Σi is invoked once in the forward computation with xi = µi and twice in the backward
+computation with other variables. Further details on the CG algorithm are provided in C.
+3.2
+PARALLEL FORM AND BLOCKWISE ALGORITHM
+Matrix Formulation.
+We first express the key components of the LLA forward pass in matrix
+form. Let Q, K, V ∈Rn×d be the query, key, and value matrices respectively for a given layer and
+head. This function applies a causal mask to the input tensor using the tril operator that preserves
+the lower-triangular matrix. Then the output O ∈Rn×d can be computed as follows,
+W = tril(exp(QK⊤/h)),
+M = WK −brsum(W) ⊙Q
+(14)
+R = CGSolve(M, Q, K, λ),
+δ = rsum(W) −rsum(M ⊙R)
+(15)
+O =
+1 −relmm(R, Q, K)
+bcast(δ)
+⊙W
+
+V,
+(16)
+where W ∈Rn×n is the matrix of kernel weight wij, M ∈Rn×d stores the first-order statistics µi,
+R ∈Rn×d contains the solution to the linear systems Σ−1
+i µi for every 1 ≤i ≤n, and CGSolve(·)
+invokes the CG algorithm that construct Σi implicitly and solve these systems in parallel. The
+division and subtraction are performed element-wise. The single-head computation can be naturally
+extended to multi-head the same way as in standard multi-head attention mechanisms.
+Blockwise Algorithm.
+Denote Br, Bc as the block size for queries and keys/values along the
+sequence length dimension and r, c as the block index. Denote Qr ∈RBr×d and Kc, Vc ∈RBc×d
+as the block-wise representations. The forward pass of FlashLLA is summarized in Algorithm 1.
+6
+
+--- Page 7 ---
+Published as a conference paper at ICLR 2026
+Algorithm 1 FlashLLA Forward Pass
+Require: Matrices Q, K, V in HBM, block sizes Br, Bc, regularization λ, bandwidth h.
+1: Divide Q into ⌈n/Br⌉blocks of size Br and K, V into ⌈n/Bc⌉blocks of size Bc.
+2: Divide output O, R into ⌈n/Br⌉blocks of size Br.
+3: for r = 1 to ⌈n/Br⌉do
+4:
+Load Qr from HBM to SRAM.
+5:
+Initialize on-chip: M (0)
+r
+←0 ∈RBr×d, ω(0)
+r
+←0 ∈RBr, m(0)
+r
+←−∞∈RBr
+6:
+for c = 1 to ⌈n/Bc⌉do
+7:
+Load Kc from HBM to SRAM.
+8:
+Compute W = QrK⊤
+c /h and m = max(m(c−1)
+r
+, rowmax(W)).
+9:
+Compute αr = exp(m(c−1)
+r
+−m), W = exp(W −bcast(m)) and update m(c)
+r
+= m.
+10:
+Compute ω(c)
+r
+= α(c)
+r
+⊙ω(c−1)
+r
++ rsum(W)
+11:
+Compute M (c)
+r
+= bcast(α(c)
+r ) ⊙M (c−1)
+r
++ WKc.
+12:
+end for
+13:
+Initialize on-chip: O(0)
+r
+←0 ∈RBr×d, R(0)
+r
+←0 ∈RBr×d
+14:
+Compute Mr = M (last)
+r
+−brsum(W) ⊙Qr.
+15:
+Compute Rr = CGSolve(Mr, Qr, K, M (last)
+r
+, ω(last)
+r
+, λ).
+16:
+Compute δr = ω(last)
+r
+−rsum(Mr ⊙Rr).
+17:
+for c = 1 to ⌈n/Bc⌉do
+18:
+Load Kc, Vc from HBM to SRAM.
+19:
+Compute W = exp(QrK⊤
+c /h −bcast(m(last)
+r
+)).
+20:
+Compute S = (1 −relmm(Rr, Qr, Kc)) ⊙W/bcast(δr).
+21:
+Compute O(c)
+r
+= O(c−1)
+r
++ SVc.
+22:
+end for
+23: end for
+1k2k
+4k
+8k
+16k
+Sequence Length
+4k
+64k
+128k
+Memory Usage (MB)
+FlashLLA
+Na¨ıve
+20
+40
+60
+Batch Size
+Figure
+1:
+FlashLLA
+re-
+duces working set memory to
+Θ(nd). The figure shows the
+profiling result for d = 128,
+OOM points are omitted.
+Since the statistics equation 7 for each query are computed inde-
+pendently, the forward pass of LLA can be naturally made parallel
+for batched queries. Therefore, the algorithm proceeds by iterat-
+ing over query blocks r. Within each query block, the iteration
+over key/value blocks has three passes. (i) The first pass (line 6-12)
+corresponds to accumulating the statistics Mr, ωr in an online fash-
+ion. Similar to online softmax (Ye, 2023; Milakov & Gimelshein,
+2018), we maintain a running maximum mr to ensure numerical
+stability when computing the kernel weights. This trick is valid as
+the computation equation 8 is homogeneous in wij. (ii) The second
+pass (line 15) is encapsulated in the CGSolve(·) operator (see Ap-
+pendix C for details). (iii) The third pass (line 17-22) computes the
+final output Or using the pre-computed results and the values Vc. To
+save computation in backward pass, we also store the intermediate
+Rr and denominator δr alongside the output into HBM.
+We implement and benchmark the algorithm 1 in a custom Triton kernel (∼500 lines of Python)
+across a range of dimensions and batch sizes on a single NVIDIA H200 GPU. Figure 1 demonstrate
+the quadratic dependency and quickly runs out of memory for na¨ıve method. In contrast, the block-
+wise Triton kernel significantly reduces the working set and scales linearly with sequence length,
+making it hardware-efficient and feasible for long-context and large batch training or inference. We
+also provide additional analysis and latency profiling in Appendix E.
+4
+EMPIRICAL RESULTS
+Test-Time Regression on Non-Stationary Data.
+We first devise a synthetic piecewise-linear re-
+gression task to isolate the test-time adaptation capabilities of different attention mechanisms di-
+rectly without training the query, key and value projections. Each sample is a length-L sequence par-
+titioned into L/S contiguous segments with S being the segment size. For each c ∈{1, . . . , L/S},
+7
+
+--- Page 8 ---
+Published as a conference paper at ICLR 2026
+256
+512
+768
+Position
+10−4
+10−1
+102
+Loss/Dim
+Segment Size 64
+256
+512
+768
+Position
+Segment Size 256
+256
+512
+768
+Position
+Segment Size 512
+256
+512
+768
+Position
+Segment Size 1024
+LLA
+Attn
+Mesa
+LA
+Random
+Figure 2: Test-time regression performance on a piecewise-linear task. The figures demonstrate
+position-wise MSE for d = 64 with S ∈{64, 256, 512, 1024}. Results are averaged over 10,000
+independently sampled sequences; LLA outperforms other baselines and benefits from more in-
+segment data; MesaNet excels only before the first shift. The y-axis uses a logarithmic scale.
+keys ki ∈Rd are drawn from a segment-specific distribution Pc supported on a distinct cone in the
+input space (see Appendix F for construction details). The corresponding values vi are generated by
+a segment-specific linear function vi = Acki+ϵi for i ∈{(c−1)S+1, . . . , cS} where Ac ∼N(0, I)
+and ϵi ∼N(0, δ2I). This design ensures the generated data {(ki, vi)}L
+i=1 has non-stationary input
+distribution and conditional mapping fc(k) = Ack.
+We evaluate a single layer of each candidate model, including LLA, Softmax Attention, vanilla LA
+(Katharopoulos et al., 2020), MesaNet (von Oswald et al., 2025) as well as a random predictor.
+8
+16
+32
+64
+128
+Dimension
+10−2
+100
+102
+104
+106
+108
+Ratio
+Attn
+LA
+Mesa
+Random
+200
+400
+600
+800
+1000
+Segment Size
+Figure 3: The advantage of
+LLA scales with the data di-
+mension d. Both axes use a
+logarithmic scale.
+As this is a test-time only evaluation, we exclude mechanisms that
+require training to adapt.
+We set L = 1024 and sweep over
+different segment sizes S and input dimensions d. Performance
+is measured by the position-wise MSE ℓi = ∥ˆf(ki) −vi∥2
+2 for
+i ∈{1, . . . , L} to capture the adaptation capability along the se-
+quence. We also investigate the scaling behavior by evaluating the
+MSE ratio PL
+j=1 ℓModel
+j
+/ PL
+j=1 ℓLLA
+j
+for each model compared to
+LLA across different values of d and S. The results are summa-
+rized in Figure 2. MesaNet achieves the best performance in the
+first segment where all the data is drawn from one linear mapping,
+as it effectively learns the optimal global linear function. However,
+it has limited capacity to adapt to distribution shifts and its perfor-
+mance degrades quickly in subsequent segments, where the data
+distribution does not match the learned global mapping.
+Meanwhile, LLA continues to improve within each segment whereas Softmax Attention does not
+benefit from more in-distribution data. Moreover, the advantage of LLA scales favorably with data
+dimensionality (Figure 3), indicating the potential for adaptation to larger models and datasets.
+In-Context Regression on Non-Stationary Data.
+We next evaluate the models’ ability to perform
+in-context regression on non-stationary, piecewise-linear data. The data generation process follows
+the same principle as in the test-time regression task. The data points {xi ∈Rdx} are generated
+from segment-specific distributions Pc and the target is given by yi = Acxi + ϵi ∈Rdy for i ∈
+{(c −1)S + 1, . . . , cS}, where Ac ∼N(0, Idy×dx/dx) and ϵi ∼N(0, δ2Idy). Query x′ ∈Rdx
+is randomly sampled from the segment distributions Pc. Each in-context regression prompt X is
+constructed by concatenating L shuffled input-target pairs with L′ queries:
+X =
+
+x1
+x2
+· · ·
+xL
+x′
+1
+· · ·
+x′
+L′
+y1
+y2
+· · ·
+yL
+0
+· · ·
+0
+
+∈R(dx+dy)×(L+L′).
+(17)
+In contrast to the test-time regression setting, the query, key and value projections are parameterized.
+The model fθ : Rdx+dy →Rdy is trained to predict the target Y , where the label to each query is
+generated by y′
+i = Acx′
+i. Specifically, for a dataset Dtrain = {(X(b), Y (b))}B
+b=1, we minimize the
+MSE loss L(θ; Dtrain) on the query tokens and report the test error L(θ∗; Dtest) after training.
+We compare LLA against several strong baselines, including Softmax Attention, Mamba (Gu & Dao,
+2024; Dao & Gu, 2024), GLA (Yang et al., 2024a), Hyena (Poli et al., 2023) and Gated DeltaNet
+8
+
+--- Page 9 ---
+Published as a conference paper at ICLR 2026
+8
+16
+32
+64
+Segment Size
+0.00
+0.25
+0.50
+0.75
+1.00
+Test Loss
+Sequence Length 64
+16
+32
+64
+128
+Segment Size
+Sequence Length 128
+32
+64
+128
+256
+Segment Size
+Sequence Length 256
+LLA
+Attn
+Gated Deltanet
+Hyena
+Mamba
+GLA
+(a) Test Error of In-Context Regression.
+512-128
+512-64
+512-32
+256-64
+256-32
+256-16
+128-32
+128-16
+128-8
+64-16
+64-8
+64-4
+(Sequence Length - KV Number)
+0
+25
+50
+75
+100
+Accuracy
+Recall Accuracy
+LLA
+Attn
+Gated DeltaNet
+Mamba
+Hyena
+GLA
+(b) Test Accuracy of Associative Recall.
+Figure 4: Figure a and b shown for models with d = 128 and 2 attention heads. Each point represents
+the best performance achieved across training hyperparameters, averaged over 3 random seeds.
+(Yang et al., 2024b; 2025). We fix the dimension dx = dy = 32 and query number L′ = 16 for all
+sweeps over segment sizes and evaluate two-layer models without MLPs. The results in Figure 4a
+demonstrate similar trends as in the test-time regression task, where LLA consistently outperforms
+other baselines across all configurations, particularly with smaller segment sizes.
+In-Context Associative Recall.
+In-context recall is a fundamental capability of language models
+which requires the model to retrieve relevant information from the context based on the query. We
+adopt the MQAR task in Zoology (Arora et al., 2023) to evaluate this ability. Specifically, given
+two alphabets Ak, Av and a set of key-value pairs (ki, vi) ∈Ak × Av, the set {ki 7→vi} defines a
+many-to-one key-value association. The model is prompted with a sequence of key-value pairs and
+then queried with keys sampled from the context to predict the corresponding value.
+As indicated in (Wang et al., 2025), a single short convolution layer is sufficient to solve next-token
+recall tasks. Therefore, we disable short convolution in all baselines to ensure fair comparison. We
+set ∥Ak ∪Av∥= 8k and sweep over different sequence lengths and number of KV pairs. The test
+recall accuracy results in Figure 4b indicate that the advantages of LLA can be effectively trans-
+ferred to discrete token prediction tasks. Additionally, we also observe different learning dynamics
+between LLA and Gated DeltaNet in this task. The results are discussed in Appendix F.4.
+Permutation State-Tracking.
+We then test models’ state-tracking ability by permutation state-
+tracking task. Given an initial assignment of items to positions, a sequence of swap instructions, and
+query positions. The model is trained to predict the item at each query position after all swaps. Each
+example is constructed as
+p1= a1, p2= a2, . . . , pN= aN
+|
+{z
+}
+initial state
+# i1 j1, i2 j2, . . . , iS jS
+|
+{z
+}
+swap instruction
+# q1= o1, . . . qN′= oN′
+|
+{z
+}
+query + answer
+.
+12
+24
+48
+96
+Number of Positions
+0
+20
+40
+60
+80
+100
+Accuracy
+State-Tracking Test Accuracy
+LLA
+Attn
+Gated DeltaNet
+Mamba
+Hyena
+GLA
+Figure 5: Test Accuracy of
+State Tracking. Results show
+the best score averaged over 3
+random seeds.
+Here pn ∈{1, . . . , N} denotes position n; an ∈A is the item
+initially assigned to n; each (is, js) ∈{1, . . . , N}2 is a swap in-
+struction exchanging the items at positions is and js; and q is the
+queried position. The target is the item at position q after applying
+all S swaps. We include explicit delimiter tokens #, =, and , for
+structure.
+We draw the number of swaps as S ∼Uniform(N/6, N/3) and
+set |A| = 8k for each example. The results in Figure 5 show that
+LLA achieves test accuracy on par with Softmax Attention across
+N. This outcome is expected from a complexity-theoretic perspec-
+tive: constant-depth Softmax Attention is no more expressive than
+constant-depth threshold circuits TC0 and has limited ability to real-
+ize unbounded-depth state-tracking as N grows (Hahn, 2020; Mer-
+rill & Sabharwal, 2023). By Eqs. 7 and 8, LLA augments Softmax
+Attention with a query-specific first-order correction computed via a constant number of parallel
+algebraic passes (weighted sum, inner product, inverse), which adds at most a constant extra circuit
+9
+
+--- Page 10 ---
+Published as a conference paper at ICLR 2026
+layer. Its performance therefore matches the theoretical limits of Softmax Attention, explaining the
+results in Figure 5.
+5
+LIMITATIONS AND FUTURE DIRECTIONS
+High Computation and I/O Intensity.
+Despite the significant reduction in memory consumption,
+LLA’s computational cost remains substantially higher than that of Softmax Attention, primarily
+due to the matrix inversion involved in the computation. Exploring approximations to reduce the
+computation is an important direction for future work. Furthermore, while FlashLLA achieves the
+same Θ(nd + n2) I/O complexity as in FlashAttention when the number of CG iterations is set as
+a constant (which is sufficient in practice), the constant factor is still higher due to the additional
+reads and writes required by the iterative solver. Incorporating hardware-aware optimizations, such
+as sliding windows or sparsity, could further reduce I/O complexity.
+Kernel Development and Evaluation on LLMs.
+This work evaluates LLA on synthetic and
+moderate-scale tasks; its efficacy on large language models remains an ongoing question. Training
+LLMs with LLA using PyTorch implementation is infeasible due to its high computational and
+memory complexity. Therefore significant engineering efforts are required to stabilize and optimize
+the forward and backward kernel. Additionally, the numerical sensitivity of the matrix inversion
+poses a challenge for developing low precision kernels without sacrificing performance.
+Efficient Interpolation of Linear and Softmax Attention.
+As shown in equation 9, LLA pro-
+vides an optimal interpolation between Linear and Softmax Attention in solving the regression ob-
+jective. And the formulation also provides a template to design algorithm for better computational
+efficiency while still retain strong estimation capabilities and potentially even improve upon the cir-
+cuit complexity of Softmax Attention. For instance, future work could explore the integration of
+state-of-the-art Linear Attention architectures such as DeltaNet and Mamba using this template.
+REPRODUCIBILITY STATEMENT
+The proofs of theoretical results 2.1 and 2.2 are provided in Appendix A and B, respectively. We
+also provide additional analysis and discussion on the implementation and profiling results in Ap-
+pendix E. In Appendix F, we provide detailed instructions, configurations and additional experimen-
+tal results for reproducing all the experiments in Section 4.
+REFERENCES
+Kwangjun Ahn, Xiang Cheng, Hadi Daneshmand, and Suvrit Sra. Transformers learn to imple-
+ment preconditioned gradient descent for in-context learning. In Advances in Neural Information
+Processing Systems 37 (NeurIPS 2023), 2023.
+Ekin Aky¨urek, Dale Schuurmans, Jacob Andreas, Tengyu Ma, and Denny Zhou. What learning
+algorithm is in-context learning? investigations with linear models. In International Conference
+on Learning Representations (ICLR), 2023.
+Simran Arora, Sabri Eyuboglu, Aman Timalsina, Isys Johnson, Michael Poli, James Zou, Atri
+Rudra, and Christopher R´e. Zoology: Measuring and improving recall in efficient language mod-
+els, 2023. URL https://arxiv.org/abs/2312.04927.
+Ali Behrouz, Meisam Razaviyayn, Peilin Zhong, and Vahab Mirrokni. It’s all connected: A jour-
+ney through test-time memorization, attentional bias, retention, and online optimization.
+In
+14th International Conference on Learning Representations, ICLR 2026, 2026. URL https:
+//openreview.net/forum?id=gZyEJ2kMow.
+Aviv Bick, Eric Xing, and Albert Gu.
+Understanding the skill gap in recurrent language mod-
+els: The role of the gather-and-aggregate mechanism. In Aarti Singh, Maryam Fazel, Daniel
+Hsu, Simon Lacoste-Julien, Felix Berkenkamp, Tegan Maharaj, Kiri Wagstaff, and Jerry Zhu
+(eds.), Proceedings of the 42nd International Conference on Machine Learning, volume 267
+10
+
+--- Page 11 ---
+Published as a conference paper at ICLR 2026
+of Proceedings of Machine Learning Research, pp. 4324–4344. PMLR, 13–19 Jul 2025. URL
+https://proceedings.mlr.press/v267/bick25a.html.
+H. J. Bierens. The nadaraya–watson kernel regression function estimator. Technical Report 1988-58,
+Faculty of Economics and Business Administration, Vrije Universiteit Amsterdam, Amsterdam,
+1988.
+Damai Dai, Yutao Sun, Li Dong, Yaru Hao, Shuming Ma, Zhifang Sui, and Furu Wei. Why can gpt
+learn in-context? language models implicitly perform gradient descent as meta-optimizers, 2023.
+URL https://arxiv.org/abs/2212.10559.
+Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. In 12th
+International Conference on Learning Representations, ICLR 2024, 2024.
+URL https://
+openreview.net/forum?id=mZn2Xyh9Ec.
+Tri Dao and Albert Gu. Transformers are ssms: Generalized models and efficient algorithms through
+structured state space duality, 2024. URL https://arxiv.org/abs/2405.21060.
+Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher R´e.
+Flashatten-
+tion:
+Fast and memory-efficient exact attention with i/o-awareness.
+In Advances in
+Neural Information Processing Systems 35, pp. 16344–16359. Curran Associates, Inc.,
+2022.
+URL https://proceedings.neurips.cc/paper_files/paper/2022/
+file/67d57c32e20fd0a7a302cb81d36e40d5-Paper-Conference.pdf.
+Mostafa Dehghani, Josip Djolonga, Basil Mustafa, Piotr Padlewski, Jonathan Heek, Justin Gilmer,
+Andreas Steiner, Mathilde Caron, Robert Geirhos, Ibrahim Alabdulmohsin, et al. Scaling vision
+transformers to 22 billion parameters. In Proceedings of the 40th International Conference on
+Machine Learning (ICML 2023), pp. 7480–7512. PMLR, 2023.
+Jianqing Fan, Ir`ene Gijbels, Tien-Chung Hu, and Li-Shan Huang. A study of variable bandwidth
+selection for local polynomial regression. Statistica Sinica, pp. 113–127, 1996.
+Yizhao Gao, Zhichen Zeng, Dayou Du, Shijie Cao, Peiyuan Zhou, Jiaxing Qi, Junjie Lai, Hayden
+Kwok-Hay So, Ting Cao, Fan Yang, and Mao Yang. Seerattention: Learning intrinsic sparse
+attention in your llms. arXiv preprint arXiv:2410.13276, 2024. URL https://arxiv.org/
+abs/2410.13276.
+Shivam Garg, Dimitris Tsipras, Percy Liang, and Gregory Valiant. What can transformers learn in-
+context? a case study of simple function classes. In Advances in Neural Information Processing
+Systems 35 (NeurIPS 2022), pp. 30583–30598, 2022.
+Felix A. Gers, J¨urgen Schmidhuber, and Fred Cummins. Learning to forget: Continual prediction
+with lstm. Neural Computation, 12(10):2451–2471, 2000.
+Albert Gu and Tri Dao. Mamba: Linear-time sequence modeling with selective state spaces. In First
+Conference on Language Modeling (COLM), Jul 2024. URL https://openreview.net/
+forum?id=tEYskw1VY2. Available on OpenReview.
+Albert Gu, Karan Goel, and Christopher R´e. Efficiently modeling long sequences with structured
+state spaces. In 10th International Conference on Learning Representations, ICLR 2022, 2022a.
+URL https://openreview.net/forum?id=uYLFoz1vlAC.
+Albert Gu, Isys Johnson, Aman Timalsina, Atri Rudra, and Christopher R´e. How to train your
+hippo: State space models with generalized orthogonal basis projections, 2022b. URL https:
+//arxiv.org/abs/2206.12037.
+Michael Hahn. Theoretical limitations of self-attention in neural sequence models. Transactions of
+the Association for Computational Linguistics, 8:156–171, 2020.
+Magnus R. Hestenes and Eduard Stiefel. Methods of conjugate gradients for solving linear systems.
+Journal of Research of the National Bureau of Standards, 49(6):409–436, 1952.
+11
+
+--- Page 12 ---
+Published as a conference paper at ICLR 2026
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Franc¸ois Fleuret. Transformers are
+rnns: Fast autoregressive transformers with linear attention. In Proceedings of the 37th Inter-
+national Conference on Machine Learning (ICML 2020), volume 119, pp. 5156–5165. PMLR,
+2020.
+Louis Kirsch, James Harrison, Jascha Sohl-Dickstein, and Luke Metz. General-purpose in-context
+learning by meta-learning transformers, 2024.
+URL https://arxiv.org/abs/2212.
+04458.
+Zhixuan Lin, Evgenii Nikishin, Xu Owen He, and Aaron Courville. Forgetting transformer: Softmax
+attention with a forget gate, 2025. URL https://arxiv.org/abs/2503.02130.
+Bo Liu, Rui Wang, Lemeng Wu, Yihao Feng, Peter Stone, and Qiang Liu. Longhorn: State space
+models are amortized online learners. In Proceedings of the 41st International Conference on
+Machine Learning (ICML 2024), 2024.
+Enzhe Lu, Zhejun Jiang, Jingyuan Liu, Yulun Du, Tao Jiang, Chao Hong, Shaowei Liu, Weiran He,
+Enming Yuan, Yuzhi Wang, Zhiqi Huang, Huan Yuan, Suting Xu, Xinran Xu, Guokun Lai, Yanru
+Chen, Huabin Zheng, Junjie Yan, Jianlin Su, Yuxin Wu, Neo Y. Zhang, Zhilin Yang, Xinyu Zhou,
+Mingxing Zhang, and Jiezhong Qiu. Moba: Mixture of block attention for long-context llms. In
+Proceedings of the 38th Conference on Neural Information Processing Systems (NeurIPS 2025),
+Spotlight, 2025. URL https://openreview.net/forum?id=RlqYCpTu1P.
+Xuezhe Ma, Xiaomeng Yang, Wenhan Xiong, Beidi Chen, Lili Yu, Hao Zhang, Jonathan May,
+Luke Zettlemoyer, Omer Levy, and Chunting Zhou. Megalodon: Efficient llm pretraining and
+inference with unlimited context length. In Advances in Neural Information Processing Systems
+37 (NeurIPS 2024), 2024.
+Arvind Mahankali, Tatsunori B. Hashimoto, and Tengyu Ma. One step of gradient descent is prov-
+ably the optimal in-context learner with one layer of linear self-attention. In Proceedings of the
+12th International Conference on Learning Representations (ICLR), 2024.
+William Merrill and Ashish Sabharwal. The parallelism tradeoff: Limitations of log-precision trans-
+formers. Transactions of the Association for Computational Linguistics, 11:531–545, 2023.
+Maxim Milakov and Natalia Gimelshein. Online normalizer calculation for softmax, 2018. URL
+https://arxiv.org/abs/1805.02867.
+E. A. Nadaraya. On estimating regression. Theory of Probability and Its Applications, 9(1):141–142,
+1964.
+Bo Peng, Daniel Goldstein, Quentin Anthony, Alon Albalak, Eric Alcaide, Stella Biderman, Eu-
+gene Cheah, Xingjian Du, Teddy Ferdinan, Haowen Hou, et al.
+Eagle and finch: Rwkv
+with matrix-valued states and dynamic recurrence, 2024. URL https://arxiv.org/abs/
+2404.05892.
+Bo Peng, Ruichong Zhang, Daniel Goldstein, Eric Alcaide, Xingjian Du, Haowen Hou, Jiaju Lin,
+Jiaxing Liu, Janna Lu, William Merrill, et al. Rwkv-7 ”goose” with expressive dynamic state
+evolution, 2025. URL https://arxiv.org/abs/2503.14456.
+Michael Poli, Stefano Massaroli, Eric Nguyen, Daniel Y. Fu, Tri Dao, Stephen Baccus, Yoshua
+Bengio, Stefano Ermon, and Christopher R´e. Hyena hierarchy: Towards larger convolutional
+language models. In Proceedings of the 40th International Conference on Machine Learning
+(ICML 2023), volume 202, pp. 28043–28078. PMLR, 2023.
+Ofir Press, Noah A. Smith, and Mike Lewis. Train short, test long: Attention with linear biases en-
+ables input length extrapolation. In Proceedings of the 10th International Conference on Learning
+Representations (ICLR), 2022.
+Hubert Ramsauer, Bernhard Sch¨afl, Johannes Lehner, Philipp Seidl, Michael Widrich, Thomas
+Adler, Lukas Gruber, Markus Holzleitner, Milena Pavlovi´c, Geir Kjetil Sandve, Victor Greiff,
+David Kreil, Michael Kopp, G¨unter Klambauer, Johannes Brandstetter, and Sepp Hochreiter.
+Hopfield networks is all you need. In International Conference on Learning Representations
+(ICLR), 2021.
+12
+
+--- Page 13 ---
+Published as a conference paper at ICLR 2026
+Imanol Schlag, Kazuki Irie, and J¨urgen Schmidhuber. Linear transformers are secretly fast weight
+programmers. In Proceedings of the 38th International Conference on Machine Learning (ICML
+2021), volume 139, pp. 9355–9366, Virtual only, 2021. PMLR.
+J¨urgen Schmidhuber. Learning to control fast-weight memories: An alternative to dynamic recurrent
+networks. Neural Computation, 4(1):131–139, 1992. doi: 10.1162/neco.1992.4.1.131.
+Julien Siems, Timur Carstensen, Arber Zela, Frank Hutter, Massimiliano Pontil, and Riccardo
+Grazzi. Deltaproduct: Improving state-tracking in linear rnns via householder products, 2025.
+URL https://arxiv.org/abs/2502.10297.
+Yutao Sun, Li Dong, Shaohan Huang, Shuming Ma, Yuqing Xia, Jilong Xue, Jianyong Wang, and
+Furu Wei. Retentive network: A successor to transformer for large language models, 2023. URL
+https://arxiv.org/abs/2307.08621.
+Chameleon Team.
+Chameleon: Mixed-modal early-fusion foundation models.
+arXiv preprint
+arXiv:2405.09818, 2024.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Infor-
+mation Processing Systems 30 (NIPS 2017), pp. 5998–6008. Curran Associates, Inc., 2017.
+Johannes von Oswald, Eyvind Niklasson, Ettore Randazzo, Jo˜ao Sacramento, Alexander Mordv-
+intsev, Andrey Zhmoginov, and Max Vladymyrov. Transformers learn in-context by gradient
+descent. In Proceedings of the 40th International Conference on Machine Learning (ICML),
+volume 202 of Proceedings of Machine Learning Research, pp. 35151–35174. PMLR, 2023.
+Johannes von Oswald, Maximilian Schlegel, Alexander Meulemans, Seijin Kobayashi, Eyvind
+Niklasson, Nicolas Zucchet, Nino Scherrer, Nolan Miller, Mark Sandler, Blaise Ag¨uera y Ar-
+cas, et al.
+Uncovering mesa-optimization algorithms in transformers, 2024.
+URL https:
+//arxiv.org/abs/2309.05858.
+Johannes von Oswald, Nino Scherrer, Seijin Kobayashi, Luca Versari, Songlin Yang, Maximil-
+ian Schlegel, Kaitlin Maile, Yanick Schimpf, Oliver Sieberling, Alexander Meulemans, et al.
+Mesanet:
+Sequence modeling by locally optimal test-time training, 2025.
+URL https:
+//arxiv.org/abs/2506.05233.
+Ke Alexander Wang, Jiaxin Shi, and Emily B. Fox. Test-time regression: a unifying framework
+for designing sequence models with associative memory, 2025. URL https://arxiv.org/
+abs/2501.12352.
+G. S. Watson. Smooth regression analysis. Sankhy¯a: The Indian Journal of Statistics, Series A, 26
+(4):359–372, 1964.
+Mitchell Wortsman, Peter J. Liu, Lechao Xiao, Katie Everett, Alex Alemi, Ben Adlam, John D. Co-
+Reyes, Izzeddin Gur, Abhishek Kumar, Roman Novak, et al. Small-scale proxies for large-scale
+transformer training instabilities. arXiv preprint arXiv:2309.14322, 2023.
+Guangxuan Xiao.
+Statistics behind block sparse attention.
+https://guangxuanx.com/
+blog/block-sparse-attn-stats.html, 2025.
+Songlin Yang, Bailin Wang, Yikang Shen, Rameswar Panda, and Yoon Kim. Gated linear attention
+transformers with hardware-efficient training. In Proceedings of the 41st International Conference
+on Machine Learning (ICML 2024), 2024a.
+Songlin Yang, Bailin Wang, Yu Zhang, Yikang Shen, and Yoon Kim. Parallelizing linear trans-
+formers with the delta rule over sequence length. In Advances in Neural Information Processing
+Systems 37 (NeurIPS 2024), 2024b. doi: 10.52202/079017-3668.
+Songlin Yang, Jan Kautz, and Ali Hatamizadeh. Gated delta networks: Improving mamba2 with
+delta rule. In Proceedings of the 13th International Conference on Learning Representations
+(ICLR 2025), 2025.
+13
+
+--- Page 14 ---
+Published as a conference paper at ICLR 2026
+Zihao Ye. From online softmax to flashattention. Course notes for ”ML for ML Systems” (CSE
+599M), University of Washington, Spring 2023, May 2023. URL https://courses.cs.
+washington.edu/courses/cse599m/23sp/notes/flashattn.pdf. Online; Uni-
+versity of Washington.
+Jingyang Yuan, Huazuo Gao, Damai Dai, Junyu Luo, Liang Zhao, Zhengyan Zhang, Zhenda Xie,
+Yuxing Wei, Lean Wang, Zhiping Xiao, Yuqing Wang, Chong Ruan, Ming Zhang, Wenfeng
+Liang, and Wangding Zeng.
+Native sparse attention: Hardware-aligned and natively train-
+able sparse attention.
+In Wanxiang Che, Joyce Nabende, Ekaterina Shutova, and Moham-
+mad Taher Pilehvar (eds.), Proceedings of the 63rd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pp. 23078–23097, Vienna, Austria, Jul
+2025. Association for Computational Linguistics. doi: 10.18653/v1/2025.acl-long.1126. URL
+https://aclanthology.org/2025.acl-long.1126/.
+Ruiqi Zhang, Spencer Frei, and Peter L Bartlett. Trained transformers learn linear models in-context.
+Journal of Machine Learning Research, 25(49):1–55, 2024.
+Shu Zhong, Mingyu Xu, Tenglong Ao, and Guang Shi. Understanding transformer from the per-
+spective of associative memory, 2025. URL https://arxiv.org/abs/2505.19488.
+14
+
+--- Page 15 ---
+Published as a conference paper at ICLR 2026
+A
+APPENDIX: PROOF OF PROPOSITION 2.1
+Let (Xi, Yi)n
+i=1 be i.i.d. with Xi ∈Rd supported on a bounded domain D ⊂Rd with density p, and
+Yi = f(Xi) + εi ∈Rdy,
+E[εi | Xi] = 0, E[ε2
+i | Xi] = σ2(Xi).
+The global linear estimator at x ∈D is
+bfGL(x) = bθ⊤(1, x⊤)⊤,
+where bθ ∈Rd+1 minimizes the empirical squared loss over the global affine class.
+Let K : Rd →[0, ∞) be a bounded, compactly supported, radially symmetric kernel with
+R
+K(u) du = 1. For a symmetric p.d. bandwidth matrix H = Hn ≻0 with a constant condition-
+number upper bound κ1, write
+KH(u) := |H|−1/2 K(H−1/2u),
+∥H∥→0,
+n|H|1/2 →∞.
+The NW estimator at x ∈D is
+bfNW(x) = 1⊤WY
+1⊤W1 ,
+where W := Diag
+ KH(Xi −x)
+
+, 1 := (1, . . . , 1)⊤∈Rn and Y := (Y1, . . . , Yn) ∈Rn×dy.
+To make the analysis easier, we assume the following smoothness requirements.
+Assumption A.1. The domain D has C2 boundary (defined as ∂D) with principal curvatures uni-
+formly bounded by κ2.
+Assumption A.2. The density function p of X satisfies p ∈C1(D). For all dimensions j ∈
+{1, . . . , dy}, the function f satisfies fj ∈C2(D), and the variance function σ2 satisfies σ2
+j ∈C(D).
+We also assume that the kernel K has easy-to-handle support.
+Assumption A.3. K is radial, compactly supported in the unit ball Bd := {u ∈Rd : ||u|| ≤1} =:
+supp(K).
+Throughout, E[·] denotes expectation with respect to the randomness of the training sample Sn :=
+{(Xi, Yi)}n
+i=1, while
+R
+D(·) dx denotes the Lebesgue integral over the spatial domain D. Because
+E
+Z
+D
+∥bf(x) −f(x)∥2 dx =
+dy
+X
+j=1
+E
+Z
+D
+  bfj(x) −fj(x)
+2 dx,
+the output dimension dy only induces a summation across components and does not affect the order;
+hence, without loss of generality, we take dy = 1 below.
+A.1
+INTEGRAL ERROR ESTIMATION OF GLOBAL LINEAR REGRESSION
+We consider the global affine class
+G :=
+
+gθ(x) = β0 + β⊤x : θ = (β0, β⊤)⊤∈R1+d 	
+.
+Lemma A.1. If f /∈G, there exists a constant A∗
+D > 0 such that for every n,
+E
+ Z
+D
+  bfGL(x) −f(x)
+2 dx
+
+≥A⋆
+D.
+Proof. Let L2(D, dx) := {h : D →R with
+R
+D h(x)2 dx < ∞} endowed with inner product
+⟨h1, h2⟩=
+R
+D h1(x)h2(x) dx. The set G is a finite-dimensional linear subspace and hence closed
+in L2(D, dx). By the Projection Theorem, the L2(D, dx)-orthogonal projection of f onto G exists
+and is unique:
+g† ∈arg min
+g∈G ∥f −g∥2
+L2(D) = arg min
+g∈G
+Z
+D
+ f(x) −g(x)
+2 dx.
+15
+
+--- Page 16 ---
+Published as a conference paper at ICLR 2026
+Set A⋆
+D := ∥f −g†∥2
+L2(D). If f /∈G, then f −g† ̸= 0 in L2(D) and thus A⋆
+D > 0.
+Fix an arbitrary realization Sn := (Xi, Yi)n
+i=1. Since bfGL(·; Sn) ∈G, the optimality of g† yields
+Z
+D
+  bfGL(x; Sn) −f(x)
+2 dx ≥inf
+g∈G
+Z
+D
+ g(x) −f(x)
+2 dx = A⋆
+D.
+This inequality holds for every sample Sn. Taking expectation over the training data proves the
+claim.
+A.2
+POINT-WISE ERROR ESTIMATION OF LOCAL CONSTANT REGRESSION
+In this section we will estimate the point-wise mean-squared-error of NW estimator, whose expres-
+sions are given by
+MSENW(x) := E
+
+bfNW(x) −f(x)
+2
+| {Xi}n
+i=1
+
+=
+
+E
+h
+bfNW(x) −f(x) | {Xi}n
+i=1
+i2
+|
+{z
+}
+BiasNW(x)2
++ E
+
+bfNW(x) −E
+h
+bfNW(x) | {Xi}n
+i=1
+i2
+| {Xi}n
+i=1
+
+|
+{z
+}
+VarNW(x)
+.
+When estimating at x ∈D, the kernel KH maps the translated domain (D −x) into supp(K)
+via the scaling H−1/2. The mapped set differs depending on whether x lies in the interior of D or
+near ∂D. This geometric difference drives a larger boundary error for NW, which will underlie the
+performance gap between NW and LL. We formalize the mapped kernel domain and the boundary
+layer.
+Definition A.1 (Exact kernel domain and boundary layer.). For any x ∈D and bandwidth H, the
+exact kernel domain is
+Dx,H := H−1/2(D −x) ∩supp(K) = {u ∈Bd : x + H1/2u ∈D}.
+Define the boundary layer by
+B(H) := { x ∈D : Dx,H ̸= supp(K) }.
+We use the following kernel-moment shorthands.
+Definition A.2 (Exact kernel moments). For all x ∈D and bandwidth H, we define
+µ⋆
+0(x, H) :=
+Z
+Dx,H
+K(u) du,
+µ⋆
+1(x, H) :=
+Z
+Dx,H
+u K(u) du,
+µ⋆
+2(x, H) :=
+Z
+Dx,H
+uu⊤K(u) du.
+Define normalized moments ¯µ⋆
+r(x, H) := µ⋆
+r(x, H)/µ⋆
+0(x, H).
+Then we are ready to estimate the bias and variance using H and n.
+Lemma A.2. Under Assumption A.2, we have
+BiasNW(x) = ∇f(x)⊤H1/2¯µ⋆
+1(x, H) + Op(∥H∥),
+VarNW(x) = Θp(
+1
+n|H|1/2 )
+uniformly for all H ∈Hn, where Hn := {H = h2B : h ∈[n−a, n−b], B ≻0, |B| = 1, κ(B) ≤
+κ1} and 0 < b < a < 1.
+Proof. Defining f := (f(X1), . . . f(Xn))⊤, for any fixed point x0 ∈D, we have
+BiasNW(x0) = (1⊤W1)−11⊤W(f −f(x0)1).
+Specifically,
+n−1(1⊤W1) = n−1
+n
+X
+i=1
+KH(Xi −x0),
+n−11⊤W(f −f(x0)1) = n−1
+n
+X
+i=1
+KH(Xi −x0)(f(Xi) −f(x0)).
+16
+
+--- Page 17 ---
+Published as a conference paper at ICLR 2026
+By Chebyshev’s inequality, for any fixed H,
+n−1
+n
+X
+i=1
+KH(Xi −x0) =
+Z
+D
+KH(x −x0)p(x)dx + Op
+ 
+n−1
+s
+n
+Z
+D
+K2
+H(x −x0)p(x)dx
+!
+.
+By Theorem 1 in (Fan et al., 1996), this bound holds uniformly over H ∈Hn after multiplying the
+stochastic term by √log n. Hence,
+n−1
+n
+X
+i=1
+KH(Xi −x0) =
+Z
+D
+KH(x −x0)p(x)dx + Op
+ 
+n−1
+s
+n log n
+Z
+D
+K2
+H(x −x0)p(x)dx
+!
+=
+Z
+Dx0,H
+K(u)p(x0 + H1/2u)du + op(1) = p(x0)µ∗
+0(x, H) + op(1)
+(18)
+uniformly for H ∈Hn.
+Similarly,
+n−1
+n
+X
+i=1
+KH(Xi −x0)(f(Xi) −f(x0))
+=
+Z
+D
+KH(x −x0)p(x)(f(x) −f(x0))dx + Op
+ 
+n−1
+s
+n log n
+Z
+D
+K2
+H(x −x0)(f(x) −f(x0))2p(x)dx
+!
+=
+Z
+Dx0,H
+K(u)p(x0 + H1/2u)(f(x0 + H1/2u) −f(x0))du + op(||H||)
+=
+Z
+Dx0,H
+K(u)(p(x0) + ∇p(x0)H1/2u + O(||H||))(∇f(x0)⊤H1/2u + O(||H||))du + op(||H||)
+= p(x0)∇f(x0)⊤H1/2µ∗
+1(x0, H) + ∇p(x0)H1/2µ∗
+2(x0, H)H1/2∇f(x0) + op(||H||)
+= p(x0)∇f(x0)⊤H1/2µ∗
+1(x0, H) + Op(||H||)
+(19)
+uniformly for all H ∈Hn.
+Combining Equations 18, 19, we have
+BiasNW(x0) = ∇f(x0)⊤H1/2¯µ⋆
+1(x0, H) + Op(∥H∥)
+uniformly for all H ∈Hn.
+Then we calculate variance
+VarNW(x0) = (1⊤W1)−1(1⊤Σ1)(1⊤W1)−1
+where Σ := diag(K2
+H(Xi −x0)σ2(Xi)). Analogously to equation 18,
+n−1(X⊤ΣX) = n−1
+n
+X
+i=1
+K2
+H(Xi −x0)σ2(Xi)
+=
+Z
+D
+K2
+H(x −x0)σ2(x)p(x)dx + Op
+ 
+n−1
+s
+n log n
+Z
+D
+K4
+H(x −x0)σ4(x)p(x)dx
+!
+= |H|−1/2
+Z
+Dx0,H
+K2(u)σ2(x0 + H1/2u)p(x0 + H1/2u)du + Op
+ r
+log n
+n
+|H|−3/4
+!
+= |H|−1/2
+Z
+Dx0,H
+K2(u)σ2(x0)p(x0)du(1 + op(1)) + Op
+ r
+log n
+n
+|H|−3/4
+!
+= |H|−1/2σ2(x0)p(x0)
+Z
+Dx0,H
+K2(u)du(1 + op(1))
+(20)
+uniformly for all H ∈Hn.
+17
+
+--- Page 18 ---
+Published as a conference paper at ICLR 2026
+Combining Equations 18, 20, we have that
+VarNW(x) = Θp(
+1
+n|H|1/2 )
+holds uniformly for all H ∈Hn.
+A.3
+INTEGRAL ERROR ESTIMATION OF LOCAL CONSTANT REGRESSION
+Here we calculate the integral error for NW estimator. From Lemma A.2 we have that for any
+x ∈D, the pointwise bias of NW estimator is
+BiasNW(x) = ∇f(x)⊤H1/2¯µ⋆
+1(x, H) + Op(∥H∥).
+By symmetry of the kernel K, the first moment ¯µ⋆
+1(x, H) = 0 if and only if x /∈B(H). Roughly,
+BiasNW(x) = O(∥H1/2∥) when x ∈B(H) and BiasNW(x) = O(∥H∥) when x /∈B(H). Hence it
+is important to bound
+R
+B(H) MSENW(x) dx and
+R
+D\B(H) MSENW(x) dx separately. We first define
+a smooth substitute for the boundary layer B(H).
+Definition A.3 (Uniform Boundary Layer). For any bandwidth H and α ∈(0, 1), the uniform
+boundary layer of D is
+C(H, α) := {x = y −te(y) : y ∈∂D, t ∈[0, αhn(y)]}
+where for any y ∈∂D, we define e(y) as the inward unit normal at y, and define hn(y) :=
+p
+e(y)⊤H e(y) .
+We now show that one can choose a constant α ∈(0, 1) (independent of H) that “sandwiches”
+B(H) between C(H, α) and C(H, α−1).
+Lemma A.3. Under Assumptions A.1, A.3, there exists α ∈(0, 1) such that for all sufficiently small
+H, we have
+C(H, α) ⊂B(H) ⊂C(H, α−1).
+Proof. We prove the claim with α = min
+  1
+2, 1
+2κ−1/2
+1
+
+.
+Step 1: C(H, α) ⊂B(H). Let ϕ denote the signed distance to ∂D (positive inside D). For x =
+y −te(y) ∈C(H, α) and any v ∈Rd, the standard expansion (using the shape operator Sy) gives
+ϕ(x + v) = −t + vn −1
+2v⊤
+T SyvT + O(∥v∥3),
+where vn := v⊤e(y) and vT := (I−e(y)e(y)⊤)v. By Assumption A.1, ∥Sy∥is uniformly bounded.
+Define
+u := κ−1/2
+1
+hn(y) H−1/2e(y) ∈Rd.
+Then
+∥u∥2 = κ−1
+1
+hn(y)2 e(y)⊤H−1e(y) = κ−1
+1
+ e(y)⊤He(y)
+ e(y)⊤H−1e(y)
+
+1
+≤κ−1
+1
+κ(H) ≤1,
+since κ(H) ≤κ1 by assumption. Hence u ∈supp(K) (Assumption A.3). Using the expansion
+with v = H1/2u and bounded curvature,
+ϕ
+ x + H1/2u
+
+= −t + u⊤H1/2e(y) + O(∥H∥3/2) = −t + κ−1/2
+1
+hn(y) + O(∥H∥3/2).
+Since t ≤αhn(y) and α ≤1
+2κ−1/2
+1
+, for sufficiently small H we have ϕ(x + H1/2u) > 0, i.e.,
+x + H1/2u /∈D. Thus there exists u ∈supp(K) with u /∈Dx,H, i.e., Dx,H ̸= supp(K), so
+x ∈B(H).
+Step 2: B(H) ⊂C(H, α−1). Let x = y −te(y) ∈B(H). By definition, there exists u ∈supp(K)
+with x + H1/2u /∈D, i.e.,
+ϕ(x + H1/2u) = −t + u⊤H1/2e(y) + O(∥H∥) > 0.
+Hence
+t < u⊤H1/2e(y) + O(∥H∥) ≤∥u∥
+q
+e(y)⊤He(y) + O(∥H∥) ≤hn(y) + O(∥H∥).
+For sufficiently small H, this yields t < α−1hn(y) (since α−1 ≥2), so x ∈C(H, α−1).
+18
+
+--- Page 19 ---
+Published as a conference paper at ICLR 2026
+With C(H, α−1) in hand, we bound the integrated variance and squared bias of the NW estimator.
+Lemma A.4. Under Assumptions A.1, A.2, and A.3, we have, uniformly for all H ∈Hn,
+Z
+D
+Bias2
+NW(x) dx = Op
+ ∥H∥3/2
+and
+Z
+D
+VarNW(x) dx = Θ
+ n−1|H|−1/2
+.
+Proof.
+Z
+D
+Bias2
+NW(x)dx =
+Z
+B(H)
+Bias2
+NW(x)dx +
+Z
+D\B(H)
+Bias2
+NW(x)dx
+= Op(||H||)
+Z
+B(H)
+dx + Op(||H2||)
+≤Op(||H||)
+Z
+C(H,α−1)
+dx + Op(||H2||)
+= Op(||H||)
+Z
+∂D
+Z
+hn(y)
+α
+0
+dtdS(y) + Op(||H2||)
+= Op(||H3/2||),
+since hn(y) =
+p
+e(y)⊤He(y) = Θ(∥H∥1/2) uniformly under bounded condition number.
+For the variance, Lemma A.2 gives VarNW(x) = Θp(n−1|H|−1/2) pointwise (uniformly over H ∈
+Hn). Integrating over D (whose volume is constant) preserves the order:
+Z
+D
+VarNW(x)dx =
+Z
+D
+Θ(n−1|H1/2|−1)dx = Θ(n−1|H1/2|−1).
+A.4
+PROOF OF PROPOSITION 2.1
+Combining Lemmas A.1, A.4, we obtain the final conclusion.
+Theorem A.1 (Precise statement of Proposition 2.1). Under Assumptions A.1, A.2, A.3, if the func-
+tion f to be estimated is not within the the global affine class G,then
+E
+Z
+D
+MSEGL(x) dx = Ω(1)
+and
+E
+Z
+D
+MSENW(x) dx = O
+ n−3/(d+3)
+,
+where bfNW uses the optimal bandwidth H ∈Hn.
+Proof. The lower bound for MSEGL follows directly from Lemma A.1.
+For NW, Lemma A.4 and the definition of Hn imply
+Z
+D
+Bias2
+NW(x) dx = Op(h3),
+Z
+D
+VarNW(x) dx = Θ
+ n−1h−d
+uniformly for h ∈[n−a, n−b] (since ∥H∥= Θ(h2) and |H|1/2 = Θ(hd) under bounded condition
+number). Hence
+Z
+D
+MSENW(x) dx = Op
+
+h3 +
+1
+n hd
+
+= Op
+ n−3/(d+3)
+,
+at the minimizer h = n−1/(d+3) ∈[n−a, n−b] of h3 + (nhd)−1.
+B
+APPENDIX: PROOF OF PROPOSITION 2.2
+The local linear estimator at x ∈D is
+bfLL(x) = (X⊤WX)−1X⊤WY ,
+where
+X :=
+
+1
+. . .
+1
+X1 −x0
+. . .
+Xn −x0
+⊤
+.
+Here we inherit Assumptions A.1, A.2, A.3 and continue to set dy = 1 as in Appendix A.
+19
+
+--- Page 20 ---
+Published as a conference paper at ICLR 2026
+B.1
+POINT-WISE ERROR ESTIMATION
+We have already derived the point-wise error of the local constant estimator in Lemma A.4. We now
+do the same for the local linear estimator.
+Lemma B.1. Under Assumption A.2, we have, uniformly for all H ∈Hn,
+BiasLL(x) = Op(∥H∥),
+VarLL(x) = Op
+
+1
+n|H|1/2
+
+,
+where Hn := {H = h2B :
+h ∈[n−a, n−b], B ≻0, |B| = 1, κ(B) ≤κ1} with constants
+0 < b < a < 1.
+Proof. For any fixed point x0 ∈D, we have
+BiasLL(x0) = e1(X⊤WX)−1X⊤W(f −X(f(x0), ∇f(x0)⊤)⊤)
+= 1
+2e1(X⊤WX)−1X⊤W(Q + op(tr(H)))
+where Q = [(X1 −x)⊤Hf(X1 −x), . . . , (Xn −x)⊤Hf(Xn −x)]⊤.
+VarLL(x0) = e1(X⊤WX)−1(X⊤ΣX)(X⊤WX)−1e⊤
+1
+where Σ := diag(K2
+H(Xi −x0)σ2(Xi)).
+n−1(X⊤WX) =
+
+n−1 Pn
+i=1 KH(Xi −x0)
+n−1 Pn
+i=1 KH(Xi −x0) (Xi −x0)⊤
+n−1 Pn
+i=1 KH(Xi −x0) (Xi −x0)
+n−1 Pn
+i=1 KH(Xi −x0) (Xi −x0)(Xi −x0)⊤
+
+n−1(X⊤ΣX) =
+
+n−1 Pn
+i=1 K2
+H(Xi −x0)σ2(Xi)
+n−1 Pn
+i=1 K2
+H(Xi −x0)σ2(Xi)(Xi −x0)⊤
+n−1 Pn
+i=1 K2
+H(Xi −x0)σ2(Xi)(Xi −x0)
+n−1 Pn
+i=1 K2
+H(Xi −x0)σ2(Xi)(Xi −x0)(Xi −x0)⊤
+
+n−1X⊤W(f −X(f(x0), ∇f(x0)⊤)⊤)
+=
+
+n−1 Pn
+i=1 KH(Xi −x0)(f(Xi) −f(x0) −∇f(x0)⊤(Xi −x0))
+n−1 Pn
+i=1 KH(Xi −x0)(f(Xi) −f(x0) −∇f(x0)⊤(Xi −x0))(Xi −x0)
+
+By the same uniform LLN and √log n arguments used in the proof of Lemma A.2, we have uni-
+formly over H ∈Hn:
+n−1
+n
+X
+i=1
+K2
+H(Xi −x0)σ2(Xi) = |H|−1/2σ2(x0)p(x0)R0(x0, H)(1 + op(1))
+n−1
+n
+X
+i=1
+K2
+H(Xi −x0)σ2(Xi)(Xi −x0)⊤
+= σ2(x0)p(x0)|H|−1/2R1(K)H1/2 + Op
+ 
+(
+r
+log n
+n
+|H|−3/4 + 1)H1/21
+!
+n−1
+n
+X
+i=1
+KH(Xi −x0) = p(x0)µ∗
+0(x0, H) + op(1)
+n−1
+n
+X
+i=1
+K2
+H(Xi −x0)σ2(Xi)(Xi −x0)(Xi −x0)⊤
+= σ2(x0)p(x0)|H|−1/2H1/2R2(K)H1/2 + op
+
+|H|−1/2H
+
+20
+
+--- Page 21 ---
+Published as a conference paper at ICLR 2026
+n−1
+n
+X
+i=1
+KH(Xi −x0)(Xi −x0)⊤= p(x0)µ∗
+1(x0, H)⊤H1/2 + Op(H1)
+n−1
+n
+X
+i=1
+KH(Xi −x0)(Xi −x0)(Xi −x0)⊤= Op(H)
+n−1
+n
+X
+i=1
+KH(Xi −x0)(f(Xi) −f(x0) −∇f(x0)⊤(Xi −x0)) = p(x0)µ2(K)tr (HHf(x0)) + op(tr(H))
+n−1
+n
+X
+i=1
+KH(Xi −x0)(f(Xi) −f(x0) −∇f(x0)⊤(Xi −x0))(Xi −x0) = Op(H3/21),
+where
+R0(x0, H) =
+Z
+Dx0,H
+K2(u)du,
+R1(x0, H) =
+Z
+Dx0,H
+K2(u)udu,
+R2(x0, H) =
+Z
+Dx0,H
+K2(u)uu⊤du.
+Then we have the expression of every element in all matrices. A standard blockwise inversion
+therefore yields
+BiasLL(x) = Op(∥H∥),
+VarLL(x) = Op(
+1
+n|H|1/2 ).
+uniformly over H ∈Hn, proving the claim.
+B.2
+INTEGRAL ERROR ESTIMATION
+From Lemma A.2 we have that for any x ∈D, the pointwise bias of local constant estimator is
+BiasNW(x) = ∇f(x)⊤H1/2¯µ⋆
+1(x, H) + Op(∥H∥).
+By symmetry of the kernel K, the first moment satisfies ¯µ⋆
+1(x, H) = 0 if and only if x /∈B(H).
+We will show that if f has a sufficiently large normal gradient on a measurable subset of ∂D, then
+R
+B(H) Bias2
+NW(x)dx will have a dominant order Θ(∥H3/2∥).
+We begin by lower-bounding |∇f(x)⊤H1/2¯µ⋆
+1(x, H)|, to do which we first lower-bound
+e(y)⊤H1/2¯µ∗
+1(y −te(y), H).
+Lemma B.2. Under Assumption A.1, A.3, there exists α ∈(0, 1), c∗> 0 and C∗> 0 such that for
+all sufficiently small H and all y ∈∂D, all t ∈[0, αhn(y)],
+|e(y)⊤H1/2¯µ∗
+1(y −te(y), H)| ≥c∗hn(y)
+||¯µ∗
+1(y −te(y), H)|| ≤C∗.
+Proof. Recall Dx,H = {u ∈Bd : x + H1/2u ∈D}. For x = y −te(y) with y ∈∂D, choose an
+orthogonal Q(y) such that Q(y)H1/2e(y) = hn(y) ed. Define the rotated domain
+eDy,t,H := { v ∈Bd : y −te(y) + H1/2Q(y)v ∈D }.
+Define the corresponding moments on eDy,t,H:
+µ⋆
+0,v(y, t, H) :=
+Z
+e
+Dy,t,H
+K(u) du,
+µ⋆
+1,v(y, t, H) :=
+Z
+e
+Dy,t,H
+u K(u) du,
+¯µ⋆
+1,v(y, t, H) := µ⋆
+1,v(y, t, H)
+µ⋆
+0,v(y, t, H).
+Then
+µ⋆
+0,v(y, t, H) = µ⋆
+0(x, H),
+Q(y) µ⋆
+1,v(y, t, H) = µ⋆
+1(x, H),
+Q(y) ¯µ⋆
+1,v(y, t, H) = ¯µ⋆
+1(x, H),
+and hence
+e(y)⊤H1/2¯µ⋆
+1(x, H) = hn(y) e⊤
+d ¯µ⋆
+1,v(y, t, H).
+(21)
+By the standard signed-distance expansion with shape operator Sy (Assumption A.1), for v ∈Rd,
+ϕ
+ y −te(y) + H1/2Q(y)v
+
+= −t + hn(y) vd −1
+2z⊤
+T SyzT + O(∥H∥3/2),
+21
+
+--- Page 22 ---
+Published as a conference paper at ICLR 2026
+where zT := (I −e(y)e(y)⊤)H1/2Q(y)v and ∥Sy∥is uniformly bounded. Therefore
+y −te(y) + H1/2Q(y)v ∈D
+⇐⇒
+vd <
+t
+hn(y) + O(∥H∥1/2),
+so
+eDy,t,H =
+n
+v ∈Bd : vd <
+t
+hn(y) + O(∥H∥1/2)
+o
+.
+Consequently,
+µ⋆
+0,v(y, t, H) =
+Z
+e
+Dy,t,H
+K(v) dv
+=
+Z
+Rd−1dv1:d−1
+Z t/hn(y)
+−√
+1−Pd−1
+i=1 v2
+i
+K(v1:d−1, vd) dvd + O(∥H∥1/2)
+≥
+Z
+Rd−1dv1:d−1
+Z 0
+−√
+1−Pd−1
+i=1 v2
+i
+K(v1:d−1, vd) dvd + O(∥H∥1/2).
+Using positivity and boundedness of K on Bd, there exist 0 < C < D < ∞such that
+C < µ⋆
+0,v(y, t, H) < D.
+(22)
+Similarly,
+e⊤
+d µ⋆
+1,v(y, t, H) =
+Z
+e
+Dy,t,H
+vdK(v) dv
+=
+Z
+Rd−1dv1:d−1
+Z t/hn(y)
+−√
+1−Pd−1
+i=1 v2
+i
+vd K(v1:d−1, vd) dvd + O(∥H∥1/2)
+=: g
+
+t
+hn(y)
+
++ O(∥H∥1/2).
+Note g(0) < 0 and g(τ) decreases as τ ↓0. Choose α = α1 ∈(0, 1) with g(α1) < 0. Then for all
+t ∈[0, α1hn(y)],
+e⊤
+d µ⋆
+1,v(y, t, H) ≤g(α1) + O(∥H∥1/2) < 0.
+(23)
+Combining equation 22–equation 23, for small H,
+e⊤
+d ¯µ⋆
+1,v(y, t, H)
+ = |e⊤
+d µ⋆
+1,v(y, t, H)|
+µ⋆
+0,v(y, t, H)
+≥|g(α1)|
+2D
+.
+Using equation 21 yields the first bound with c∗:= |g(α1)|/(2D). The second bound follows from
+boundedness of K and supp(K) ⊂Bd.
+Since the leading term of BiasNW(x) is ∇f(x)⊤H1/2¯µ⋆
+1(x, H),
+the lower bound on
+|e(y)⊤H1/2¯µ⋆
+1(y −te(y), H)| alone does not guarantee order Θ(∥H1/2∥); we also require a suffi-
+ciently large normal derivative of f along ∂D.
+Definition B.1 (Extreme boundary gradient class). For any domain D and constants m and M,
+we define a class of functions E(D, m, M), where f ∈E(D, m, M) iff there exist a measurable
+Γ ⊂∂D with S(Γ) > 0 and constants m, M such that |∂ef(y)| ≥m and ||∇T f(y)|| < M where
+∂ef(y) = ∇f(y)⊤e(y) and ∇T f(y) = (I −e(y)e(y)⊤)∇f(y).
+Then we can prove that if the function to be estimated is within E(D, m, M) where m and M are
+specifically chosen constants that are independent of H, the NW has an integral squared bias with
+high order.
+Lemma B.3. Under Assumptions A.1, A.2, and A.3, if f ∈E(D, m, M) with
+c2
+∗κ−1
+1 m2 −2c∗κ−1/2
+1
+C∗mM ≥C1 > 0,
+then uniformly over H ∈Hn,
+Z
+D
+Bias2
+NW(x) dx = Ωp(∥H∥3/2)
+and
+Z
+D
+VarNW(x) dx = Ωp
+ n−1|H|−1/2
+.
+22
+
+--- Page 23 ---
+Published as a conference paper at ICLR 2026
+Remark. It is easy to construct f and D satisfying Assumptions A.1, A.2 and f ∈E(D, m, M).
+For example, on D = {(x1, x2) : x2
+1 + x2
+2 ≤1}, f(x1, x2) =
+√c1κ1
+2c∗(x2
+1 + x2
+2) works with suitable
+m, M.
+Proof. We first lower-bound bias. Choosing α as the minimum α given by Lemmas A.3, B.2, we
+have
+Z
+Bias2
+NW(x)dx ≥
+Z
+B(H)
+Bias2
+NW(x)dx ≥
+Z
+C(H,α)
+Bias2
+NW(x)dx
+=
+Z
+∂D
+Z αhn(y)
+0
+Bias2
+NW(y −te(y))det (I −tSy) dtdS(y)
+≥C2
+Z
+Γ
+Z αhn(y)
+0
+
+(∇f(y −te(y))⊤H1/2¯µ⋆
+1(y −te(y), H))2 + Op(||H3/2||)
+
+dtdS(y),
+(24)
+where the last inequality is derived from Lemma A.2 and the boundedness of Sy from Assumption
+A.1.
+For all t ∈αhn(y) and all η ∈(0, 1),
+
+∇f(y −te(y))⊤H1/2¯µ⋆
+1(y −te(y), H)
+2
+(a)
+=
+
+∂ef(y −te(y))e(y)⊤H1/2¯µ⋆
+1(y −te(y), H) + ∇T f(y −te(y))⊤H1/2¯µ⋆
+1(y −te(y), H)
+2
+(b)
+≥(1 −η)
+
+∂ef(y −te(y))e(y)⊤H1/2¯µ⋆
+1(y −te(y), H)
+2
+−η−1 
+∇T f(y −te(y))⊤H1/2¯µ⋆
+1(y −te(y), H)
+2
+(c)
+≥(1 −η)(∂ef(y −te(y)))2h2
+n(y)c2
+∗−η−1||∇T f(y −te(y)||2C2
+∗||H||
+= (1 −η)(∂ef(y))2h2
+n(y)c2
+∗−η−1||∇T f(y)||2C2
+∗||H|| + O(||H3/2||)
+≥
+ (1 −η)m2c2
+∗κ−1
+1
+−η−1M 2C2
+∗
+
+||H|| + O(||H3/2||).
+Here (a) uses the fact ∇f = ∂ef(y)e(y)+∇T f(y), (b) uses the fact (A+B)2 ≥(1−η)A2−η−1B2
+for all η ∈(0, 1), (c) uses Lemma B.2.
+Setting η = MC∗κ1/2
+1
+mc∗
+, we have
+
+∇f(y −te(y))⊤H1/2¯µ⋆
+1(y −te(y), H)
+2
+≥
+ (1 −η)m2c2
+∗κ−1
+1
+−η−1M 2C2
+∗
+
+||H|| + O(||H3/2||)
+=
+
+c2
+∗κ−1
+1 m2 −2c∗κ−1/2
+1
+C∗mM
+
+||H|| + O(||H3/2||)
+≥C1||H|| + +O(||H3/2||).
+(25)
+Combining Equations 24, 25, we have that
+Z
+Bias2
+NW(x)dx ≥αC2
+
+C1||H|| + Op(||H3/2||)
+ Z
+Γ
+hn(y)dS(y) = Ωp(||H3/2||).
+The last equation holds because hn(y) ≥κ−1
+1 ||H1/2||. Using Lemma A.2, it is straightforward to
+show that
+Z
+Ω
+VarNW(x)dx = Ωp(n−1|H1/2|−1).
+We then show that local linear regression enjoys strictly lower bias than NW on all functions.
+Lemma B.4. Under Assumptions A.1, A.2, A.3, we have
+R
+D Bias2
+LL(x)dx = Op(||H2||) and
+R
+D VarLL(x)dx = Op(n−1|H1/2|−1) uniformly hold for all H ∈Hn.
+23
+
+--- Page 24 ---
+Published as a conference paper at ICLR 2026
+Proof. It is straightforward from Lemma B.1.
+Then it is easy to prove the final conclusion.
+Theorem B.1 (Precise statement of Proposition 2.2). Under Assumptions A.1, A.2, A.3, if the func-
+tion f to be estimated is within E(D, m, M) where
+c2
+∗κ−1
+1 m2 −2c∗κ−1/2
+1
+C∗mM ≥C1 > 0,
+we have E
+R
+D MSENW(x)dx = Ω(n−3/(d+3)) and E
+R
+D MSELL(x)dx = O(n−4/(d+4)), where
+both bfNW and bfLL are at their optimal bandwidth H ∈Hn.
+Proof. According
+to
+Lemma
+B.3
+and
+the
+definition
+of
+Hn,
+we
+have
+that
+we
+have
+R
+D Bias2
+NW(x)dx = Ωp(h3) and
+R
+D VarNW(x)dx = Ωp(n−1h−d) uniformly hold for all h ∈
+[n−a, n−b]. So we have
+Z
+D
+MSENW(x)dx = Ωp(h3 +
+1
+nhd ) = Ωp(n−3/(d+3))
+even for optimal H ∈Hn. The last equality holds because h = n−1/(d+3) ∈[n−a, n−b] is the
+minimizer of h3 + (nhd)−1.
+According to Lemma B.4, we have that
+Z
+D
+MSELL(x)dx = Op(h4 +
+1
+nhd ) = Op(n−4/(d+4))
+for the optimal H ∈Hn. According to the definition of Ωp and Op, it is straightforward to deduce
+the conclusion.
+C
+APPENDIX: CONJUGATE GRADIENT SOLVER
+The Conjugate Gradient (CG) method (Hestenes & Stiefel, 1952) is an iterative algorithm for solving
+systems of linear equations with symmetric positive-definite matrices. As described in Section 3,
+we solve the linear systems with matrix Σi for blocks of queries in parallel:
+Σixi = yi,
+for i ∈{(r −1)Br + 1, . . . , rBr}
+(26)
+In the FlashLLA forward algorithm 1, CG is applied within each row block, with Qr, Mr, mr, ωr
+being the block quantities, Xr being the solution to be computed and Yr being the right-hand side.
+We use the simplest initialization Xr ←0 for CG. Hence the initial residual ri is set to be yi, i.e.,
+R(0) ←Yr in Algorithm 2.
+The core computation is the matrix-vector product Σipi for the search vectors pi computed in the
+lines 4-10. The result is stored in matrix ΣP . This operation has high I/O intensity due to the re-
+quirement to stream through the entire K matrix in HBM during each CG iteration. Consequently,
+controlling the number of iterations is crucial for both the efficiency and convergence. While maxi-
+mal iteration number T ≤d can be manually set, further considerations are necessary to ensure the
+numerical stability and performance.
+First, the convergence and convergent rate of CG are greatly influenced by its spectral condition.
+However, the conditioning varies significantly across positions. For example, for early tokens, the
+matrix Σi is low-rank and requires relatively large λ to maintain positive definiteness. To address
+this, we make the regularization λ learnable and data-dependent:
+λi = sigmoid(Wλxi).
+(27)
+The dimension of the weight Wλ ∈Rd×dλ controls the granularity of the regularization. Setting
+dλ = d enables per-dimensional regularization, though empirically set dλ = dh suffices, where dh
+denotes the head dimension.
+Additionally, since the CG solves multiple systems in parallel, different system converge at different
+iterations. To prevent the numerical issues from affecting early converged system, we employ an
+active mask that disables iterations for systems whose residual norm fall below the tolerance ϵ.
+24
+
+--- Page 25 ---
+Published as a conference paper at ICLR 2026
+Algorithm 2 FlashLLA CG Solver
+Require: Variables K in HBM, Xr, Yr, Qr, Mr, mr, ωr in SRAM, block sizes Bc, regularization
+λ, tolerance ϵ, max iterations T, bandwidth h.
+1: Initialize on-chip: R(0) ←Yr ∈RBr×d, P (0) ←Yr ∈RBr×d.
+2: for t = 1 to T do
+3:
+Initialize on-chip: Σ(0)
+P
+←0 ∈RBr×d.
+4:
+for c = 1 to ⌈n/Bc⌉do
+5:
+Load Kc from HBM to SRAM.
+6:
+Compute W = exp(QrK⊤
+c /h −bcast(mr)).
+7:
+Compute Σ(c)
+P
+= Σ(c−1)
+P
++ (W ⊙P (t−1)Kc)Kc.
+8:
+end for
+9:
+Compute PQ = brsum(Yr ⊙Qr) and PM = brsum(P (t−1) ⊙Mr).
+10:
+Compute Σ(last)
+P
+= Σ(last)
+P
+−PQ ⊙Mr −PM ⊙Qr + bcast(ωr) ⊙PQ ⊙Qr + λP (t−1)
+11:
+Compute n = rsum(R(t−1) ⊙R(t−1)) and check convergence.
+12:
+Compute α = n/rsum(P (t−1) ⊙Σ(last)
+P
+).
+13:
+Compute X(t) = X(t−1) + bcast(α) ⊙P (t−1).
+14:
+Compute R(t) = R(t−1) −bcast(α) ⊙Σ(last)
+P
+.
+15:
+Compute β = rsum(R(t) ⊙R(t))/n.
+16:
+Compute P (t) = R(t) + β ⊙P (t−1).
+17: end for
+18: return Xr as the solution of ΣiX = Yr for i in the block.
+D
+APPENDIX: BACKWARD DERIVATION
+This section provides the detailed derivation of the backward pass. Defining the following variables:
+ˆbi =
+i
+X
+j=1
+sijvj =
+i
+X
+j=1
+wij
+nij
+δi
+vj,
+gi = ∂L
+∂ˆbi
+∈Rd
+(28)
+γij = g⊤
+i vj = ∂L
+∂sij
+,
+βi = 1
+δi
+i
+X
+j=1
+γijsij,
+cij = γijwij
+δi
+(29)
+The gradient of the loss with respect to vj is given by:
+∂L
+∂vj
+=
+n
+X
+i=j
+sijgi,
+∆V = S⊤G
+(30)
+The gradient of qi and kj is related to sij, which can be broken down into wij and zij path in the
+computation graph. The partial gradients of the loss with respect to wij, zij are given by:
+∂L
+∂wij
+= ∂L
+∂sij
+∂sij
+∂wij
++ ∂L
+∂ωi
+∂ωi
+∂wij
++ ∂L
+∂µi
+⊤∂µi
+∂wij
++ Tr
+ 
+∂L
+∂Σi
+⊤∂Σi
+∂wij
+!
+(31)
+= γijnij
+δi
+−βi + z⊤
+ij
+∂L
+∂µi
++ z⊤
+ij
+∂L
+∂Σi
+zij
+(32)
+∂L
+∂zij
+= ∂L
+∂sij
+∂sij
+∂zij
++ ∂L
+∂µi
+⊤∂µi
+∂zij
++ Tr
+ 
+∂L
+∂Σi
+⊤∂Σi
+∂wij
+!
+(33)
+= −cijρi + wij
+∂L
+∂µi
++ 2wij
+∂L
+∂Σi
+zij
+(34)
+25
+
+--- Page 26 ---
+Published as a conference paper at ICLR 2026
+Then the partial gradients of the loss with respect to kj and qi are given by:
+∂L
+∂kj
+=
+n
+X
+i=j
+∂L
+∂wij
+∂wij
+∂kj
++ ∂L
+∂zij
+∂zij
+∂kj
+=
+n
+X
+i=j
+∂L
+∂wij
+wij
+h qi + ∂L
+∂zij
+(35)
+∂L
+∂qi
+=
+i
+X
+j=1
+∂L
+∂wij
+∂wij
+∂qi
++ ∂L
+∂zij
+∂zij
+∂qi
+=
+i
+X
+j=1
+∂L
+∂wij
+wij
+h kj −∂L
+∂zij
+(36)
+In order to compute the partial gradients of µi and Σi, denote
+ui = Σ−1
+i
+i
+X
+j=1
+cijzij = Σ−1
+i
+
+i
+X
+j=1
+cijkj −
+
+i
+X
+j=1
+cij
+
+qi
+
+(37)
+which can be computed with existing Conjugate Gradient solver 2. Then
+∂L
+∂µi
+=
+i
+X
+j=1
+∂L
+∂nij
+∂nij
+∂µi
++ ∂L
+∂δi
+∂δi
+∂µi
+= −ui + 2βiρi
+(38)
+∂L
+∂Σi
+=
+i
+X
+j=1
+∂L
+∂nij
+∂nij
+∂Σi
++ ∂L
+∂δi
+∂δi
+∂Σi
+= −1
+2ρi
+∂L
+∂µi
+⊤
++ 1
+2uiρ⊤
+i
+(39)
+We denote the following variables:
+∆µ = −U + 2bcast(β) ⊙R
+(40)
+We can materialize the gradient of wij for every i, j pair and then perform the reduction.
+wij
+∂L
+∂wij
+= γijsij + wijz⊤
+ij
+∂L
+∂µi
++ wijz⊤
+ij
+∂L
+∂Σi
+zij
+(41)
+We omit the Q, K in the relmm for simplicity, then the gradient of wij can be computed as:
+∆W = Γ ⊙S + W ⊙(−bcast(β) + relmm(∆µ) −1
+2relmm(∆µ) ⊙relmm(R)
+(42)
++ 1
+2relmm(U) ⊙relmm(R))
+(43)
+Then we can compute the gradient of kj and qi through wij branch as follows:
+∆K
+W = 1
+h∆⊤
+W Q,
+∆Q
+W = 1
+h∆W K
+(44)
+For the zij path, we avoid materializing the third-order tensor by performing the reduction internally,
+n
+X
+i=j
+∂L
+∂zij
+=
+n
+X
+i=j
+−cijρi +
+n
+X
+i=j
+wij
+∂L
+∂µi
++ 2
+n
+X
+i=j
+wij
+∂L
+∂Σi
+zij
+(45)
+i
+X
+j=1
+∂L
+∂zij
+=
+i
+X
+j=1
+−cijρi +
+i
+X
+j=1
+wij
+∂L
+∂µi
++ 2
+i
+X
+j=1
+wij
+∂L
+∂Σi
+zij
+(46)
+Then we can compute the gradient of the loss with respect to zij as follows:
+∆K
+Z = −C⊤R + W ⊤∆µ −(W ⊙relmm(∆µ))⊤R + (W ⊙relmm(R))⊤U
+(47)
+∆Q
+Z = −brsum(C) ⊙R + brsum(W) ⊙∆µ
+(48)
+−brsum(W ⊙relmm(∆µ)) ⊙R + brsum(W ⊙relmm(R)) ⊙U
+(49)
+Hence the gradient of the loss with respect to kj and qi can be computed as:
+∆K = ∆K
+W + ∆K
+Z ,
+∆Q = ∆Q
+W + ∆Q
+Z
+(50)
+26
+
+--- Page 27 ---
+Published as a conference paper at ICLR 2026
+10−5
+10−1
+Dim 8
+Loss/Dim
+Segment Size 8
+Segment Size 16
+Segment Size 64
+Segment Size 128
+Segment Size 256
+Segment Size 512
+Segment Size 1024
+10−5
+10−1
+Dim 16
+Loss/Dim
+10−5
+10−1
+Dim 32
+Loss/Dim
+10−5
+10−1
+Dim 64
+Loss/Dim
+0
+500
+1000
+Position
+10−5
+10−1
+Dim 128
+Loss/Dim
+0
+500
+1000
+Position
+0
+500
+1000
+Position
+0
+500
+1000
+Position
+0
+500
+1000
+Position
+0
+500
+1000
+Position
+0
+500
+1000
+Position
+Position-wise MSE - All Dimensions vs Segment Sizes
+LLA
+Attn
+Mesa
+LA
+Random
+Figure 6: Test-time regression with across all input dimension d and segment size S.
+E
+APPENDIX: COMPLEXITY ANALYSIS
+In this section, we provide a detailed discussion of the computation and IO complexity of FlashLLA
+and its sparse variants, together with empirical profiling results and numerical precision analysis of
+our FLASHLLA kernel. This complements the main paper by offering concrete guidance on how
+computation and memory can be reduced in future work.
+E.1
+COMPUTATION AND IO COMPLEXITY
+LLA extends the Softmax attention operator by performing regression-style computation across both
+sequence and feature dimensions. The additional cost arises primarily from solving a d × d linear
+system per query. Therefore, the computation of LLA can be amortized over sequential dimensions
+and feature dimensions. Specifically, we can consider two strategies for reducing the computational
+and memory cost of LLA:
+1. Sliding-Window LLA (SW-LLA): Applying a sliding window reduces both computa-
+tion and IO, particularly for CG-based solvers. Theoretically, local linear regressors has
+improved sample efficiency compared to local constant methods. Hence, local linear atten-
+tion has the potential to achieve the same error level with restricted window size.
+2. Block-Diagonal LLA (BD-LLA): The full LLA formulation captures all feature correla-
+tions, which is the dominant source of computational and memory cost and often requires
+ridge regularization to ensure positive definiteness. Imposing block-diagonal structure re-
+duces both compute and memory while relaxing conditioning requirements. Suppose the
+block-diagonal structure consists of g diagonal blocks, each of size d/g. We consider the
+following two specifications:
+• g = d: only per-feature scaling is modeled. This introduces only O(nd) memory and
+element-wise multiplications beyond Softmax attention. CG is unnecessary.
+• g = d/2: pairwise feature correlations are modeled. This requires inverting 2 ×
+2 matrices per block, which is computationally inexpensive and well-conditioned in
+practice. CG is unnecessary in this regime.
+These dimensional sparsity strategies often eliminate the need for CG entirely while retain-
+ing much of the modeling flexibility of full LLA.
+We summarize the per-query complexity of representative methods in Table 1. Here, n denotes the
+sequence length, d the head dimension, T the number of CG iterations (if used), g the number of
+diagonal blocks in block-diagonal LLA (BD-LLA), and B the block size used in the kernel.
+E.2
+LATENCY PROFILING
+27
+
+--- Page 28 ---
+Published as a conference paper at ICLR 2026
+Method
+Computation
+IO
+SW Support
+Softmax Attention
+O(nd)
+2nd/B
+✓
+MesaNet
+O(Td2) + O(d2)
+O(d)
+✗
+LLA
+O(Td2) + O(nd)
+(T + 3)nd/B
+✓
+BD-LLA (CG)
+O(Td2/g2) + O(nd)
+(T + 3)nd/B
+✓
+BD-LLA (direct)
+O(d3/g2) + O(nd)
+3nd/B
+✓
+Table 1: Per-query computation and IO complexity.
+27
+28
+29
+210
+211
+212
+213
+Sequence Length
+10−1
+100
+101
+102
+Latency (ms)
+Naive LLA
+FlashLLA (T=8)
+FlashLLA (T=16)
+FlashLLA (T=32)
+FlashAttention
+Figure 7: Prefill latency scal-
+ing (log-log) with dimension
+128 and batch size 32.
+We profile latency (ms) and peak memory (GB) during prefill with
+head dimension 128 and batch size 32. Results are summarized
+in Figure 7. FLASHLLA reduces working memory and improves
+latency by 50×–200× over the naive implementation depending on
+sequence length and CG iterations. Notably, naive LLA runs out-
+of-memory beyond length 4096, while FlashLLA implementation
+scales to 8192 tokens with moderate memory growth.
+We also evaluate numerical accuracy by comparing our BF16
+CG kernel against a naive FP32 implementation that uses
+torch.linalg.solve. Table 2 reports absolute and relative
+error versus CG iteration count.
+Relative error decreases rapidly and reaches an error floor at ap-
+proximately 16 iteration. Additional iterations yield negligible improvements, indicating that a small
+constant iteration budget is sufficient in practice.
+T
+1
+2
+4
+8
+16
+32
+64
+Absolute Error
+1.49e-3
+4.51e-4
+9.13e-5
+1.98e-5
+1.72e-5
+1.72e-5
+1.72e-5
+Relative Error
+1.898
+0.651
+0.129
+0.016
+0.011
+0.011
+0.011
+Table 2: Numerical precision of BF16 CG kernel versus FP32 solve.
+For comparison, if the naive implementation uses BF16: (1) Casting all computations to FP32 yields
+relative error 0.0173; (2) Casting to FP32 only before computing the final solution yields relative
+error 0.0174. Our BF16 CG kernel therefore achieves significantly better numerical stability than
+naive mixed-precision implementations. It also suggests that the CG iterations could be reduced
+further without sacrificing much accuracy, which would yield additional efficiency gains.
+F
+APPENDIX: EXPERIMENTS
+F.1
+PIECEWISE LINEAR DATA GENERATION.
+Let n = 2m be the number of segment with n = log2 n ≤d. For each section index c ∈{1, . . . , n},
+define a sign pattern Sc = (sc,1, sc,2, . . . , sc,m) ∈{−1, +1}m by reading the least-significant bits
+of c. For each segment in each sample, draw Z ∼N(0, Id) and construct the data X ∈Rd by
+flipping the first m coordinate of Z:
+Xj =
+Sc,j|Zj|,
+j ≤m
+Zj,
+j > m
+(51)
+As the result, the constructed segment is a truncated Gaussian conditioned to lie in the cone Cc =
+{x ∈Rd : sc,jxj ≥0, j = 1, . . . , m} where Ci ∩Cj = ∅. Denote Tc(Z) = (Sc ⊙|Z1:m|, |Zm+1:d|)
+and segment distribution Pc, we have
+X ∼Pc ⇐⇒X
+d= Tc(Z)
+(52)
+28
+
+--- Page 29 ---
+Published as a conference paper at ICLR 2026
+F.2
+TRAINING CONFIGURATION
+Test-Time Regression.
+This experiment evaluates test-time adaptation without training any model
+parameters.
+We sweep over input dimension d ∈{8, 16, 32, 64, 128} and segment size S ∈
+{8, 16, 32, 64, 128, 256, 512, 1024} with fixed sequence length L = 1024. Performance is evalu-
+ated by averaging the mean squared error over 10,000 independently generated sequences.
+In-Context Regression.
+We fix the input and output dimensions at dx = dy = 32. For each ran-
+dom seed, we generate 100,000 training examples with noise level δ = 0.1 and 1,000 test examples
+with δ = 0 (noiseless evaluation). For each sequence length L ∈{64, 128, 256, 512}, we sweep
+over segment size S ∈{L/8, L/4, L/2, L} and learning rate {5 × 10−5, 10−4, 5 × 10−4, 10−3}.
+All models are trained with the AdamW optimizer (β1, β2) = (0.9, 0.999), weight decay 0.1, batch
+size 256, for a maximum of 100 epochs.
+In-Context Associative Recall.
+We fix the vocabulary size |Ak ∪Av| = 8,192. For each sequence
+length L ∈{64, 128, 256, 512}, we sweep over the number of key-value pairs {L/16, L/8, L/4}
+and learning rate {10−4, 5 × 10−4, 10−3}. We generate 20,000, 40,000, and 60,000 training exam-
+ples and 1,000 test examples each for the respective key-value pair counts. Training uses AdamW
+with (β1, β2) = (0.9, 0.999), weight decay 0.1, batch size 256, for a maximum of 32 epochs. Short
+convolution and feature map are disabled for all models.
+Permutation State Tracking.
+We fix the vocabulary size |A| = 8,192. For each random seed,
+we generate 100,000 training examples and 1,000 test examples. For each position count N ∈
+{16, 24, 48, 96}, we sample the number of instructions S ∼Uniform(N/6, N/3) and use 8 queries
+per example. We sweep over learning rate {10−4, 5×10−4, 10−3}. Models are trained with AdamW
+(β1, β2) = (0.9, 0.999), weight decay 0.1, batch size 256, for a maximum of 64 epochs.
+F.3
+PRETRAINING ANALYSIS
+This section supplements the main paper with additional pretraining results discussed in our rebuttal.
+Our goal is two-fold: (i) report evidence that LLA can yield consistent optimization benefits under
+settings that recover the kernel-regression perspective, and (ii) characterize qualitative differences in
+learned attention behavior when training with practical configurations.
+Perplexity with Normalized Queries and Keys.
+When queries and keys are normalized, LLA
+recovers the kernel-regression perspective most directly and empirically shows clear improvement
+over Softmax Attention in pretraining. In particular, our pretraining curves indicate that smaller
+ridge parameter λ yields better learning curves and lower final perplexity. Concretely, we observe
+final losses of 3.287 (λ=0.01), 3.421 (λ=0.1), 3.509 (λ=1), and 3.848 for standard Softmax At-
+tention (equivalently, LLA with λ →∞). The results are shown in Figure 8a. While strong QK
+normalization appears to provide the most stable training in this regime, it can be overly restrictive
+and may hurt overall performance. Nonetheless, this normalization is commonly adopted by linear-
+attention architectures (e.g., DeltaNet and MesaNet) as well as some Softmax Attention variants.
+Attention Behavior Analysis.
+Under more practical training configurations without strong QK
+normalization, we observe consistent and interpretable differences in attention behavior that suggest
+LLA induces a sharper and richer token interaction structure.
+To quantify how broadly each token attends, we define an attention density metric as the number of
+positions whose absolute attention score exceeds a threshold (we use |sij| > 0.1). We then average
+this density across tokens, heads, and layers. We find that Softmax Attention typically concentrates
+heavily on 1–2 tokens on average, while LLA more often attends to 2–4 tokens across most layers,
+indicating denser contextual aggregation. The results are shown in Figure 8b.
+Although LLA enforces a normalization constraint analogous to attention weights summing to one,
+it does not constrain the scores to be nonnegative. In practice, LLA exhibits both negative attention
+scores (as low as −0.5) and larger positive scores (up to ≈1.8), whereas Softmax Attention score is
+restricted to be within [0, 1]. Signed contributions allow the model to subtract irrelevant components
+and amplify useful directions. The results are shown in Figure 8c.
+29
+
+--- Page 30 ---
+Published as a conference paper at ICLR 2026
+0
+50000
+100000
+150000
+200000
+Training Step
+102
+Perplexity
+Training Perplexity
+Attn
+LLA (λ = 1)
+LLA (λ = 0.1)
+LLA (λ = 0.01)
+(a) LLA Pretraining Perplexity.
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+Layer
+0
+1
+2
+3
+4
+5
+Density
+Density of Attention Matrix
+LLA
+Attn
+(b) Attention Map Density.
+0
+200
+400
+600
+800
+1000
+Position
+−0.5
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+Max and Min Score
+Range of Attention Score
+LLA Max
+Attn Max
+LLA Min
+Attn Min
+(c) Attention Score Range.
+F.4
+ADDITIONAL EXPERIMENT RESULTS
+In Figure 6, we provide the full test-time regression results across all input dimension d and seg-
+ment size S. The advantages of LLA scales with the dimension d and nonstationarity. In practical
+settings, as the dimensionality increases, it is less likely to do exact query q = kj as in this synthetic
+experiment. Consequently, kernel selectivity becomes less pronounced when noise is present in
+query points, limiting the potential advantages of both softmax attention and LLA compared to the
+ideal conditions of this synthetic experiment. Nevertheless, the overall performance trends remain
+consistent with our main findings.
+Figure 9 shows complete associative recall results across all sequence lengths L. For visual clarity,
+we average results across different numbers of key-value pairs for each sequence length and plot the
+trajectory of the best score for each model. Gated DeltaNet exhibits distinctive training dynamics
+characterized by an extended plateau phase with minimal loss improvement, followed by an abrupt
+transition to significantly lower test loss and corresponding rapid accuracy improvement. The timing
+of this transition is highly sensitive to hyperparameters such as learning rate and dataset size.
+In contrast, LLA demonstrates consistent, gradual improvement in test accuracy with a correspond-
+ing smooth decrease in test loss throughout training, mirroring the behavior of Softmax Attention
+but more powerful. This stable convergence pattern remains robust across a wide range of learn-
+ing rates and dataset sizes. The marked difference in optimization dynamics suggests fundamental
+differences in how these models navigate the loss landscape and converge to solutions.
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Test Accuracy
+L=64, Seed=42
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=128, Seed=42
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=256, Seed=42
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=512, Seed=42
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Test Accuracy
+L=64, Seed=43
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=128, Seed=43
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=256, Seed=43
+10
+20
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=512, Seed=43
+10
+20
+30
+Test Step
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Test Accuracy
+L=64, Seed=44
+10
+20
+30
+Test Step
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=128, Seed=44
+10
+20
+30
+Test Step
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=256, Seed=44
+10
+20
+30
+Test Step
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L=512, Seed=44
+Test Recall Accuracy
+LLA
+Mamba
+Hyena
+GLA
+Gated DeltaNet
+Attn
+Figure 9: Test accuracy curves for associative recall across all sequence lengths L (averaged over 3
+random seeds). Results for different numbers of key-value pairs are averaged within each sequence
+length for visual clarity
+30
